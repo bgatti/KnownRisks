@@ -1519,6 +1519,7 @@ export default defineConfig({
   ],
   server: {
     port: parseInt(process.env.PORT || '5174'),
+    allowedHosts: true,
     open: process.env.RAILWAY_ENVIRONMENT ? false : '/',
     proxy: {
       // Two live ADS-B feeds. adsb.lol is the preferred primary; the client
