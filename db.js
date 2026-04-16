@@ -9,7 +9,13 @@ export const useDb = !!DATABASE_URL
 let pool = null
 function getPool() {
   if (!pool && DATABASE_URL) {
-    pool = new pg.Pool({ connectionString: DATABASE_URL })
+    const isInternal = DATABASE_URL.includes('.railway.internal')
+    pool = new pg.Pool({
+      connectionString: DATABASE_URL,
+      ssl: isInternal ? false : { rejectUnauthorized: false },
+      connectionTimeoutMillis: 10000,
+    })
+    pool.on('error', (err) => console.error('[db] pool error', err.message))
   }
   return pool
 }
