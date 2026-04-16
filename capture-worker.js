@@ -24,10 +24,10 @@ let state = { day: todayUTC(), startedAt: nowIso(), byHex: new Map() }
 let pollInFlight = false
 
 const connStr = process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL
-const isInternal = connStr && connStr.includes('.railway.internal')
+console.log('[capture-worker] DB URL:', connStr?.replace(/:[^:@]+@/, ':***@'))
 const pool = new pg.Pool({
   connectionString: connStr,
-  ssl: isInternal ? false : { rejectUnauthorized: false },
+  ssl: { rejectUnauthorized: false },
   connectionTimeoutMillis: 10000,
 })
 pool.on('error', (err) => console.error('[capture-worker] pool error', err.message))
