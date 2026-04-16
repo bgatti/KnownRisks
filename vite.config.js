@@ -1518,8 +1518,8 @@ export default defineConfig({
     liveCapturePlugin(),
   ],
   server: {
-    port: 5174,
-    open: '/',
+    port: parseInt(process.env.PORT || '5174'),
+    open: process.env.RAILWAY_ENVIRONMENT ? false : '/',
     proxy: {
       // Two live ADS-B feeds. adsb.lol is the preferred primary; the client
       // auto-fails over to airplanes.live when it can't reach the primary.
