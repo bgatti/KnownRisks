@@ -1531,6 +1531,10 @@ function liveCapturePlugin() {
 // Serve tracks_yearly.json from Postgres (Railway) or from the local
 // filesystem (dev). The importer writes to C:\tmp\noise_data\ locally;
 // on Railway, the DB-backed version streams all tracks from Postgres.
+// Serves /tracks_yearly.json from Postgres when DATABASE_URL is set.
+// The client-side map fetches this URL on load; without this plugin
+// the request would 404 (the static file is excluded from the deploy).
+// Data is cached in memory for TTL ms to avoid re-querying on every request.
 function dbTracksPlugin() {
   let cached = null
   let cachedAt = 0
@@ -1538,13 +1542,20 @@ function dbTracksPlugin() {
   return {
     name: 'db-tracks',
     configureServer(server) {
+      console.log('[db-tracks] plugin registered — /tracks_yearly.json will be served from Postgres')
       server.middlewares.use('/tracks_yearly.json', async (_req, res) => {
+        console.log('[db-tracks] /tracks_yearly.json requested')
         try {
           const now = Date.now()
           if (!cached || now - cachedAt > TTL) {
+            console.log('[db-tracks] cache miss — querying Postgres...')
             const data = await db.loadTracksFromDb()
+            console.log(`[db-tracks] loaded ${data.tracks.length} tracks from DB`)
             cached = JSON.stringify({ tracks: data.tracks })
             cachedAt = now
+            console.log(`[db-tracks] serialized ${(Buffer.byteLength(cached) / 1024 / 1024).toFixed(1)}MB`)
+          } else {
+            console.log('[db-tracks] serving from cache')
           }
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Content-Length', Buffer.byteLength(cached))

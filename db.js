@@ -5,6 +5,7 @@ import pg from 'pg'
 
 const DATABASE_URL = process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL
 export const useDb = !!DATABASE_URL
+console.log(`[db] useDb=${useDb}, DATABASE_URL=${DATABASE_URL ? DATABASE_URL.replace(/:[^:@]+@/, ':***@') : 'not set'}`)
 
 let pool = null
 function getPool() {
@@ -47,6 +48,7 @@ function indexByTail(tracks) {
 }
 
 export const loadTracksFromDb = cached('tracks', 30_000, async () => {
+  console.log('[db] loadTracksFromDb: querying...')
   const p = getPool()
   const res = await p.query('SELECT call, hex, type, desc_text, own_op, src, points FROM tracks')
   const tracks = res.rows.map(r => ({
