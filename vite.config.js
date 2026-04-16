@@ -1528,9 +1528,37 @@ function liveCapturePlugin() {
   }
 }
 
-// Serve tracks_yearly.json from outside OneDrive so cloud sync can't
-// corrupt it mid-write. The importer writes to C:\tmp\noise_data\ and
-// this middleware intercepts the fetch.
+// Serve tracks_yearly.json from Postgres (Railway) or from the local
+// filesystem (dev). The importer writes to C:\tmp\noise_data\ locally;
+// on Railway, the DB-backed version streams all tracks from Postgres.
+function dbTracksPlugin() {
+  let cached = null
+  let cachedAt = 0
+  const TTL = 60_000 // cache for 60s
+  return {
+    name: 'db-tracks',
+    configureServer(server) {
+      server.middlewares.use('/tracks_yearly.json', async (_req, res) => {
+        try {
+          const now = Date.now()
+          if (!cached || now - cachedAt > TTL) {
+            const data = await db.loadTracksFromDb()
+            cached = JSON.stringify({ tracks: data.tracks })
+            cachedAt = now
+          }
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Content-Length', Buffer.byteLength(cached))
+          res.end(cached)
+        } catch (e) {
+          console.error('[db-tracks] error', e)
+          res.statusCode = 500
+          res.end('{"tracks":[]}')
+        }
+      })
+    },
+  }
+}
+
 function externalDataPlugin() {
   const DATA_PATH = 'C:\\tmp\\noise_data\\tracks_yearly.json'
   return {
@@ -1555,8 +1583,8 @@ function externalDataPlugin() {
 export default defineConfig({
   plugins: [
     react(),
-    // On Railway, data comes from Postgres — skip file-based plugins
-    !db.useDb && externalDataPlugin(),
+    // On Railway, serve tracks from Postgres; locally, from C:\tmp\noise_data\
+    db.useDb ? dbTracksPlugin() : externalDataPlugin(),
     sendNoticePlugin(),
     offensesApiPlugin(),
     complaintsApiPlugin(),
