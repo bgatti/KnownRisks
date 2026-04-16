@@ -1,0 +1,368 @@
+{
+  "reports": [
+    {
+      "mode": "excursion",
+      "submittedAt": "2026-04-14T19:00:00Z",
+      "reporter": {
+        "email": "me@example.com",
+        "name": "Test"
+      },
+      "identity": "anon",
+      "location": {
+        "lat": 40.05,
+        "lon": -105.17
+      },
+      "score": 7,
+      "media": {
+        "kind": "audio",
+        "url": "blob:..."
+      },
+      "excursion": {
+        "tail": "N692CF",
+        "startedAt": "2026-04-14T18:44:21.000Z",
+        "klass": "yellow",
+        "zone": "Gunbarrel / Heatherwood"
+      },
+      "id": "nr-mnz2c0zc-twrtwi",
+      "receivedAt": "2026-04-14T20:17:20.376Z"
+    },
+    {
+      "mode": "excursion",
+      "submittedAt": "2026-04-14T20:20:07.333Z",
+      "reporter": "anon:memyself",
+      "identity": {
+        "kind": "anonymous",
+        "label": "memyself"
+      },
+      "location": {
+        "lat": 40.014175494557335,
+        "lng": -105.22862892386902,
+        "accuracy": 96,
+        "source": "browser",
+        "precision": "cross",
+        "display": "Conestoga Street & Arapahoe Avenue"
+      },
+      "score": {
+        "total": 3,
+        "max": 10,
+        "tier": "Useful",
+        "breakdown": [
+          {
+            "label": "Cross street",
+            "pts": 3
+          }
+        ]
+      },
+      "media": {
+        "audio": null,
+        "video": null
+      },
+      "excursion": {
+        "tail": "N4345G",
+        "type": "Piper PA-28-161 (1982)",
+        "worst": "orange",
+        "counts": {
+          "yellow": 3,
+          "orange": 30,
+          "red": 0
+        },
+        "lastSeenMs": 1776192624812,
+        "school": "Rocky Mountain Flight School",
+        "airport": "KBJC"
+      },
+      "id": "nr-mnz2fltb-j800nh",
+      "receivedAt": "2026-04-14T20:20:07.343Z"
+    },
+    {
+      "mode": "excursion",
+      "submittedAt": "2026-04-14T20:27:00.645Z",
+      "reporter": "anon:memyself",
+      "identity": {
+        "kind": "anonymous",
+        "label": "memyself"
+      },
+      "location": {
+        "lat": 40.014203,
+        "lng": -105.228744,
+        "accuracy": 141,
+        "source": "browser",
+        "precision": "cross",
+        "display": "Patton Drive & Arapahoe Avenue"
+      },
+      "score": {
+        "total": 3,
+        "max": 10,
+        "tier": "Useful",
+        "breakdown": [
+          {
+            "label": "Cross street",
+            "pts": 3
+          }
+        ]
+      },
+      "media": {
+        "audio": null,
+        "video": null
+      },
+      "excursion": {
+        "tail": "N4345G",
+        "type": "Piper PA-28-161 (1982)",
+        "worst": "orange",
+        "counts": {
+          "yellow": 3,
+          "orange": 30,
+          "red": 0
+        },
+        "lastSeenMs": 1776192624812,
+        "school": "Rocky Mountain Flight School",
+        "airport": "KBJC"
+      },
+      "id": "nr-mnz2ogqo-57rg6x",
+      "receivedAt": "2026-04-14T20:27:00.672Z"
+    },
+    {
+      "mode": "excursion",
+      "submittedAt": "2026-04-14T20:38:29.372Z",
+      "reporter": "anon:memyself",
+      "identity": {
+        "kind": "anonymous",
+        "label": "memyself"
+      },
+      "location": {
+        "lat": 40.014203,
+        "lng": -105.228744,
+        "accuracy": 141,
+        "source": "browser",
+        "precision": "cross",
+        "display": "Patton Drive & Arapahoe Avenue"
+      },
+      "score": {
+        "total": 3,
+        "max": 10,
+        "tier": "Useful",
+        "breakdown": [
+          {
+            "label": "Cross street",
+            "pts": 3
+          }
+        ]
+      },
+      "media": {
+        "audio": null,
+        "video": null
+      },
+      "excursion": {
+        "tail": "N75FF",
+        "type": "Cessna 172S",
+        "worst": "yellow",
+        "counts": {
+          "yellow": 4,
+          "orange": 0,
+          "red": 0
+        },
+        "lastSeenMs": 1776198717505,
+        "school": "Unattributed (school affiliation TBD)",
+        "airport": "KBJC area"
+      },
+      "id": "nr-mnz3385l-yeom53",
+      "receivedAt": "2026-04-14T20:38:29.385Z"
+    },
+    {
+      "mode": "excursion",
+      "submittedAt": "2026-04-14T21:42:54.195Z",
+      "reporter": "anon:memyself",
+      "identity": {
+        "kind": "anonymous",
+        "label": "memyself"
+      },
+      "location": {
+        "lat": 40.038808261606995,
+        "lng": -105.23121177327383,
+        "accuracy": 143,
+        "source": "browser",
+        "precision": "precise",
+        "display": "40.03881, -105.23121"
+      },
+      "score": {
+        "total": 8,
+        "max": 10,
+        "tier": "Strong",
+        "breakdown": [
+          {
+            "label": "Audio recording",
+            "pts": 3
+          },
+          {
+            "label": "Precise",
+            "pts": 5
+          }
+        ]
+      },
+      "media": {
+        "audio": {
+          "bytes": 1458,
+          "type": "audio/webm;codecs=opus"
+        },
+        "video": null
+      },
+      "excursion": {
+        "tail": "N692CF",
+        "type": "PA44",
+        "worst": "yellow",
+        "counts": {
+          "yellow": 8,
+          "orange": 0,
+          "red": 0
+        },
+        "lastSeenMs": 1776202949000,
+        "school": null,
+        "airport": null
+      },
+      "id": "nr-mnz5e2ah-3g0z3j",
+      "receivedAt": "2026-04-14T21:42:54.233Z"
+    },
+    {
+      "mode": "excursion",
+      "submittedAt": "2026-04-14T21:49:00.691Z",
+      "reporter": "anon:memyself",
+      "identity": {
+        "kind": "anonymous",
+        "label": "memyself"
+      },
+      "location": {
+        "lat": 40.038808261606995,
+        "lng": -105.23121177327383,
+        "accuracy": 143,
+        "source": "browser",
+        "precision": "precise",
+        "display": "40.03881, -105.23121"
+      },
+      "score": {
+        "total": 8,
+        "max": 10,
+        "tier": "Strong",
+        "breakdown": [
+          {
+            "label": "Audio recording",
+            "pts": 3
+          },
+          {
+            "label": "Precise",
+            "pts": 5
+          }
+        ]
+      },
+      "media": {
+        "audio": {
+          "bytes": 1458,
+          "type": "audio/webm;codecs=opus"
+        },
+        "video": null
+      },
+      "excursion": {
+        "tail": "N692CF",
+        "type": "PA44",
+        "worst": "yellow",
+        "counts": {
+          "yellow": 8,
+          "orange": 0,
+          "red": 0
+        },
+        "lastSeenMs": 1776202949000,
+        "school": null,
+        "airport": null
+      },
+      "id": "nr-mnz5lx25-0qdr1m",
+      "receivedAt": "2026-04-14T21:49:00.701Z"
+    },
+    {
+      "mode": "excursion",
+      "submittedAt": "2026-04-15T22:35:30.184Z",
+      "reporter": "anon:memyself",
+      "identity": {
+        "kind": "anonymous",
+        "label": "memyself"
+      },
+      "location": {
+        "lat": 40.03823758815247,
+        "lng": -105.23120451986127,
+        "accuracy": 132,
+        "source": "browser",
+        "precision": "cross",
+        "display": "Airport Boulevard & Airport Road"
+      },
+      "score": {
+        "total": 6,
+        "max": 10,
+        "tier": "Strong",
+        "breakdown": [
+          {
+            "label": "Audio recording",
+            "pts": 3
+          },
+          {
+            "label": "Cross street",
+            "pts": 3
+          }
+        ]
+      },
+      "media": {
+        "audio": {
+          "bytes": 1458,
+          "type": "audio/webm;codecs=opus"
+        },
+        "video": null
+      },
+      "excursion": {
+        "tail": "84-23960",
+        "type": "H60",
+        "worst": "red",
+        "counts": {
+          "yellow": 1,
+          "orange": 0,
+          "red": 30
+        },
+        "lastSeenMs": 1776287592435,
+        "school": null,
+        "airport": null
+      },
+      "id": "nr-mo0mpk4w-3uxgep",
+      "receivedAt": "2026-04-15T22:35:30.224Z"
+    },
+    {
+      "mode": "general",
+      "submittedAt": "2026-04-16T00:18:59.029Z",
+      "reporter": "anon:memyself",
+      "identity": {
+        "kind": "anonymous",
+        "label": "memyself"
+      },
+      "location": {
+        "lat": 40.030934,
+        "lng": -105.235751,
+        "accuracy": 225,
+        "source": "browser",
+        "precision": "cross",
+        "display": "Berthoud Drive & Monarch Circle"
+      },
+      "score": {
+        "total": 3,
+        "max": 10,
+        "tier": "Useful",
+        "breakdown": [
+          {
+            "label": "Cross street",
+            "pts": 3
+          }
+        ]
+      },
+      "media": {
+        "audio": null,
+        "video": null
+      },
+      "excursion": null,
+      "id": "nr-mo0qemvz-ht2jhr",
+      "receivedAt": "2026-04-16T00:18:59.039Z"
+    }
+  ]
+}
