@@ -5,14 +5,10 @@ import { classifyPoint } from './geo'
 
 const KBDU = [40.0394, -105.2258]
 
-function parseHashQuery(hash) {
-  const q = hash.split('?')[1] || ''
+function parseQuery() {
+  const params = new URLSearchParams(window.location.search)
   const out = {}
-  for (const pair of q.split('&')) {
-    if (!pair) continue
-    const [k, v] = pair.split('=')
-    out[decodeURIComponent(k)] = decodeURIComponent(v || '')
-  }
+  for (const [k, v] of params) out[k] = v
   return out
 }
 
@@ -137,14 +133,14 @@ const COLORS = {
 }
 
 export default function NoticePage() {
-  const [hash, setHash] = useState(() => window.location.hash || '')
+  const [search, setSearch] = useState(() => window.location.search)
   useEffect(() => {
-    const on = () => setHash(window.location.hash || '')
-    window.addEventListener('hashchange', on)
-    return () => window.removeEventListener('hashchange', on)
+    const on = () => setSearch(window.location.search)
+    window.addEventListener('popstate', on)
+    return () => window.removeEventListener('popstate', on)
   }, [])
 
-  const { tail = '', at = '', school = '' } = parseHashQuery(hash)
+  const { tail = '', at = '', school = '' } = parseQuery()
   const ac = useMemo(() => findAircraftByTail(tail), [tail])
 
   const flights = useMemo(

@@ -166,22 +166,28 @@ function ComposeNoticeModal({ compose, onClose }) {
   )
 }
 
-function useHashRoute() {
-  const [hash, setHash] = useState(() => window.location.hash || '#map')
+function useRoute() {
+  const [path, setPath] = useState(() => window.location.pathname || '/')
   useEffect(() => {
-    const onChange = () => setHash(window.location.hash || '#map')
-    window.addEventListener('hashchange', onChange)
-    return () => window.removeEventListener('hashchange', onChange)
+    const onChange = () => setPath(window.location.pathname || '/')
+    window.addEventListener('popstate', onChange)
+    return () => window.removeEventListener('popstate', onChange)
   }, [])
-  return hash
+  return path
 }
 
-function Nav({ hash }) {
-  const link = (h, label) => (
+function navigate(to) {
+  window.history.pushState(null, '', to)
+  window.dispatchEvent(new PopStateEvent('popstate'))
+}
+
+function Nav({ route }) {
+  const link = (to, label) => (
     <a
-      href={h}
+      href={to}
+      onClick={(e) => { e.preventDefault(); navigate(to) }}
       className={`px-2 py-1 rounded ${
-        hash === h ? 'bg-white/15 text-white' : 'text-white/60 hover:text-white'
+        route === to ? 'bg-white/15 text-white' : 'text-white/60 hover:text-white'
       }`}
     >
       {label}
@@ -189,11 +195,11 @@ function Nav({ hash }) {
   )
   return (
     <nav className="flex items-center gap-1 text-xs">
-      {link('#map', 'Map')}
-      {link('#yoy', 'Year over Year')}
-      {link('#bases', 'Bases')}
-      {link('#thinning', 'Thinning')}
-      {link('#impact', 'Impact Model')}
+      {link('/', 'Map')}
+      {link('/yoy', 'Year over Year')}
+      {link('/bases', 'Bases')}
+      {link('/thinning', 'Thinning')}
+      {link('/impact', 'Impact Model')}
     </nav>
   )
 }
@@ -359,24 +365,24 @@ function bandTrack(points) {
 }
 
 export default function App() {
-  const hash = useHashRoute()
-  const route = hash.split('?')[0]
-  if (route === '#notice') {
+  const path = useRoute()
+  const route = path.split('?')[0]
+  if (route === '/notice') {
     return <NoticePage />
   }
-  if (hash === '#yoy' || hash === '#bases' || hash === '#thinning' || hash === '#impact') {
+  if (route === '/yoy' || route === '/bases' || route === '/thinning' || route === '/impact') {
     return (
       <div className="h-full w-full flex flex-col">
         <header className="px-4 py-3 border-b border-white/10 flex items-center gap-4">
           <h1 className="text-lg font-semibold">Front Range Aviation Monitor</h1>
-          <Nav hash={hash} />
+          <Nav route={route} />
         </header>
         <div className="flex-1 overflow-hidden">
-          {hash === '#yoy'
+          {route === '/yoy'
             ? <YearOverYear />
-            : hash === '#bases'
+            : route === '/bases'
               ? <BasesDiagnostic />
-              : hash === '#thinning'
+              : route === '/thinning'
                 ? <ThinningTest />
                 : <NoiseImpactTest />}
         </div>
@@ -387,7 +393,7 @@ export default function App() {
 }
 
 function MapPage() {
-  const hash = useHashRoute()
+  const route = useRoute()
   const [enabled, setEnabled] = useState({ yearly: true })
   const [yearFilter, setYearFilter] = useState(null) // null = not initialized, 'all' or a specific year
   const [baseFilter, setBaseFilter] = useState('all') // 'all' or an airport code
@@ -1666,7 +1672,7 @@ function MapPage() {
       )}
       <header className="px-4 py-3 border-b border-white/10 flex flex-wrap items-center gap-x-6 gap-y-2">
         <h1 className="text-lg font-semibold">Front Range Aviation Monitor</h1>
-        <Nav hash={hash} />
+        <Nav route={route} />
         <div className="text-xs text-white/60">
           {visible.length} tracks ·{' '}
           <span className="text-red-400">
@@ -2213,7 +2219,7 @@ A few ways to get to know us better:
   • An Airspace Awareness flight with a local CFI who'll walk the flows with you from the cockpit
 
 A friendly map of the visit is here (ADS-B participation is voluntary; this review is for courtesy and education only):
-${window.location.origin}/#notice?tail=${encodeURIComponent(a.tail)}&at=${worstEv?.startTs || ''}&school=${encodeURIComponent(sch?.school || '')}
+${window.location.origin}/notice?tail=${encodeURIComponent(a.tail)}&at=${worstEv?.startTs || ''}&school=${encodeURIComponent(sch?.school || '')}
 
 Blue skies, and welcome to Boulder,
 The team at Boulder Municipal Airport (KBDU)`

@@ -918,7 +918,7 @@ function offensesApiPlugin() {
           params.set('at', String(atMs))
           params.set('nid', noticeId)
           if (schoolInfo?.school) params.set('school', schoolInfo.school)
-          const landing = `${proto}://${host}/#notice?${params.toString()}`
+          const landing = `${proto}://${host}/notice?${params.toString()}`
           const elapsedMs = Date.now() - t0
           const payload = {
             tail,
