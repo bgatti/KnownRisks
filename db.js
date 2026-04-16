@@ -56,10 +56,18 @@ export const loadTracksFromDb = cached('tracks', 30_000, async () => {
   console.log('[db] loadTracksFromDb: querying...')
   const p = getPool()
   const res = await p.query('SELECT call, hex, type, desc_text, own_op, src, points FROM tracks')
-  const tracks = res.rows.map(r => ({
-    call: r.call, hex: r.hex, type: r.type, desc: r.desc_text,
-    ownOp: r.own_op, src: r.src, points: r.points,
-  }))
+  const currentYear = new Date().getFullYear()
+  const tracks = res.rows.map(r => {
+    // Derive year/t0/years_back from src (e.g. "globe/2023-03-15/hex")
+    const m = (r.src || '').match(/(\d{4})-(\d{2})-(\d{2})/)
+    const year = m ? m[1] : null
+    const t0 = m ? Math.floor(Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`) / 1000) : null
+    return {
+      call: r.call, hex: r.hex, type: r.type, desc: r.desc_text,
+      ownOp: r.own_op, src: r.src, points: r.points,
+      year, t0, years_back: year ? currentYear - parseInt(year) : null,
+    }
+  })
   return { tracks, _byTail: indexByTail(tracks) }
 })
 

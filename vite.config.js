@@ -1566,10 +1566,20 @@ function dbTracksPlugin() {
             'SELECT call, hex, type, desc_text, own_op, src, points FROM tracks ORDER BY id LIMIT $1 OFFSET $2',
             [size, offset]
           )
-          const tracks = r.rows.map(row => ({
-            call: row.call, hex: row.hex, type: row.type, desc: row.desc_text,
-            ownOp: row.own_op, src: row.src, points: row.points,
-          }))
+          // Derive year, t0, years_back from src (e.g. "globe/2023-03-15/hex")
+          // These fields are expected by the client for filtering and time-of-day.
+          const currentYear = new Date().getFullYear()
+          const tracks = r.rows.map(row => {
+            const m = (row.src || '').match(/(\d{4})-(\d{2})-(\d{2})/)
+            const year = m ? m[1] : null
+            const t0 = m ? Math.floor(Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`) / 1000) : null
+            const yearsBack = year ? currentYear - parseInt(year) : null
+            return {
+              call: row.call, hex: row.hex, type: row.type, desc: row.desc_text,
+              ownOp: row.own_op, src: row.src, points: row.points,
+              year, t0, years_back: yearsBack,
+            }
+          })
 
           const payload = JSON.stringify({ tracks, page, size, total, pages })
           res.setHeader('Content-Type', 'application/json')
