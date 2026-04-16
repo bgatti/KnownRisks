@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import crypto from 'crypto'
+import * as db from './db.js'
 
 // JSON file-backed ledger store. Each instance owns one file (e.g.
 // data/reports.json) and serializes concurrent mutations through a single
@@ -113,19 +114,24 @@ function sendNoticePlugin() {
           const logLine = `[send-notice] ${new Date().toISOString()} ${tail} → ${to} (${school})`
           const recordNotification = async (via, ok) => {
             if (!ok || !tail) return
-            await notificationsLedger.mutate(fs, path, (cur) => {
-              const items = Array.isArray(cur.items) ? cur.items : []
-              items.push({
-                kind: 'operator',
-                tail,
-                via,
-                contact: to,
-                school: school || null,
-                noticeId: nid || null,
-                at: new Date().toISOString(),
+            const notifRecord = {
+              kind: 'operator',
+              tail,
+              via,
+              contact: to,
+              school: school || null,
+              noticeId: nid || null,
+              at: new Date().toISOString(),
+            }
+            if (db.useDb) {
+              await db.addNotification(notifRecord)
+            } else {
+              await notificationsLedger.mutate(fs, path, (cur) => {
+                const items = Array.isArray(cur.items) ? cur.items : []
+                items.push(notifRecord)
+                return { items }
               })
-              return { items }
-            })
+            }
           }
           if (!apiKey) {
             console.log(logLine, '— DRY RUN (no RESEND_API_KEY)')
@@ -176,6 +182,12 @@ function offensesApiPlugin() {
     live: 'public/tracks_live.json',
   }
   const loadCached = async (fs, path, key) => {
+    // When DATABASE_URL is set, read from Postgres instead of files
+    if (db.useDb) {
+      if (key === 'tracks') return db.loadTracksFromDb()
+      if (key === 'live') return db.loadLiveFromDb()
+      if (key === 'schools') return db.loadSchoolsFromDb()
+    }
     const p = path.resolve(FILE_PATHS[key])
     try {
       const stat = await fs.stat(p)
@@ -608,10 +620,15 @@ function offensesApiPlugin() {
           const windowFromMs = nowMs - hours * 3600 * 1000
           if (includeSet.has('reports')) {
             let complaintsData = null
-            try {
-              const raw = await fs.readFile(path.resolve('data/complaints.json'), 'utf8')
-              complaintsData = JSON.parse(raw)
-            } catch {}
+            if (db.useDb) {
+              const all = await db.getComplaints(null)
+              complaintsData = { complaints: all }
+            } else {
+              try {
+                const raw = await fs.readFile(path.resolve('data/complaints.json'), 'utf8')
+                complaintsData = JSON.parse(raw)
+              } catch {}
+            }
             const byTail = new Map()
             for (const c of (complaintsData && complaintsData.complaints) || []) {
               const ts = Date.parse(c.createdAt || '')
@@ -636,10 +653,15 @@ function offensesApiPlugin() {
           }
           if (includeSet.has('notifications')) {
             let notifData = null
-            try {
-              const raw = await fs.readFile(path.resolve('data/notifications.json'), 'utf8')
-              notifData = JSON.parse(raw)
-            } catch {}
+            if (db.useDb) {
+              const all = await db.getNotifications(null, null)
+              notifData = { items: all }
+            } else {
+              try {
+                const raw = await fs.readFile(path.resolve('data/notifications.json'), 'utf8')
+                notifData = JSON.parse(raw)
+              } catch {}
+            }
             // Per-tail latest by kind, plus an aggregated pilotAction state
             // machine (completed > reviewed > acknowledged > none). We only
             // consider items whose `at` falls in the window, so stale
@@ -960,15 +982,20 @@ function noiseReportsApiPlugin() {
           if (req.method === 'GET') {
             const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
             const reporter = (u.searchParams.get('reporter') || '').trim()
-            const data = (await ledger.load(fs, path)) || { reports: [] }
-            let list = Array.isArray(data.reports) ? data.reports : []
-            if (reporter) {
-              list = list.filter((r) => {
-                const rep = r.reporter
-                if (!rep) return false
-                if (typeof rep === 'string') return rep === reporter
-                return rep.email === reporter || rep.id === reporter || rep.name === reporter
-              })
+            let list
+            if (db.useDb) {
+              list = await db.getNoiseReports(reporter || null)
+            } else {
+              const data = (await ledger.load(fs, path)) || { reports: [] }
+              list = Array.isArray(data.reports) ? data.reports : []
+              if (reporter) {
+                list = list.filter((r) => {
+                  const rep = r.reporter
+                  if (!rep) return false
+                  if (typeof rep === 'string') return rep === reporter
+                  return rep.email === reporter || rep.id === reporter || rep.name === reporter
+                })
+              }
             }
             res.setHeader('Content-Type', 'application/json')
             res.setHeader('Access-Control-Allow-Origin', '*')
@@ -986,14 +1013,16 @@ function noiseReportsApiPlugin() {
           }
           const receivedAt = new Date().toISOString()
           const id = `nr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-          // Store the client meta blob verbatim; server-assigned id and
-          // receivedAt are added on top, and never overwritten by client.
           const record = { ...body, id, receivedAt }
-          await ledger.mutate(fs, path, (cur) => {
-            const reports = Array.isArray(cur.reports) ? cur.reports : []
-            reports.push(record)
-            return { reports }
-          })
+          if (db.useDb) {
+            await db.addNoiseReport(record)
+          } else {
+            await ledger.mutate(fs, path, (cur) => {
+              const reports = Array.isArray(cur.reports) ? cur.reports : []
+              reports.push(record)
+              return { reports }
+            })
+          }
           res.statusCode = 201
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Access-Control-Allow-Origin', '*')
@@ -1063,11 +1092,15 @@ function pilotApiPlugin() {
             notes: body.notes || null,
             at: new Date().toISOString(),
           }
-          await notificationsLedger.mutate(fs, path, (cur) => {
-            const items = Array.isArray(cur.items) ? cur.items : []
-            items.push(record)
-            return { items }
-          })
+          if (db.useDb) {
+            await db.addNotification(record)
+          } else {
+            await notificationsLedger.mutate(fs, path, (cur) => {
+              const items = Array.isArray(cur.items) ? cur.items : []
+              items.push(record)
+              return { items }
+            })
+          }
           res.statusCode = 201
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Access-Control-Allow-Origin', '*')
@@ -1127,11 +1160,15 @@ function pilotApiPlugin() {
             notes: body.notes || null,
             at: new Date().toISOString(),
           }
-          await notificationsLedger.mutate(fs, path, (cur) => {
-            const items = Array.isArray(cur.items) ? cur.items : []
-            items.push(record)
-            return { items }
-          })
+          if (db.useDb) {
+            await db.addNotification(record)
+          } else {
+            await notificationsLedger.mutate(fs, path, (cur) => {
+              const items = Array.isArray(cur.items) ? cur.items : []
+              items.push(record)
+              return { items }
+            })
+          }
           res.statusCode = 201
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Access-Control-Allow-Origin', '*')
@@ -1150,10 +1187,15 @@ function pilotApiPlugin() {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const tail = (u.searchParams.get('tail') || '').trim().toUpperCase()
           const kind = (u.searchParams.get('kind') || '').trim()
-          const data = (await notificationsLedger.load(fs, path)) || { items: [] }
-          let items = Array.isArray(data.items) ? data.items : []
-          if (tail) items = items.filter((i) => (i.tail || '').toUpperCase() === tail)
-          if (kind) items = items.filter((i) => i.kind === kind)
+          let items
+          if (db.useDb) {
+            items = await db.getNotifications(tail || null, kind || null)
+          } else {
+            const data = (await notificationsLedger.load(fs, path)) || { items: [] }
+            items = Array.isArray(data.items) ? data.items : []
+            if (tail) items = items.filter((i) => (i.tail || '').toUpperCase() === tail)
+            if (kind) items = items.filter((i) => i.kind === kind)
+          }
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Access-Control-Allow-Origin', '*')
           res.end(JSON.stringify({ count: items.length, items }))
@@ -1215,10 +1257,15 @@ function complaintsApiPlugin() {
           if (req.method === 'GET') {
             const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
             const tail = (u.searchParams.get('tail') || '').trim().toUpperCase()
-            const data = await loadAll(fs, path)
-            const list = tail
-              ? data.complaints.filter((c) => (c.tail || '').toUpperCase() === tail)
-              : data.complaints
+            let list
+            if (db.useDb) {
+              list = await db.getComplaints(tail || null)
+            } else {
+              const data = await loadAll(fs, path)
+              list = tail
+                ? data.complaints.filter((c) => (c.tail || '').toUpperCase() === tail)
+                : data.complaints
+            }
             res.setHeader('Content-Type', 'application/json')
             res.setHeader('Access-Control-Allow-Origin', '*')
             res.end(JSON.stringify({ count: list.length, complaints: list }))
@@ -1252,25 +1299,24 @@ function complaintsApiPlugin() {
             zone: body.zone || null,
             reporter: body.reporter || null,
             notes: body.notes || null,
-            // Optional citizen-report enrichments (NoiseReport/NoiseStudio
-            // submission flow). All nullable so internal complaints that
-            // don't carry this metadata continue to work unchanged.
             type: body.type || null,
             location: body.location || null,
             precision: body.precision || null,
             mediaKind: body.mediaKind || null,
             score: typeof body.score === 'number' ? body.score : null,
           }
-          const task = async () => {
-            const data = await loadAll(fs, path)
-            data.complaints.push(record)
-            await saveAll(fs, path, data)
+          if (db.useDb) {
+            await db.addComplaint(record)
+          } else {
+            const task = async () => {
+              const data = await loadAll(fs, path)
+              data.complaints.push(record)
+              await saveAll(fs, path, data)
+            }
+            const queued = writeChain.then(task, task)
+            writeChain = queued.catch(() => {})
+            await queued
           }
-          // Run regardless of any prior rejection, but swallow for the
-          // persistent chain so one bad write doesn't poison future writes.
-          const queued = writeChain.then(task, task)
-          writeChain = queued.catch(() => {})
-          await queued
           res.statusCode = 201
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Access-Control-Allow-Origin', '*')
@@ -1509,14 +1555,15 @@ function externalDataPlugin() {
 export default defineConfig({
   plugins: [
     react(),
-    externalDataPlugin(),
+    // On Railway, data comes from Postgres — skip file-based plugins
+    !db.useDb && externalDataPlugin(),
     sendNoticePlugin(),
     offensesApiPlugin(),
     complaintsApiPlugin(),
     noiseReportsApiPlugin(),
     pilotApiPlugin(),
-    liveCapturePlugin(),
-  ],
+    !db.useDb && liveCapturePlugin(),
+  ].filter(Boolean),
   server: {
     port: parseInt(process.env.PORT || '5174'),
     allowedHosts: true,
