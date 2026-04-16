@@ -320,48 +320,63 @@ const DATASETS = [
 
 // Fetch tracks in pages from /api/tracks (Postgres-backed) with progress
 // callback. Falls back to single /tracks_yearly.json fetch for local dev.
-async function fetchTracksChunked(onProgress) {
-  // Try paginated API first
-  const first = await fetch('/api/tracks?page=0&size=2000')
-  if (!first.ok) {
-    // Fallback: local dev serves the whole file
-    const r = await fetch('/tracks_yearly.json')
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
-    return r.json()
-  }
-  const firstData = await first.json()
-  if (firstData._use_api) {
-    // Server told us to use the API (legacy endpoint)
-    const r2 = await fetch('/api/tracks?page=0&size=2000')
-    if (!r2.ok) throw new Error(`${r2.status}`)
-    const d2 = await r2.json()
-    return fetchRemainingPages(d2, onProgress)
-  }
-  return fetchRemainingPages(firstData, onProgress)
-}
-
-async function fetchRemainingPages(firstPage, onProgress) {
-  const { tracks, pages, total, size } = firstPage
-  const allTracks = [...tracks]
-  if (onProgress) onProgress(allTracks.length, total)
-
-  // Fetch remaining pages in parallel batches of 4
-  const remaining = []
-  for (let p = 1; p < pages; p++) remaining.push(p)
-
-  const BATCH = 4
-  for (let i = 0; i < remaining.length; i += BATCH) {
-    const batch = remaining.slice(i, i + BATCH)
-    const results = await Promise.all(
-      batch.map(p => fetch(`/api/tracks?page=${p}&size=${size}`).then(r => r.json()))
-    )
-    for (const r of results) {
-      allTracks.push(...r.tracks)
+// onStatus receives string messages shown in the progress bar.
+async function fetchTracksChunked(onProgress, onStatus) {
+  onStatus('Connecting to /api/tracks...')
+  console.log('[tracks-loader] starting fetch')
+  try {
+    const first = await fetch('/api/tracks?page=0&size=2000')
+    console.log(`[tracks-loader] /api/tracks response: ${first.status}`)
+    if (!first.ok) {
+      onStatus(`API returned ${first.status}, falling back to /tracks_yearly.json...`)
+      console.log('[tracks-loader] falling back to /tracks_yearly.json')
+      const r = await fetch('/tracks_yearly.json')
+      if (!r.ok) throw new Error(`tracks_yearly.json: ${r.status} ${r.statusText}`)
+      const d = await r.json()
+      console.log(`[tracks-loader] fallback loaded ${d.tracks?.length || 0} tracks`)
+      onStatus(`Loaded ${d.tracks?.length || 0} tracks from file`)
+      return d
     }
-    if (onProgress) onProgress(allTracks.length, total)
-  }
+    const firstData = await first.json()
+    console.log(`[tracks-loader] page 0: ${firstData.tracks?.length} tracks, total=${firstData.total}, pages=${firstData.pages}`)
 
-  return { tracks: allTracks }
+    // If server returned the legacy empty response, bail
+    if (firstData._use_api || !firstData.tracks) {
+      throw new Error('Server returned empty _use_api response')
+    }
+
+    const { tracks, pages, total, size } = firstData
+    const allTracks = [...tracks]
+    onProgress(allTracks.length, total)
+    onStatus(`Page 1/${pages} loaded (${allTracks.length} tracks)`)
+
+    // Fetch remaining pages in parallel batches of 4
+    for (let i = 1; i < pages; i += 4) {
+      const batch = []
+      for (let j = i; j < Math.min(i + 4, pages); j++) batch.push(j)
+
+      const results = await Promise.all(
+        batch.map(async (p) => {
+          const r = await fetch(`/api/tracks?page=${p}&size=${size}`)
+          if (!r.ok) throw new Error(`Page ${p} failed: ${r.status}`)
+          return r.json()
+        })
+      )
+      for (const r of results) {
+        if (r.tracks) allTracks.push(...r.tracks)
+      }
+      onProgress(allTracks.length, total)
+      onStatus(`Pages ${i+1}-${Math.min(i+4, pages)}/${pages} (${allTracks.length.toLocaleString()} tracks)`)
+    }
+
+    console.log(`[tracks-loader] done: ${allTracks.length} tracks loaded`)
+    onStatus(`Complete: ${allTracks.length.toLocaleString()} tracks`)
+    return { tracks: allTracks }
+  } catch (e) {
+    console.error('[tracks-loader] FAILED:', e)
+    onStatus(`ERROR: ${e.message}`)
+    throw e
+  }
 }
 
 const CLASS_COLOR = {
@@ -602,7 +617,7 @@ function MapPage() {
   }, [liveActive])
   const [datasets, setDatasets] = useState({})
   const [errors, setErrors] = useState({})
-  const [loadProgress, setLoadProgress] = useState(null) // { loaded, total } or null
+  const [loadProgress, setLoadProgress] = useState(null) // { loaded, total, status } or null
   const [schoolsByTail, setSchoolsByTail] = useState(new Map())
   const [compose, setCompose] = useState(null) // { to, subject, body, school, tail }
 
@@ -720,15 +735,21 @@ function MapPage() {
   useEffect(() => {
     // Load tracks — tries paginated /api/tracks first (Railway/Postgres),
     // falls back to single /tracks_yearly.json fetch (local dev).
-    setLoadProgress({ loaded: 0, total: 0 })
-    fetchTracksChunked((loaded, total) => setLoadProgress({ loaded, total }))
+    setLoadProgress({ loaded: 0, total: 0, status: 'Starting...' })
+    fetchTracksChunked(
+      (loaded, total) => setLoadProgress(p => ({ ...p, loaded, total })),
+      (status) => setLoadProgress(p => ({ ...p, status }))
+    )
       .then((d) => {
+        console.log(`[tracks-loader] setting datasets.yearly: ${d.tracks?.length} tracks, sample:`, d.tracks?.[0])
         setDatasets((s) => ({ ...s, yearly: d }))
         setLoadProgress(null)
       })
       .catch((e) => {
+        console.error('[tracks-loader] setting error:', e)
         setErrors((s) => ({ ...s, yearly: String(e) }))
-        setLoadProgress(null)
+        // Keep progress bar visible with error
+        setLoadProgress(p => ({ ...p, status: `FAILED: ${e.message}`, error: true }))
       })
   }, [])
 
@@ -2493,16 +2514,23 @@ The team at Boulder Municipal Airport (KBDU)`
           </div>
         )}
         {loadProgress && (
-          <div className="absolute top-0 left-0 right-0 z-[1000] bg-gray-900/90 px-4 py-3 flex items-center gap-3">
+          <div className={`absolute top-0 left-0 right-0 z-[1000] px-4 py-3 flex items-center gap-3 ${
+            loadProgress.error ? 'bg-red-900/95' : 'bg-gray-900/90'
+          }`}>
             <div className="flex-1 bg-gray-700 rounded-full h-2 overflow-hidden">
               <div
-                className="bg-cyan-400 h-full transition-all duration-300"
-                style={{ width: `${loadProgress.total ? (loadProgress.loaded / loadProgress.total * 100) : 0}%` }}
+                className={`h-full transition-all duration-300 ${loadProgress.error ? 'bg-red-400' : 'bg-cyan-400'}`}
+                style={{ width: `${loadProgress.total ? (loadProgress.loaded / loadProgress.total * 100) : 5}%` }}
               />
             </div>
-            <span className="text-xs text-white/80 whitespace-nowrap">
-              Loading tracks: {loadProgress.loaded.toLocaleString()} / {loadProgress.total.toLocaleString()}
+            <span className="text-xs text-white/80 whitespace-nowrap max-w-[50%] truncate">
+              {loadProgress.status || `${loadProgress.loaded.toLocaleString()} / ${loadProgress.total.toLocaleString()}`}
             </span>
+          </div>
+        )}
+        {errors.yearly && !loadProgress && (
+          <div className="absolute top-0 left-0 right-0 z-[1000] bg-red-900/95 px-4 py-3 text-xs text-white">
+            Track loading failed: {errors.yearly}
           </div>
         )}
         <MapContainer center={[39.97, -105.03]} zoom={10} className="h-full w-full" preferCanvas={true} ref={mapRef}>
