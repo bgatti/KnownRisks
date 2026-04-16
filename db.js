@@ -47,6 +47,11 @@ function indexByTail(tracks) {
   return byTail
 }
 
+// Direct query helper for paginated endpoints
+export async function queryDb(sql, params) {
+  return getPool().query(sql, params)
+}
+
 export const loadTracksFromDb = cached('tracks', 30_000, async () => {
   console.log('[db] loadTracksFromDb: querying...')
   const p = getPool()

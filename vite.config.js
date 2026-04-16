@@ -1528,43 +1528,67 @@ function liveCapturePlugin() {
   }
 }
 
-// Serve tracks_yearly.json from Postgres (Railway) or from the local
-// filesystem (dev). The importer writes to C:\tmp\noise_data\ locally;
-// on Railway, the DB-backed version streams all tracks from Postgres.
-// Serves /tracks_yearly.json from Postgres when DATABASE_URL is set.
-// The client-side map fetches this URL on load; without this plugin
-// the request would 404 (the static file is excluded from the deploy).
-// Data is cached in memory for TTL ms to avoid re-querying on every request.
+// Paginated API: GET /api/tracks?page=0&size=2000
+// Returns { tracks, page, size, total, pages } so the client can fetch
+// in chunks and show a progress bar. Queries Postgres with LIMIT/OFFSET.
+// Also serves /tracks_yearly.json as a legacy fallback (redirects to
+// the paginated API page 0 for backwards compat).
 function dbTracksPlugin() {
-  let cached = null
-  let cachedAt = 0
-  const TTL = 60_000 // cache for 60s
+  let countCache = { n: 0, at: 0 }
+  const COUNT_TTL = 60_000
   return {
     name: 'db-tracks',
     configureServer(server) {
-      console.log('[db-tracks] plugin registered — /tracks_yearly.json will be served from Postgres')
-      server.middlewares.use('/tracks_yearly.json', async (_req, res) => {
-        console.log('[db-tracks] /tracks_yearly.json requested')
+      console.log('[db-tracks] plugin registered — /api/tracks (paginated) + /tracks_yearly.json')
+
+      // Paginated endpoint — client fetches chunks from Postgres directly
+      server.middlewares.use('/api/tracks', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
         try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const page = Math.max(0, parseInt(u.searchParams.get('page') || '0'))
+          const size = Math.min(5000, Math.max(100, parseInt(u.searchParams.get('size') || '2000')))
+          const offset = page * size
+
+          // Get total count (cached)
           const now = Date.now()
-          if (!cached || now - cachedAt > TTL) {
-            console.log('[db-tracks] cache miss — querying Postgres...')
-            const data = await db.loadTracksFromDb()
-            console.log(`[db-tracks] loaded ${data.tracks.length} tracks from DB`)
-            cached = JSON.stringify({ tracks: data.tracks })
-            cachedAt = now
-            console.log(`[db-tracks] serialized ${(Buffer.byteLength(cached) / 1024 / 1024).toFixed(1)}MB`)
-          } else {
-            console.log('[db-tracks] serving from cache')
+          if (!countCache.n || now - countCache.at > COUNT_TTL) {
+            const cr = await db.queryDb('SELECT count(*) FROM tracks')
+            countCache = { n: parseInt(cr.rows[0].count), at: now }
           }
+          const total = countCache.n
+          const pages = Math.ceil(total / size)
+
+          console.log(`[db-tracks] /api/tracks page=${page} size=${size} offset=${offset} total=${total}`)
+
+          // Query just this page from Postgres
+          const r = await db.queryDb(
+            'SELECT call, hex, type, desc_text, own_op, src, points FROM tracks ORDER BY id LIMIT $1 OFFSET $2',
+            [size, offset]
+          )
+          const tracks = r.rows.map(row => ({
+            call: row.call, hex: row.hex, type: row.type, desc: row.desc_text,
+            ownOp: row.own_op, src: row.src, points: row.points,
+          }))
+
+          const payload = JSON.stringify({ tracks, page, size, total, pages })
           res.setHeader('Content-Type', 'application/json')
-          res.setHeader('Content-Length', Buffer.byteLength(cached))
-          res.end(cached)
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(payload)
         } catch (e) {
-          console.error('[db-tracks] error', e)
+          console.error('[db-tracks] /api/tracks error', e)
           res.statusCode = 500
-          res.end('{"tracks":[]}')
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: String(e), tracks: [] }))
         }
+      })
+
+      // Legacy /tracks_yearly.json — redirect to page 0 so old clients
+      // get something, but real loading uses the paginated API above.
+      server.middlewares.use('/tracks_yearly.json', async (_req, res) => {
+        console.log('[db-tracks] /tracks_yearly.json requested — returning empty (use /api/tracks)')
+        res.setHeader('Content-Type', 'application/json')
+        res.end('{"tracks":[],"_use_api":true}')
       })
     },
   }

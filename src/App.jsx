@@ -318,6 +318,52 @@ const DATASETS = [
   { id: 'yearly', label: 'Globe history (location-filtered)', file: '/tracks_yearly.json' },
 ]
 
+// Fetch tracks in pages from /api/tracks (Postgres-backed) with progress
+// callback. Falls back to single /tracks_yearly.json fetch for local dev.
+async function fetchTracksChunked(onProgress) {
+  // Try paginated API first
+  const first = await fetch('/api/tracks?page=0&size=2000')
+  if (!first.ok) {
+    // Fallback: local dev serves the whole file
+    const r = await fetch('/tracks_yearly.json')
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+    return r.json()
+  }
+  const firstData = await first.json()
+  if (firstData._use_api) {
+    // Server told us to use the API (legacy endpoint)
+    const r2 = await fetch('/api/tracks?page=0&size=2000')
+    if (!r2.ok) throw new Error(`${r2.status}`)
+    const d2 = await r2.json()
+    return fetchRemainingPages(d2, onProgress)
+  }
+  return fetchRemainingPages(firstData, onProgress)
+}
+
+async function fetchRemainingPages(firstPage, onProgress) {
+  const { tracks, pages, total, size } = firstPage
+  const allTracks = [...tracks]
+  if (onProgress) onProgress(allTracks.length, total)
+
+  // Fetch remaining pages in parallel batches of 4
+  const remaining = []
+  for (let p = 1; p < pages; p++) remaining.push(p)
+
+  const BATCH = 4
+  for (let i = 0; i < remaining.length; i += BATCH) {
+    const batch = remaining.slice(i, i + BATCH)
+    const results = await Promise.all(
+      batch.map(p => fetch(`/api/tracks?page=${p}&size=${size}`).then(r => r.json()))
+    )
+    for (const r of results) {
+      allTracks.push(...r.tracks)
+    }
+    if (onProgress) onProgress(allTracks.length, total)
+  }
+
+  return { tracks: allTracks }
+}
+
 const CLASS_COLOR = {
   red: '#dc2626',
   orange: '#f97316',
@@ -556,6 +602,7 @@ function MapPage() {
   }, [liveActive])
   const [datasets, setDatasets] = useState({})
   const [errors, setErrors] = useState({})
+  const [loadProgress, setLoadProgress] = useState(null) // { loaded, total } or null
   const [schoolsByTail, setSchoolsByTail] = useState(new Map())
   const [compose, setCompose] = useState(null) // { to, subject, body, school, tail }
 
@@ -671,14 +718,18 @@ function MapPage() {
   useEffect(() => { clearSelected() }, [yearFilter, baseFilter])
 
   useEffect(() => {
-    // Fire immediately; the fetch itself is async so the Live button /
-    // header stay interactive while the JSON streams in.
-    DATASETS.forEach((ds) => {
-      fetch(ds.file)
-        .then((r) => (r.ok ? r.json() : Promise.reject(`${r.status} ${r.statusText}`)))
-        .then((d) => setDatasets((s) => ({ ...s, [ds.id]: d })))
-        .catch((e) => setErrors((s) => ({ ...s, [ds.id]: String(e) })))
-    })
+    // Load tracks — tries paginated /api/tracks first (Railway/Postgres),
+    // falls back to single /tracks_yearly.json fetch (local dev).
+    setLoadProgress({ loaded: 0, total: 0 })
+    fetchTracksChunked((loaded, total) => setLoadProgress({ loaded, total }))
+      .then((d) => {
+        setDatasets((s) => ({ ...s, yearly: d }))
+        setLoadProgress(null)
+      })
+      .catch((e) => {
+        setErrors((s) => ({ ...s, yearly: String(e) }))
+        setLoadProgress(null)
+      })
   }, [])
 
   // Precompute everything that depends on the FULL raw dataset. Heavy work
@@ -2439,6 +2490,19 @@ The team at Boulder Municipal Airport (KBDU)`
                 </div>
               )}
             </div>
+          </div>
+        )}
+        {loadProgress && (
+          <div className="absolute top-0 left-0 right-0 z-[1000] bg-gray-900/90 px-4 py-3 flex items-center gap-3">
+            <div className="flex-1 bg-gray-700 rounded-full h-2 overflow-hidden">
+              <div
+                className="bg-cyan-400 h-full transition-all duration-300"
+                style={{ width: `${loadProgress.total ? (loadProgress.loaded / loadProgress.total * 100) : 0}%` }}
+              />
+            </div>
+            <span className="text-xs text-white/80 whitespace-nowrap">
+              Loading tracks: {loadProgress.loaded.toLocaleString()} / {loadProgress.total.toLocaleString()}
+            </span>
           </div>
         )}
         <MapContainer center={[39.97, -105.03]} zoom={10} className="h-full w-full" preferCanvas={true} ref={mapRef}>
