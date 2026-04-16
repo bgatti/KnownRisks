@@ -4,8 +4,19 @@
 
 export const NOISE_ZONES = [
   {
+    name: 'Glider Box',
+    note: 'KBDU KML section',
+    polygon: [
+      [40.014678, -105.253536],
+      [40.014642, -105.193442],
+      [40.029362, -105.19342],
+      [40.029188, -105.253683],
+      [40.014678, -105.253536],
+    ],
+  },
+  {
     name: 'Frasier Meadows',
-    note: 'SE residential block — Frasier Meadows / Keewaydin neighborhood',
+    note: 'SE residential â€” Frasier Meadows / Keewaydin neighborhood',
     polygon: [
       [40.014271, -105.216554],
       [39.99606, -105.216639],
@@ -16,7 +27,7 @@ export const NOISE_ZONES = [
   },
   {
     name: 'Valmont / East Pearl',
-    note: 'Block immediately S of runway — 30th/Pearl/Valmont corridor',
+    note: 'S of runway â€” 30th/Pearl/Valmont corridor',
     polygon: [
       [40.029612, -105.226334],
       [40.029579, -105.2223],
@@ -27,7 +38,7 @@ export const NOISE_ZONES = [
   },
   {
     name: 'Central & West Boulder',
-    note: 'Downtown, University Hill, North Boulder, NCAR — main exclusion',
+    note: 'Downtown, University Hill, North Boulder, NCAR',
     polygon: [
       [40.060194, -105.244243],
       [40.062198, -105.247161],
@@ -51,7 +62,7 @@ export const NOISE_ZONES = [
   },
   {
     name: 'Gunbarrel / Heatherwood',
-    note: 'NE residential — Gunbarrel and Heatherwood subdivisions',
+    note: 'NE residential â€” Gunbarrel and Heatherwood subdivisions',
     polygon: [
       [40.051047, -105.220582],
       [40.051042, -105.187214],
@@ -68,6 +79,17 @@ export const NOISE_ZONES = [
       [40.082455, -105.196255],
       [40.060304, -105.220521],
       [40.051047, -105.220582],
+    ],
+  },
+  {
+    name: '8 / 26 Pattern',
+    note: 'KBDU KML section',
+    polygon: [
+      [40.039031, -105.25543],
+      [40.039157, -105.194986],
+      [40.050618, -105.195179],
+      [40.05065, -105.255613],
+      [40.039031, -105.25543],
     ],
   },
 ]

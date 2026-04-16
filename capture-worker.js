@@ -23,12 +23,17 @@ const nowIso = () => new Date().toISOString().replace(/\.\d{3}Z$/, '')
 let state = { day: todayUTC(), startedAt: nowIso(), byHex: new Map() }
 let pollInFlight = false
 
+const connStr = process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL
+const isInternal = connStr && connStr.includes('.railway.internal')
 const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL,
-  ssl: process.env.DATABASE_URL ? false : { rejectUnauthorized: false },
+  connectionString: connStr,
+  ssl: isInternal ? false : { rejectUnauthorized: false },
+  connectionTimeoutMillis: 10000,
 })
+pool.on('error', (err) => console.error('[capture-worker] pool error', err.message))
 
 async function initDb() {
+  console.log('[capture-worker] connecting to DB...', connStr?.replace(/:[^:@]+@/, ':***@'))
   await pool.query(`
     CREATE TABLE IF NOT EXISTS live_tracks (
       id SERIAL PRIMARY KEY,

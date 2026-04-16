@@ -402,6 +402,7 @@ export function computeNoiseRaster(tracks, opts = {}) {
     fieldElev = KBDU_ELEV_FT,
     samplePeriodS = 1,
     maxBlobs = 50000,
+    rasterPx = 1200,       // pixels on the longer grid axis
     // Time-of-day filter (local hour, MST = UTC-7). When set, only points
     // whose local hour falls in [todStart, todEnd) contribute blobs.
     // todStart > todEnd wraps past midnight (e.g. 22→4 = 10PM–4AM).
@@ -488,9 +489,8 @@ export function computeNoiseRaster(tracks, opts = {}) {
   const dLat = latMax - latMin, dLon = lonMax - lonMin
   if (dLat <= 0 || dLon <= 0) return null
   const aspect = (dLon * Math.cos((latMin+latMax)/2 * Math.PI / 180)) / dLat
-  const targetPx = 600
-  const gridW = aspect >= 1 ? targetPx : Math.max(64, Math.round(targetPx * aspect))
-  const gridH = aspect >= 1 ? Math.max(64, Math.round(targetPx / aspect)) : targetPx
+  const gridW = aspect >= 1 ? rasterPx : Math.max(64, Math.round(rasterPx * aspect))
+  const gridH = aspect >= 1 ? Math.max(64, Math.round(rasterPx / aspect)) : rasterPx
   const result = rasterize(upsampled, gridW, gridH, latMin, latMax, lonMin, lonMax, directionalGain, {
     autoRange: accumAutoRange, logLo: accumLogLo, logHi: accumLogHi,
   })

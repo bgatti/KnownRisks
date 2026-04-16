@@ -368,7 +368,7 @@ export default function App() {
     return (
       <div className="h-full w-full flex flex-col">
         <header className="px-4 py-3 border-b border-white/10 flex items-center gap-4">
-          <h1 className="text-lg font-semibold">KBDU Noise</h1>
+          <h1 className="text-lg font-semibold">Front Range Aviation Monitor</h1>
           <Nav hash={hash} />
         </header>
         <div className="flex-1 overflow-hidden">
@@ -622,7 +622,8 @@ function MapPage() {
   const [onlyViolations, setOnlyViolations] = useState(false)
   const [realImpact, setRealImpact] = useState(true)
   const [impactOpacity, setImpactOpacity] = useState(1.0)
-  const [clipToRadius, setClipToRadius] = useState(true)
+  const [clipToRadius, setClipToRadius] = useState(false)
+  const mapRef = useRef(null)
   const [todFilter, setTodFilter] = useState(false)
   const [todStart, setTodStart] = useState(7)
   const [todEnd, setTodEnd] = useState(22)
@@ -1664,7 +1665,7 @@ function MapPage() {
         <ComposeNoticeModal compose={compose} onClose={() => setCompose(null)} />
       )}
       <header className="px-4 py-3 border-b border-white/10 flex flex-wrap items-center gap-x-6 gap-y-2">
-        <h1 className="text-lg font-semibold">KBDU Noise</h1>
+        <h1 className="text-lg font-semibold">Front Range Aviation Monitor</h1>
         <Nav hash={hash} />
         <div className="text-xs text-white/60">
           {visible.length} tracks ·{' '}
@@ -1743,10 +1744,25 @@ function MapPage() {
             <input type="checkbox" checked={onlyViolations} onChange={(e) => setOnlyViolations(e.target.checked)} />
             <span>Only violators</span>
           </label>
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <input type="checkbox" checked={clipToRadius} onChange={(e) => setClipToRadius(e.target.checked)} />
-            <span>Clip to {MAP_RADIUS_NM} nm</span>
-          </label>
+          <div className="flex items-center gap-1 flex-wrap">
+            {[
+              { code: 'KBDU', lat: 40.0394, lon: -105.2258, zoom: 13 },
+              { code: 'KBJC', lat: 39.9088, lon: -105.1172, zoom: 13 },
+              { code: 'KEIK', lat: 40.0098, lon: -105.0488, zoom: 13 },
+              { code: 'KLMO', lat: 40.1636, lon: -105.1636, zoom: 13 },
+              { code: 'KAPA', lat: 39.5701, lon: -104.8493, zoom: 13 },
+              { code: 'KGXY', lat: 40.4348, lon: -104.6331, zoom: 13 },
+              { code: 'All', lat: 39.97, lon: -105.03, zoom: 10 },
+            ].map((ap) => (
+              <button
+                key={ap.code}
+                onClick={() => mapRef.current && mapRef.current.flyTo([ap.lat, ap.lon], ap.zoom, { duration: 1 })}
+                className="text-[9px] px-1.5 py-0.5 rounded border border-white/20 text-white/70 hover:border-cyan-400 hover:text-cyan-200"
+              >
+                {ap.code}
+              </button>
+            ))}
+          </div>
           {realImpact && (
             <div className="flex items-center gap-1.5">
               <span className="text-white/60">opacity</span>
@@ -2419,7 +2435,7 @@ The team at Boulder Municipal Airport (KBDU)`
             </div>
           </div>
         )}
-        <MapContainer center={KBDU} zoom={12} className="h-full w-full" preferCanvas={true}>
+        <MapContainer center={[39.97, -105.03]} zoom={10} className="h-full w-full" preferCanvas={true} ref={mapRef}>
           <TileLayer
             attribution="&copy; OpenStreetMap"
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
