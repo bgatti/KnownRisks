@@ -1108,28 +1108,9 @@ export function NoiseStudio() {
           </div>
           <div className="text-left leading-tight">
             <div className="text-white text-[11px] font-bold group-hover:text-sky-300 transition-colors">Airport Impact</div>
-            <div className="text-slate-400 text-[9px] uppercase tracking-wider">← back to district</div>
           </div>
         </a>
-        <div className="px-3 py-2 rounded-lg bg-slate-950/80 backdrop-blur-md border border-white/10">
-          <div className="text-slate-500 text-[9px] uppercase tracking-wider font-semibold">Viewing</div>
-          <select
-            value={FALLBACK.airport?.icao || DEFAULT_AIRPORT}
-            onChange={(e) => {
-              const next = e.target.value
-              const url = new URL(window.location.href)
-              url.searchParams.set('airport', next)
-              window.location.href = url.toString()
-            }}
-            className="bg-transparent text-white font-bold text-xs outline-none cursor-pointer"
-          >
-            {Object.values(DFAID_AIRPORTS).map((a) => (
-              <option key={a.icao} value={a.icao} className="bg-slate-900">
-                {a.icao} · {a.name} — {a.city}
-              </option>
-            ))}
-          </select>
-        </div>
+        {/* Airport selector removed — the report page covers all airports */}
       </div>
 
       {/* Hover pill over a flight track */}
