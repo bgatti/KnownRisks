@@ -717,6 +717,9 @@ function MapPage() {
   const [todFilter, setTodFilter] = useState(false)
   const [todStart, setTodStart] = useState(7)
   const [todEnd, setTodEnd] = useState(22)
+  const [todAnimate, setTodAnimate] = useState(false)
+  const [todAnimIdx, setTodAnimIdx] = useState(0)
+  const [todCache, setTodCache] = useState(null)
   const [dirFilter, setDirFilter] = useState('all') // 'all' | 'east' | 'west'
   const [originFilter, setOriginFilter] = useState('all') // 'all' | 'local' | 'transient'
   const [selectedTails, setSelectedTails] = useState([])
@@ -1303,11 +1306,7 @@ function MapPage() {
     { label: 'Night', start: 22, end: 4 },
     { label: 'All', start: 0, end: 24 },
   ]
-  const [todAnimate, setTodAnimate] = useState(false)
-  const [todAnimIdx, setTodAnimIdx] = useState(0)
   const todTimerRef = useRef(null)
-  // Cache: pre-fetched tracks + stats for each TOD block
-  const [todCache, setTodCache] = useState(null) // { blocks: [{tracks, stats, raster},...] }
 
   // When animate starts, pre-fetch all 4 TOD blocks in parallel and cache
   useEffect(() => {
