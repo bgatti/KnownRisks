@@ -2101,11 +2101,13 @@ function MapPage() {
           )}
           {/* LATE-LOADING controls appear to the right of the always-present ones */}
           {availableYears.length > 0 && (
-            <div className="flex items-center gap-0 rounded overflow-hidden border border-white/15">
+            <div className="flex items-center gap-1">
               <button
                 onClick={() => setYearFilter(yearFilter === 'all' ? null : 'all')}
-                className={`px-2 py-0.5 text-xs text-white/90 ${
-                  yearFilter === 'all' ? 'ring-2 ring-cyan-400 ring-inset' : 'hover:brightness-125'
+                className={`px-2.5 py-0.5 text-xs rounded-full border ${
+                  yearFilter === 'all'
+                    ? 'border-cyan-400 bg-cyan-500/20 text-white'
+                    : 'border-white/15 text-white/60 hover:text-white hover:border-white/30'
                 }`}
               >
                 all yrs
@@ -2117,9 +2119,11 @@ function MapPage() {
                   <button
                     key={y}
                     onClick={() => setYearFilter(yearFilter === y ? null : y)}
-                    style={{ backgroundColor: bg }}
-                    className={`px-2 py-0.5 text-xs text-white/90 ${
-                      yearFilter === y ? 'ring-2 ring-cyan-400 ring-inset' : 'hover:brightness-125'
+                    style={yearFilter !== y ? { backgroundColor: bg } : undefined}
+                    className={`px-2.5 py-0.5 text-xs rounded-full border ${
+                      yearFilter === y
+                        ? 'border-cyan-400 bg-cyan-500/20 text-white'
+                        : 'border-white/10 text-white/90 hover:brightness-125'
                     }`}
                     title={`${y} · ${pct.toFixed(1)}% red`}
                   >
