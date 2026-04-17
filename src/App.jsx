@@ -719,7 +719,14 @@ function MapPage() {
   const [clipToRadius, setClipToRadius] = useState(false)
   const mapRef = useRef(null)
   const [mobilePanel, setMobilePanel] = useState(null) // null | 'stats' | 'chart'
-  const isMobile = typeof window !== 'undefined' && window.innerWidth < 640
+  const [mobileFilters, setMobileFilters] = useState(false)
+  const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 639px)').matches)
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 639px)')
+    const onChange = (e) => setIsMobile(e.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
   const [todFilter, setTodFilter] = useState(false)
   const [todStart, setTodStart] = useState(7)
   const [todEnd, setTodEnd] = useState(22)
@@ -1961,8 +1968,27 @@ function MapPage() {
       {compose && (
         <ComposeNoticeModal compose={compose} onClose={() => setCompose(null)} />
       )}
-      <header className="px-4 py-3 max-sm:px-2 max-sm:py-2 border-b border-white/10 flex flex-wrap items-center gap-x-6 gap-y-2 max-sm:gap-x-2 max-sm:gap-y-1">
-        <h1 className="text-lg max-sm:text-sm font-semibold">Front Range Aviation Monitor</h1>
+      <header className={`border-b border-white/10 ${isMobile ? 'px-2 py-1.5' : 'px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-2'}`}>
+        {isMobile ? (
+          /* ── Mobile header: compact bar with expand toggle ── */
+          <div className="flex items-center gap-2">
+            <h1 className="text-sm font-semibold flex-1 truncate">FRAM</h1>
+            <span className="text-[10px] text-white/60">
+              {visible.length} tracks
+            </span>
+            <button
+              onClick={() => setMobileFilters(v => !v)}
+              className={`px-2 py-1 text-[10px] rounded border ${
+                mobileFilters ? 'border-cyan-400 bg-cyan-500/20 text-white' : 'border-white/20 text-white/60'
+              }`}
+            >
+              Filters
+            </button>
+          </div>
+        ) : (
+          /* ── Desktop header: full controls ── */
+          <>
+        <h1 className="text-lg font-semibold">Front Range Aviation Monitor</h1>
         <Nav route={route} />
         <div className="text-xs text-white/60">
           {visible.length} tracks ·{' '}
@@ -2262,7 +2288,87 @@ function MapPage() {
             </div>
           )}
         </div>
-
+          </>
+        )}
+        {/* ── Mobile filter drawer ── */}
+        {isMobile && mobileFilters && (
+          <div className="flex flex-wrap gap-1.5 pt-2 pb-1 border-t border-white/10 mt-1.5">
+            {/* Layer toggles */}
+            {[
+              { label: 'Paths', active: showPaths, toggle: () => setShowPaths(v => !v) },
+              { label: 'Zones', active: showZones, toggle: () => setShowZones(v => !v) },
+              { label: 'Heatmap', active: realImpact, toggle: () => setRealImpact(v => !v) },
+              { label: 'Violators', active: onlyViolations, toggle: () => setOnlyViolations(v => !v) },
+            ].map(b => (
+              <button key={b.label} onClick={b.toggle}
+                className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                  b.active ? 'border-cyan-400 text-cyan-200 bg-cyan-500/20' : 'border-white/20 text-white/50'
+                }`}
+              >{b.label}</button>
+            ))}
+            {/* Year pills */}
+            {availableYears.length > 0 && (
+              <div className="flex items-center gap-1 w-full">
+                <button onClick={() => setYearFilter('all')}
+                  className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                    yearFilter === 'all' ? 'border-cyan-400 bg-cyan-500/20 text-white' : 'border-white/15 text-white/60'
+                  }`}>all</button>
+                {availableYears.map(y => (
+                  <button key={y} onClick={() => setYearFilter(yearFilter === y ? 'all' : y)}
+                    className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                      yearFilter === y ? 'border-cyan-400 bg-cyan-500/20 text-white' : 'border-white/15 text-white/60'
+                    }`}>{y}</button>
+                ))}
+              </div>
+            )}
+            {/* Base pills */}
+            {availableBases.length > 0 && (
+              <div className="flex items-center gap-1 w-full overflow-x-auto">
+                <button onClick={() => setBaseFilter('all')}
+                  className={`text-[10px] px-2 py-0.5 rounded-full border whitespace-nowrap ${
+                    baseFilter === 'all' ? 'border-cyan-400 bg-cyan-500/20 text-white' : 'border-white/15 text-white/60'
+                  }`}>all</button>
+                {availableBases.map(b => (
+                  <button key={b} onClick={() => setBaseFilter(b)}
+                    className={`text-[10px] px-2 py-0.5 rounded-full border font-mono whitespace-nowrap ${
+                      baseFilter === b ? 'border-cyan-400 bg-cyan-500/20 text-white' : 'border-white/15 text-white/60'
+                    }`}>{b}</button>
+                ))}
+              </div>
+            )}
+            {/* School + Purpose dropdowns */}
+            <div className="flex gap-1 w-full">
+              {availableSchools.length > 0 && (
+                <select value={schoolFilter} onChange={e => setSchoolFilter(e.target.value)}
+                  className="flex-1 border border-white/15 text-[10px] rounded-full px-2 py-1 bg-gray-800 text-white/90 truncate">
+                  <option value="all">all schools</option>
+                  {availableSchools.map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
+              )}
+              {noiseStats?.purposes && (
+                <select value={purposeFilter} onChange={e => setPurposeFilter(e.target.value)}
+                  className="flex-1 border border-white/15 text-[10px] rounded-full px-2 py-1 bg-gray-800 text-white/90 truncate">
+                  <option value="all">all purposes</option>
+                  {noiseStats.purposes.map(p => <option key={p} value={p}>{p.replace(/_/g, ' ')}</option>)}
+                </select>
+              )}
+            </div>
+            {/* Quick-fly buttons */}
+            <div className="flex gap-1 w-full overflow-x-auto">
+              {[
+                { code: 'KBDU', lat: 40.0394, lon: -105.2258, zoom: 13 },
+                { code: 'KBJC', lat: 39.9088, lon: -105.1172, zoom: 13 },
+                { code: 'KAPA', lat: 39.5701, lon: -104.8493, zoom: 13 },
+                { code: 'All', lat: 39.97, lon: -105.03, zoom: 10 },
+              ].map(ap => (
+                <button key={ap.code}
+                  onClick={() => { mapRef.current?.flyTo([ap.lat, ap.lon], ap.zoom, { duration: 1 }); setMobileFilters(false) }}
+                  className="text-[9px] px-1.5 py-0.5 rounded border border-white/20 text-white/70 whitespace-nowrap"
+                >{ap.code}</button>
+              ))}
+            </div>
+          </div>
+        )}
       </header>
 
       <div
