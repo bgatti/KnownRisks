@@ -84,9 +84,11 @@ function classifyTrack(points, call, src, schoolMap) {
   const year = m ? m[1] : null
   const date = m ? `${m[1]}-${m[2]}-${m[3]}` : null
 
-  // Filter to below 7500 ft for classification
-  const pts = (points || []).filter(p => p[2] < 7500)
-  if (pts.length < 2) {
+  // All points for band rendering; low points for classification
+  const allPts = points || []
+  const pts = allPts.filter(p => p[2] < 7500)
+
+  if (allPts.length < 2) {
     return {
       year, date,
       base_airport: null, origin: null, worst_class: null,
@@ -97,36 +99,40 @@ function classifyTrack(points, call, src, schoolMap) {
     }
   }
 
-  const first = pts[0]
-  const last = pts[pts.length - 1]
+  // Use all points for base/origin determination
+  const first = allPts[0]
+  const last = allPts[allPts.length - 1]
   const firstBase = nearestAirport(first[0], first[1], 3)
   const lastBase = nearestAirport(last[0], last[1], 3)
   const base_airport = firstBase || lastBase
   const isLocal = nmFrom(first[0], first[1], KBDU[0], KBDU[1]) <= LOCAL_RADIUS_NM
   const origin = isLocal ? 'local' : 'transient'
 
-  // Classify each point against all noise zones
-  const tags = pts.map(p => classifyPoint(p[0], p[1], p[2], NOISE_ZONES))
+  // Total track length from ALL points (full flight)
+  let len_total_ft = 0
+  for (let i = 1; i < allPts.length; i++) {
+    len_total_ft += distFt(allPts[i-1][0], allPts[i-1][1], allPts[i][0], allPts[i][1])
+  }
 
-  // Compute segment stats — total track length is the FULL flight,
-  // infraction lengths are wherever the flight enters any noise zone.
-  // No geographic restriction (not limited to KBDU vicinity).
+  // Classify low points against noise zones for infraction stats
   let seg_total = 0, seg_red = 0, seg_orange = 0, seg_yellow = 0
-  let len_total_ft = 0, len_red_ft = 0, len_orange_ft = 0, len_yellow_ft = 0
+  let len_red_ft = 0, len_orange_ft = 0, len_yellow_ft = 0
   let worst_class = null
 
-  for (let i = 1; i < pts.length; i++) {
-    const a = pts[i - 1], b = pts[i]
-    const seg = distFt(a[0], a[1], b[0], b[1])
-    seg_total++
-    len_total_ft += seg
-    const ta = tags[i-1], tb = tags[i]
-    const worst = (SEVERITY[ta]||0) >= (SEVERITY[tb]||0) ? ta : tb
-    if (worst === 'red') { seg_red++; len_red_ft += seg }
-    else if (worst === 'orange') { seg_orange++; len_orange_ft += seg }
-    else if (worst === 'yellow') { seg_yellow++; len_yellow_ft += seg }
-    if (worst && (!worst_class || SEVERITY[worst] > SEVERITY[worst_class])) {
-      worst_class = worst
+  if (pts.length >= 2) {
+    const tags = pts.map(p => classifyPoint(p[0], p[1], p[2], NOISE_ZONES))
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i]
+      const seg = distFt(a[0], a[1], b[0], b[1])
+      seg_total++
+      const ta = tags[i-1], tb = tags[i]
+      const worst = (SEVERITY[ta]||0) >= (SEVERITY[tb]||0) ? ta : tb
+      if (worst === 'red') { seg_red++; len_red_ft += seg }
+      else if (worst === 'orange') { seg_orange++; len_orange_ft += seg }
+      else if (worst === 'yellow') { seg_yellow++; len_yellow_ft += seg }
+      if (worst && (!worst_class || SEVERITY[worst] > SEVERITY[worst_class])) {
+        worst_class = worst
+      }
     }
   }
 
