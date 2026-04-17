@@ -9,6 +9,7 @@ import BasesDiagnostic from './BasesDiagnostic.jsx'
 import NoticePage from './NoticePage.jsx'
 import ThinningTest from './ThinningTest.jsx'
 import NoiseImpactTest from './NoiseImpactTest.jsx'
+import { NoiseStudio as NoiseReportPage } from './NoiseReport.jsx'
 import { computeNoiseRaster, computeImpactRaster } from './noiseRaster'
 import { loadPopulationDensity, rasterizePopulation } from './populationRaster'
 import { loadTerrain, terrainAt } from './terrain'
@@ -429,6 +430,9 @@ export default function App() {
   const route = path.split('?')[0]
   if (route === '/notice') {
     return <NoticePage />
+  }
+  if (route === '/report') {
+    return <NoiseReportPage />
   }
   if (route === '/yoy' || route === '/bases' || route === '/thinning' || route === '/impact') {
     return (
