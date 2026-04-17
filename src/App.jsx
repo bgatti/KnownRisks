@@ -1959,8 +1959,8 @@ function MapPage() {
       {compose && (
         <ComposeNoticeModal compose={compose} onClose={() => setCompose(null)} />
       )}
-      <header className="px-4 py-3 border-b border-white/10 flex flex-wrap items-center gap-x-6 gap-y-2">
-        <h1 className="text-lg font-semibold">Front Range Aviation Monitor</h1>
+      <header className="px-4 py-3 max-sm:px-2 max-sm:py-2 border-b border-white/10 flex flex-wrap items-center gap-x-6 gap-y-2 max-sm:gap-x-2 max-sm:gap-y-1">
+        <h1 className="text-lg max-sm:text-sm font-semibold">Front Range Aviation Monitor</h1>
         <Nav route={route} />
         <div className="text-xs text-white/60">
           {visible.length} tracks ·{' '}
@@ -2271,7 +2271,7 @@ function MapPage() {
         }}
       >
         {byTail.length > 0 && (
-          <div className="absolute top-3 right-3 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] max-h-[calc(100%-1.5rem)] overflow-y-auto w-72">
+          <div className="absolute top-3 right-3 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] max-h-[calc(100%-1.5rem)] overflow-y-auto w-72 max-sm:w-52 max-sm:right-1 max-sm:top-1">
             <div className="flex items-center justify-between mb-1 px-1 gap-2">
               <div className="flex items-center gap-0 rounded overflow-hidden border border-white/15">
                 <button
@@ -2405,7 +2405,7 @@ function MapPage() {
           }
 
           return (
-            <div className="absolute bottom-3 left-3 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2">
+            <div className="absolute bottom-3 left-3 max-sm:left-1 max-sm:bottom-1 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 max-sm:max-w-[calc(100%-0.5rem)]">
               <div className="flex items-center gap-2 mb-1 px-1">
                 <span className="text-white/70 text-[10px] font-medium">Excursion %</span>
                 <span className="text-white/40 text-[9px]">
@@ -2473,7 +2473,7 @@ function MapPage() {
             ...liveOffenses.flatMap((a) => a.events.map((e) => e.distFt)),
           )
           return (
-            <div className="absolute top-3 right-[19.5rem] z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] w-64 max-h-[70%] overflow-y-auto">
+            <div className="absolute top-3 right-[19.5rem] max-sm:right-1 max-sm:top-[45%] z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] w-64 max-sm:w-52 max-h-[70%] max-sm:max-h-[50%] overflow-y-auto">
               <div className="text-white/50 uppercase tracking-wide text-[9px] mb-1 px-1 flex items-center justify-between">
                 <span>Live offenders · {liveOffenses.length}</span>
                 {selectedTails.length > 0 && (
@@ -2641,7 +2641,7 @@ The team at Boulder Municipal Airport (KBDU)`
           )
         })()}
         {byBase.length > 0 && (
-          <div className="absolute bottom-3 right-3 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] w-64">
+          <div className="absolute bottom-3 right-3 max-sm:right-1 max-sm:bottom-1 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] w-64 max-sm:w-52">
             <div className="flex items-center gap-2 mb-1 px-1">
               <div className="flex items-center gap-0 rounded overflow-hidden border border-white/15">
                 <button
