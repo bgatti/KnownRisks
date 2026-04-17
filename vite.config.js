@@ -2033,6 +2033,10 @@ export default defineConfig({
     port: parseInt(process.env.PORT || '5174'),
     allowedHosts: true,
     open: process.env.RAILWAY_ENVIRONMENT ? false : '/',
+    headers: {
+      'Cache-Control': 'no-store, no-cache, must-revalidate',
+      'Pragma': 'no-cache',
+    },
     proxy: {
       // Two live ADS-B feeds. adsb.lol is the preferred primary; the client
       // auto-fails over to airplanes.live when it can't reach the primary.

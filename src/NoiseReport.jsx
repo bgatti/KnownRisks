@@ -1218,7 +1218,7 @@ export function NoiseStudio() {
 
       {/* Active excursions panel — floating tiles on mobile, sidebar on desktop */}
       <aside className="absolute z-[1000] pointer-events-auto
-        bottom-[4.5rem] left-2 md:bottom-auto md:top-24 md:left-4 md:right-auto md:w-72 md:max-h-[60vh]">
+        bottom-[4.5rem] left-2 max-w-[50vw] md:max-w-none md:bottom-auto md:top-24 md:left-4 md:right-auto md:w-56 md:max-h-[55vh]">
         <ExcursionList
           activeList={activeList}
           activeStatus={activeStatus}
@@ -1529,13 +1529,8 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
 
       {/* ─ Desktop: vertical sidebar list ─ */}
       <div className="hidden md:flex md:flex-col md:overflow-hidden bg-black/60 backdrop-blur-md border border-white/10 rounded-lg shadow-2xl">
-        <div className="px-3 py-2.5 border-b border-white/10">
-          <p className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">Active Excursions</p>
-          <p className="text-[11px] text-neutral-400">
-            {activeStatus === 'loading' && 'Loading…'}
-            {activeStatus === 'error' && <span className="text-rose-300">Feed unavailable</span>}
-            {activeStatus === 'ok' && `${activeList.length} aircraft · 2h`}
-          </p>
+        <div className="px-2 py-1.5 border-b border-white/10">
+          <p className="text-[9px] uppercase tracking-[0.15em] text-neutral-500">Excursions</p>
         </div>
         <ul className="overflow-y-auto">
           {activeStatus === 'ok' && items.length === 0 && (
@@ -1546,11 +1541,11 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
               <button
                 onClick={g.onClick}
                 className={[
-                  'w-full text-left px-3 py-2.5 flex items-center gap-2.5 transition-colors',
+                  'w-full text-left px-2 py-1.5 flex items-center gap-2 transition-colors',
                   g.anyActive ? 'bg-white/10' : 'hover:bg-white/5',
                 ].join(' ')}
               >
-                <div className="relative h-10 w-14 flex-shrink-0 rounded overflow-hidden bg-black/40 border border-white/10">
+                <div className="relative h-8 w-10 flex-shrink-0 rounded overflow-hidden bg-black/40 border border-white/10">
                   {typePhotos?.[g.type] ? (
                     <img src={typePhotos[g.type]} alt="" loading="lazy" className="absolute inset-0 w-full h-full object-cover" />
                   ) : (
@@ -1563,7 +1558,7 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center justify-between gap-2">
-                    <div className="text-sm font-medium text-neutral-100 truncate">{g.type}</div>
+                    <div className="text-xs font-medium text-neutral-100 truncate">{g.type}</div>
                     {g.nearestMeters != null && (
                       <div className="text-[11px] font-mono text-neutral-200 flex-shrink-0">
                         {formatMiles(g.nearestMeters)}
