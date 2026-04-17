@@ -1411,6 +1411,7 @@ function LocationCard({ rawCoords, precision, setPrecision, displayedLocation, r
       )}
       {locationError && <p className="text-[10px] text-rose-300 mt-1">{locationError}</p>}
 
+      {/* Precision picker removed — defaulting to precise. Uncomment to restore.
       <div className="mt-2.5 grid grid-cols-3 gap-1 p-0.5 rounded border border-white/10 bg-white/5">
         {PRECISION_OPTIONS.map((opt) => {
           const active = precision === opt.key
@@ -1429,7 +1430,7 @@ function LocationCard({ rawCoords, precision, setPrecision, displayedLocation, r
             </button>
           )
         })}
-      </div>
+      </div> */}
     </div>
   )
 }
