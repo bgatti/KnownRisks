@@ -386,34 +386,40 @@ const CLASS_COLOR = {
   yellow: '#facc15',
 }
 
-// Dirty-pastel color for clean (non-violation) track segments.
-// Maps altitude to a cool→warm gradient:
-//   high (≥7500 ft) → dusty slate blue (safe, well above)
-//   mid  (~5500 ft) → muted sage green
-//   low  (≤3500 ft) → warm clay/terracotta (low, approaching risk)
-// Uses MSL altitude; the field elevation (~5300 ft) sits mid-range.
+// Color for clean (non-violation) track segments based on altitude.
+// Calibrated to real data: p10=5750 ft, median=7100 ft, p90=8000 ft.
+// The worst 10% (low-flying) get a warm amber; the default/majority
+// is a dark cool cyan that reads clearly as "safe". The gradient is
+// compressed into the 5500–8000 ft range where most flights sit.
+//
+//   ≤5500 ft  → warm amber   rgb(180,120,60)   — unusually low
+//    6000 ft  → muted olive  rgb(100,120,80)
+//    7000 ft  → dark teal    rgb(40,110,110)    — typical
+//   ≥8000 ft  → dark cyan    rgb(30,90,120)     — high, safe
 const CLEAN_STOPS = [
-  [3500, [178, 132, 120]],  // warm clay — low, near terrain
-  [4500, [186, 156, 130]],  // dusty tan
-  [5500, [152, 170, 140]],  // sage green — mid altitude
-  [6500, [130, 160, 160]],  // muted teal
-  [7500, [140, 155, 180]],  // dusty slate blue — high, safe
+  [5500, [180, 120,  60]],   // warm amber — bottom 10%
+  [6000, [100, 120,  80]],   // muted olive
+  [7000, [ 40, 110, 110]],   // dark teal — median
+  [8000, [ 30,  90, 120]],   // dark cyan — top 10%
 ]
 
 function cleanColor(avgAlt) {
-  if (avgAlt == null) return '#9ca3af' // gray fallback
+  if (avgAlt == null) return '#1e6060' // dark teal fallback
+  if (avgAlt <= CLEAN_STOPS[0][0]) {
+    const [, c] = CLEAN_STOPS[0]
+    return `rgb(${c[0]},${c[1]},${c[2]})`
+  }
   for (let i = 0; i < CLEAN_STOPS.length - 1; i++) {
     const [a0, c0] = CLEAN_STOPS[i]
     const [a1, c1] = CLEAN_STOPS[i + 1]
     if (avgAlt <= a1) {
-      const t = Math.max(0, Math.min(1, (avgAlt - a0) / (a1 - a0)))
+      const t = (avgAlt - a0) / (a1 - a0)
       const r = Math.round(c0[0] + (c1[0] - c0[0]) * t)
       const g = Math.round(c0[1] + (c1[1] - c0[1]) * t)
       const b = Math.round(c0[2] + (c1[2] - c0[2]) * t)
       return `rgb(${r},${g},${b})`
     }
   }
-  // Above highest stop
   const [, c] = CLEAN_STOPS[CLEAN_STOPS.length - 1]
   return `rgb(${c[0]},${c[1]},${c[2]})`
 }
