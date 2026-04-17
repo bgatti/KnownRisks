@@ -1205,17 +1205,8 @@ export function NoiseStudio() {
               </button>
             </div>
           </div>
-          <div className="hidden md:block">
-            <LocationCard
-              rawCoords={rawCoords}
-              precision={precision}
-              setPrecision={setPrecision}
-              displayedLocation={displayedLocation}
-              requestLocation={requestLocation}
-              locating={locating}
-              locationError={locationError}
-            />
-          </div>
+          {/* LocationCard hidden — location auto-requests silently on load.
+              Precision defaults to precise. No user interaction needed. */}
         </div>
       </header>
 
@@ -1244,9 +1235,9 @@ export function NoiseStudio() {
         />
       )}
 
-      {/* Active excursions panel — compact strip on mobile, sidebar on desktop */}
+      {/* Active excursions panel — floating tiles on mobile, sidebar on desktop */}
       <aside className="absolute z-[1000] pointer-events-auto
-        bottom-14 left-1 right-1 md:bottom-auto md:top-24 md:left-4 md:right-auto md:w-72 md:max-h-[60vh]">
+        bottom-14 left-2 md:bottom-auto md:top-24 md:left-4 md:right-auto md:w-72 md:max-h-[60vh]">
         <ExcursionList
           activeList={activeList}
           activeStatus={activeStatus}
@@ -1524,20 +1515,20 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
   })
 
   return (
-    <div className="bg-black/60 backdrop-blur-md border border-white/10 rounded-lg shadow-2xl flex flex-col overflow-hidden">
-      {/* ─ Mobile: ultra-compact thumbnail strip ─ */}
+    <div>
+      {/* ─ Mobile: bare floating tiles, no panel background ─ */}
       <div className="md:hidden">
-        <ul className="flex gap-1 overflow-x-auto px-1 py-0.5 scrollbar-none">
+        <ul className="flex gap-1.5 overflow-x-auto scrollbar-none">
           {items.map((g) => (
             <li key={g.type} className="flex-shrink-0">
               <button
                 onClick={g.onClick}
                 title={`${g.type}${g.nearestMeters != null ? ' · ' + formatMiles(g.nearestMeters) : ''}`}
                 className={[
-                  'relative h-10 w-10 rounded overflow-hidden border transition-colors',
+                  'relative h-11 w-11 rounded-lg overflow-hidden shadow-lg transition-all',
                   g.anyActive
-                    ? 'border-sky-400 ring-1 ring-sky-400/50'
-                    : 'border-white/15',
+                    ? 'border-2 border-sky-400 ring-2 ring-sky-400/40 scale-110'
+                    : 'border border-white/20',
                 ].join(' ')}
               >
                 {typePhotos?.[g.type] ? (
@@ -1546,8 +1537,8 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
                   <div className="absolute inset-0 bg-neutral-900 flex items-center justify-center text-[7px] text-neutral-400 font-semibold leading-none text-center px-0.5">{g.type}</div>
                 )}
                 <span
-                  className="absolute bottom-0.5 right-0.5 h-1.5 w-1.5 rounded-full"
-                  style={{ background: KLASS_COLORS[g.worst], boxShadow: `0 0 4px ${KLASS_COLORS[g.worst]}` }}
+                  className="absolute bottom-0.5 right-0.5 h-2 w-2 rounded-full border border-black/50"
+                  style={{ background: KLASS_COLORS[g.worst], boxShadow: `0 0 6px ${KLASS_COLORS[g.worst]}` }}
                 />
               </button>
             </li>
@@ -1555,8 +1546,8 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
         </ul>
       </div>
 
-      {/* ─ Desktop: vertical list ─ */}
-      <div className="hidden md:flex md:flex-col md:overflow-hidden">
+      {/* ─ Desktop: vertical sidebar list ─ */}
+      <div className="hidden md:flex md:flex-col md:overflow-hidden bg-black/60 backdrop-blur-md border border-white/10 rounded-lg shadow-2xl">
         <div className="px-3 py-2.5 border-b border-white/10">
           <p className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">Active Excursions</p>
           <p className="text-[11px] text-neutral-400">
