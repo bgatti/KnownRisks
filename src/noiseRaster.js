@@ -652,7 +652,16 @@ export function computeImpactRaster(tracks, popData, opts = {}) {
   const energy = accumulate(allBlobs, gridW, gridH, latMin, latMax, lonMin, lonMax, directionalGain)
   if (!energy) return null
 
-  // Step 2: multiply each cell by population density at that cell's location
+  // Step 2: multiply each noise cell by a normalized population weight.
+  // Raw density values span 0–25000+ people/km², so we log-normalize them
+  // into a 0–1 weight: unpopulated cells → 0, dense urban → 1. This keeps
+  // the product in a range where the auto-range colorizer can discriminate
+  // between "noisy over suburbs" and "noisy over downtown" without the raw
+  // magnitude of dense-area counts overwhelming everything else.
+  const POP_LOG_FLOOR = Math.log(10)    // below 10 ppl/km² ≈ uninhabited
+  const POP_LOG_CEIL  = Math.log(15000) // dense urban saturates at 1.0
+  const popSpan = POP_LOG_CEIL - POP_LOG_FLOOR
+
   const impact = new Float32Array(gridW * gridH)
   for (let row = 0; row < gridH; row++) {
     const lat = latMax - (row + 0.5) / gridH * (latMax - latMin)
@@ -661,7 +670,10 @@ export function computeImpactRaster(tracks, popData, opts = {}) {
       const e = energy[row * gridW + col]
       if (e <= 0) continue
       const pop = samplePopDensity(popData, lat, lon)
-      impact[row * gridW + col] = e * pop
+      if (pop <= 0) continue
+      // Log-normalized population weight: 0 (rural) → 1 (dense urban)
+      const popWeight = Math.max(0, Math.min(1, (Math.log(pop) - POP_LOG_FLOOR) / popSpan))
+      impact[row * gridW + col] = e * popWeight
     }
   }
 

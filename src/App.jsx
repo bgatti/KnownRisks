@@ -460,6 +460,7 @@ function MapPage() {
   const [yearFilter, setYearFilter] = useState(null) // null = not initialized, 'all' or a specific year
   const [baseFilter, setBaseFilter] = useState('all') // 'all' or an airport code
   const [schoolFilter, setSchoolFilter] = useState('all') // 'all' or school name
+  const [purposeFilter, setPurposeFilter] = useState('all') // 'all' or purpose category
   const [offenderTab, setOffenderTab] = useState('pct') // 'pct' or 'len'
   const [baseTab, setBaseTab] = useState('pct') // 'pct' or 'len'
   const [trendTab, setTrendTab] = useState('pct') // 'pct' or 'len'
@@ -767,6 +768,7 @@ function MapPage() {
     if (yearFilter && yearFilter !== 'all') params.set('year', yearFilter)
     if (baseFilter !== 'all') params.set('base', baseFilter)
     if (schoolFilter !== 'all') params.set('school', schoolFilter)
+    if (purposeFilter !== 'all') params.set('purpose', purposeFilter)
     fetch(`/api/noise/stats?${params}`)
       .then(r => r.ok ? r.json() : r.json().then(d => Promise.reject(d.error || r.status)))
       .then(data => {
@@ -774,7 +776,7 @@ function MapPage() {
         setNoiseStats(data)
       })
       .catch(e => console.error('[noise-api] stats error:', e))
-  }, [useServerApi, yearFilter, baseFilter, schoolFilter])
+  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter])
 
   // --- Server-side API: fetch pre-banded tracks for map ---
   // ~200-500KB for 500 tracks. Re-fetches on filter change.
@@ -785,6 +787,7 @@ function MapPage() {
     if (yearFilter && yearFilter !== 'all') params.set('year', yearFilter)
     if (baseFilter !== 'all') params.set('base', baseFilter)
     if (schoolFilter !== 'all') params.set('school', schoolFilter)
+    if (purposeFilter !== 'all') params.set('purpose', purposeFilter)
     if (onlyViolations) params.set('violations_only', '1')
     params.set('limit', '500')
     fetch(`/api/noise/tracks?${params}`)
@@ -798,7 +801,7 @@ function MapPage() {
         console.error('[noise-api] tracks error:', e)
         setServerLoading(false)
       })
-  }, [useServerApi, yearFilter, baseFilter, schoolFilter, onlyViolations])
+  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter, onlyViolations])
 
   // --- Fallback: load all tracks from file for local dev ---
   useEffect(() => {
@@ -2154,6 +2157,24 @@ function MapPage() {
                   style={{ backgroundColor: '#1f2937', color: '#e5e7eb' }}
                 >
                   {s}
+                </option>
+              ))}
+            </select>
+          )}
+          {noiseStats?.purposes && (
+            <select
+              value={purposeFilter}
+              onChange={(e) => setPurposeFilter(e.target.value)}
+              style={{ backgroundColor: '#1f2937', color: '#e5e7eb' }}
+              className="border border-white/15 text-xs rounded px-1.5 py-0.5 hover:border-white/30 max-w-[10rem]"
+              title="Filter by aircraft purpose"
+            >
+              <option style={{ backgroundColor: '#1f2937', color: '#e5e7eb' }} value="all">
+                all purposes
+              </option>
+              {noiseStats.purposes.map((p) => (
+                <option key={p} value={p} style={{ backgroundColor: '#1f2937', color: '#e5e7eb' }}>
+                  {p.replace(/_/g, ' ')}
                 </option>
               ))}
             </select>

@@ -1641,6 +1641,7 @@ function noiseApiPlugin() {
           const base = u.searchParams.get('base') || null
           const school = u.searchParams.get('school') || null
           const origin = u.searchParams.get('origin') || null
+          const purpose = u.searchParams.get('purpose') || null
 
           // Build WHERE clause from filters
           const conds = ['seg_total > 0']
@@ -1649,11 +1650,12 @@ function noiseApiPlugin() {
           if (base) { params.push(base); conds.push(`base_airport = $${params.length}`) }
           if (school) { params.push(school); conds.push(`school = $${params.length}`) }
           if (origin) { params.push(origin); conds.push(`origin = $${params.length}`) }
+          if (purpose) { params.push(purpose); conds.push(`purpose = $${params.length}`) }
           const where = conds.join(' AND ')
 
           // Per-tail rankings
           const tailSql = `
-            SELECT call AS tail, type, desc_text AS desc, school, base_airport AS base, origin,
+            SELECT call AS tail, type, desc_text AS desc, school, base_airport AS base, origin, purpose,
                    SUM(seg_total)::int AS total, SUM(seg_red)::int AS red,
                    SUM(seg_orange)::int AS orange, SUM(seg_yellow)::int AS yellow,
                    SUM(len_total_ft)::real AS total_ft, SUM(len_red_ft)::real AS red_ft,
@@ -1662,7 +1664,7 @@ function noiseApiPlugin() {
                    COUNT(*)::int AS track_count
             FROM tracks
             WHERE ${where}
-            GROUP BY call, type, desc_text, school, base_airport, origin
+            GROUP BY call, type, desc_text, school, base_airport, origin, purpose
             HAVING SUM(seg_total) > 0
             ORDER BY SUM(seg_red)::float / NULLIF(SUM(seg_total), 0) DESC
             LIMIT 200
@@ -1692,6 +1694,7 @@ function noiseApiPlugin() {
           const yearsRes = await db.queryDb('SELECT DISTINCT year FROM tracks WHERE year IS NOT NULL ORDER BY year')
           const basesRes = await db.queryDb('SELECT DISTINCT base_airport FROM tracks WHERE base_airport IS NOT NULL ORDER BY base_airport')
           const schoolsRes = await db.queryDb('SELECT DISTINCT school FROM tracks WHERE school IS NOT NULL ORDER BY school')
+          const purposesRes = await db.queryDb('SELECT DISTINCT purpose FROM tracks WHERE purpose IS NOT NULL ORDER BY purpose')
 
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Access-Control-Allow-Origin', '*')
@@ -1701,6 +1704,7 @@ function noiseApiPlugin() {
             years: yearsRes.rows.map(r => r.year),
             bases: basesRes.rows.map(r => r.base_airport),
             schools: schoolsRes.rows.map(r => r.school),
+            purposes: purposesRes.rows.map(r => r.purpose),
           }))
         } catch (e) {
           console.error('[noise-api] /stats error', e)
@@ -1720,6 +1724,7 @@ function noiseApiPlugin() {
           const year = u.searchParams.get('year') || null
           const base = u.searchParams.get('base') || null
           const school = u.searchParams.get('school') || null
+          const purpose = u.searchParams.get('purpose') || null
           const violationsOnly = u.searchParams.get('violations_only') === '1'
           const limit = Math.min(2000, Math.max(1, parseInt(u.searchParams.get('limit') || '500')))
           const offset = Math.max(0, parseInt(u.searchParams.get('offset') || '0'))
@@ -1729,6 +1734,7 @@ function noiseApiPlugin() {
           if (year) { params.push(year); conds.push(`year = $${params.length}`) }
           if (base) { params.push(base); conds.push(`base_airport = $${params.length}`) }
           if (school) { params.push(school); conds.push(`school = $${params.length}`) }
+          if (purpose) { params.push(purpose); conds.push(`purpose = $${params.length}`) }
           if (violationsOnly) { conds.push('worst_class IS NOT NULL') }
           const where = conds.join(' AND ')
 
@@ -1742,7 +1748,7 @@ function noiseApiPlugin() {
           const sql = `
             SELECT call, type, desc_text AS desc, own_op AS "ownOp", src,
                    year, date, base_airport AS base, origin, worst_class AS worst,
-                   seg_total, seg_red, seg_orange, seg_yellow, school, bands
+                   seg_total, seg_red, seg_orange, seg_yellow, school, purpose, bands
             FROM tracks
             WHERE ${where}
             ORDER BY id
