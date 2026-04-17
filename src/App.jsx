@@ -2710,19 +2710,20 @@ The team at Boulder Municipal Airport (KBDU)`
         {todFilter && (
           <div className="absolute top-3 right-3 z-[1000] pointer-events-none">
             <div className="bg-black/80 backdrop-blur-sm border border-white/20 rounded-lg px-3 py-2 flex flex-col items-center">
-              {/* Clock face showing the active arc */}
+              {/* 24-hour clock face showing the active arc */}
               <svg viewBox="0 0 44 44" width="40" height="40">
                 <circle cx="22" cy="22" r="19" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
-                {/* Active arc */}
+                {/* Active arc — 24-hour clock, 0h at top */}
                 {(() => {
                   const s = todStart, e = todEnd
-                  const startAngle = (s / 12) * 360 - 90
-                  const endAngle = (e / 12) * 360 - 90
+                  const startAngle = (s / 24) * 360 - 90
+                  const endAngle = (e / 24) * 360 - 90
                   const r = 17
-                  const x1 = 22 + r * Math.cos(startAngle * Math.PI / 180)
-                  const y1 = 22 + r * Math.sin(startAngle * Math.PI / 180)
-                  const x2 = 22 + r * Math.cos(endAngle * Math.PI / 180)
-                  const y2 = 22 + r * Math.sin(endAngle * Math.PI / 180)
+                  const rad = Math.PI / 180
+                  const x1 = 22 + r * Math.cos(startAngle * rad)
+                  const y1 = 22 + r * Math.sin(startAngle * rad)
+                  const x2 = 22 + r * Math.cos(endAngle * rad)
+                  const y2 = 22 + r * Math.sin(endAngle * rad)
                   const span = s <= e ? e - s : 24 - s + e
                   const large = span > 12 ? 1 : 0
                   return (
@@ -2732,15 +2733,18 @@ The team at Boulder Municipal Airport (KBDU)`
                     />
                   )
                 })()}
-                {/* Hour ticks */}
-                {[...Array(12)].map((_, i) => {
-                  const a = (i / 12) * 360 - 90
-                  const r1 = 15, r2 = 19
+                {/* 24 hour ticks — longer at 0,6,12,18 */}
+                {[...Array(24)].map((_, i) => {
+                  const a = (i / 24) * 360 - 90
+                  const major = i % 6 === 0
+                  const r1 = major ? 14 : 16
+                  const r2 = 19
+                  const rad = Math.PI / 180
                   return (
                     <line key={i}
-                      x1={22 + r1 * Math.cos(a * Math.PI / 180)} y1={22 + r1 * Math.sin(a * Math.PI / 180)}
-                      x2={22 + r2 * Math.cos(a * Math.PI / 180)} y2={22 + r2 * Math.sin(a * Math.PI / 180)}
-                      stroke="rgba(255,255,255,0.3)" strokeWidth="1"
+                      x1={22 + r1 * Math.cos(a * rad)} y1={22 + r1 * Math.sin(a * rad)}
+                      x2={22 + r2 * Math.cos(a * rad)} y2={22 + r2 * Math.sin(a * rad)}
+                      stroke={major ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.2)'} strokeWidth={major ? 1.5 : 0.5}
                     />
                   )
                 })}
