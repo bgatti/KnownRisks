@@ -1183,12 +1183,12 @@ export function NoiseStudio() {
       )}
 
       {/* Top header */}
-      <header className="absolute top-0 left-0 right-0 z-[1000] p-2 sm:p-4 pointer-events-none">
-        <div className="max-w-5xl mx-auto flex items-start justify-between gap-2 sm:gap-4">
-          <div className="pointer-events-auto bg-black/60 backdrop-blur-md border border-white/10 rounded-lg px-4 py-2.5 shadow-2xl">
-            <p className="text-[10px] uppercase tracking-[0.2em] text-neutral-500">Aircraft Noise</p>
-            <h1 className="text-base font-semibold text-neutral-100">Noise Report</h1>
-            <div className="mt-2 flex items-center gap-1.5">
+      <header className="absolute top-0 left-0 right-0 z-[1000] p-2 md:p-4 pointer-events-none">
+        <div className="max-w-5xl mx-auto flex items-start justify-between gap-2 md:gap-4">
+          <div className="pointer-events-auto bg-black/60 backdrop-blur-md border border-white/10 rounded-lg px-2.5 py-1.5 md:px-4 md:py-2.5 shadow-2xl">
+            <p className="text-[9px] md:text-[10px] uppercase tracking-[0.2em] text-neutral-500">Aircraft Noise</p>
+            <h1 className="text-sm md:text-base font-semibold text-neutral-100">Noise Report</h1>
+            <div className="hidden md:flex mt-2 items-center gap-1.5">
               <IdentityChip identity={identity} onEdit={() => setIdentityModalOpen(true)} />
               <button
                 onClick={() => setComplaintsPanelOpen(true)}
@@ -1205,15 +1205,17 @@ export function NoiseStudio() {
               </button>
             </div>
           </div>
-          <LocationCard
-            rawCoords={rawCoords}
-            precision={precision}
-            setPrecision={setPrecision}
-            displayedLocation={displayedLocation}
-            requestLocation={requestLocation}
-            locating={locating}
-            locationError={locationError}
-          />
+          <div className="hidden md:block">
+            <LocationCard
+              rawCoords={rawCoords}
+              precision={precision}
+              setPrecision={setPrecision}
+              displayedLocation={displayedLocation}
+              requestLocation={requestLocation}
+              locating={locating}
+              locationError={locationError}
+            />
+          </div>
         </div>
       </header>
 
@@ -1244,7 +1246,7 @@ export function NoiseStudio() {
 
       {/* Active excursions panel — compact strip on mobile, sidebar on desktop */}
       <aside className="absolute z-[1000] pointer-events-auto
-        bottom-16 left-1 right-1 sm:bottom-auto sm:top-24 sm:left-4 sm:right-auto sm:w-72 sm:max-h-[60vh]">
+        bottom-14 left-1 right-1 md:bottom-auto md:top-24 md:left-4 md:right-auto md:w-72 md:max-h-[60vh]">
         <ExcursionList
           activeList={activeList}
           activeStatus={activeStatus}
@@ -1257,13 +1259,13 @@ export function NoiseStudio() {
 
       {/* Bottom Report button — sits above the mobile excursion strip */}
       {!reportOpen && (
-        <div className="absolute bottom-[4.5rem] sm:bottom-8 left-0 right-0 z-[1000] flex justify-center pointer-events-none pb-[env(safe-area-inset-bottom)]">
+        <div className="absolute bottom-[3.75rem] md:bottom-8 left-0 right-0 z-[1000] flex justify-center pointer-events-none pb-[env(safe-area-inset-bottom)]">
           <button
             onClick={() => openReport(activeList.length ? 'excursion' : 'general')}
-            className="pointer-events-auto group relative flex items-center gap-2 rounded-full bg-gradient-to-r from-rose-500 to-amber-500 px-4 sm:px-7 py-2.5 sm:py-4 text-xs sm:text-base font-semibold text-white shadow-[0_10px_40px_rgba(244,63,94,0.45)] hover:shadow-[0_10px_50px_rgba(244,63,94,0.65)] transition-all hover:scale-[1.02]"
+            className="pointer-events-auto group relative flex items-center gap-1.5 md:gap-3 rounded-full bg-gradient-to-r from-rose-500 to-amber-500 px-3.5 md:px-7 py-2 md:py-4 text-[11px] md:text-base font-semibold text-white shadow-[0_10px_40px_rgba(244,63,94,0.45)] hover:shadow-[0_10px_50px_rgba(244,63,94,0.65)] transition-all hover:scale-[1.02]"
           >
-            <IconAlertTriangle size={16} />
-            Report Noise Excursion
+            <IconAlertTriangle size={14} />
+            Report Noise
             <IconArrowRight size={14} />
           </button>
         </div>
@@ -1523,7 +1525,7 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
   return (
     <div className="bg-black/60 backdrop-blur-md border border-white/10 rounded-lg shadow-2xl flex flex-col overflow-hidden">
       {/* ─ Mobile: ultra-compact thumbnail strip ─ */}
-      <div className="sm:hidden">
+      <div className="md:hidden">
         <ul className="flex gap-1 overflow-x-auto px-1 py-0.5 scrollbar-none">
           {items.map((g) => (
             <li key={g.type} className="flex-shrink-0">
@@ -1552,8 +1554,8 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
         </ul>
       </div>
 
-      {/* ─ Desktop: vertical list (unchanged layout) ─ */}
-      <div className="hidden sm:flex sm:flex-col sm:overflow-hidden">
+      {/* ─ Desktop: vertical list ─ */}
+      <div className="hidden md:flex md:flex-col md:overflow-hidden">
         <div className="px-3 py-2.5 border-b border-white/10">
           <p className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">Active Excursions</p>
           <p className="text-[11px] text-neutral-400">
