@@ -1735,6 +1735,84 @@ function noiseApiPlugin() {
         }
       })
 
+      // GET /api/noise/missions
+      // Today's flights from live capture, categorized by purpose.
+      // Counts all aircraft seen since midnight UTC, looks up purpose
+      // from the tracks table (historical classification) and the
+      // special_use + flight_schools data.
+      server.middlewares.use('/api/noise/missions', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          // Get today's live tracks
+          const liveRes = await db.queryDb(
+            'SELECT tracks FROM live_tracks WHERE day = CURRENT_DATE ORDER BY id DESC LIMIT 1'
+          )
+          if (!liveRes.rows.length || !liveRes.rows[0].tracks) {
+            res.setHeader('Content-Type', 'application/json')
+            res.setHeader('Access-Control-Allow-Origin', '*')
+            res.end(JSON.stringify({ date: new Date().toISOString().slice(0, 10), total: 0, categories: {} }))
+            return
+          }
+
+          const liveTracks = liveRes.rows[0].tracks
+          const tails = liveTracks.map(t => t.call || t.reg || '').filter(Boolean)
+
+          // Look up purpose for each tail from the historical tracks table
+          // (most recent record wins)
+          const purposeRes = tails.length ? await db.queryDb(
+            `SELECT DISTINCT ON (call) call, purpose, school, type, base_airport
+             FROM tracks WHERE call = ANY($1) AND purpose IS NOT NULL
+             ORDER BY call, id DESC`,
+            [tails]
+          ) : { rows: [] }
+
+          const purposeMap = new Map()
+          for (const r of purposeRes.rows) {
+            purposeMap.set(r.call, { purpose: r.purpose, school: r.school, type: r.type, base: r.base_airport })
+          }
+
+          // Categorize
+          const categories = {}
+          for (const t of liveTracks) {
+            const tail = t.call || t.reg || ''
+            const info = purposeMap.get(tail)
+            const purpose = info?.purpose || 'unknown'
+            if (!categories[purpose]) categories[purpose] = { count: 0, aircraft: [] }
+            categories[purpose].count++
+            categories[purpose].aircraft.push({
+              tail,
+              type: t.type || info?.type || '',
+              school: info?.school || null,
+              base: info?.base || null,
+              points: t.points?.length || 0,
+            })
+          }
+
+          // Remove empty categories and sort by count desc
+          const sorted = Object.entries(categories)
+            .filter(([, v]) => v.count > 0)
+            .sort((a, b) => b[1].count - a[1].count)
+          const result = {}
+          for (const [k, v] of sorted) result[k] = v
+
+          const now = new Date()
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.setHeader('Cache-Control', 'public, max-age=60')
+          res.end(JSON.stringify({
+            date: now.toISOString().slice(0, 10),
+            updated_at: now.toISOString(),
+            total: liveTracks.length,
+            categories: result,
+          }))
+        } catch (e) {
+          console.error('[noise-api] /missions error', e)
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: String(e) }))
+        }
+      })
+
       // Shared: parse URL filter params into SQL WHERE + params array.
       // Supports year, base (comma-multi), school, purpose, tod_start/tod_end.
       function buildFilters(u, baseConds = ['seg_total > 0']) {
