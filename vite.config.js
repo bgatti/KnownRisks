@@ -1692,6 +1692,33 @@ function noiseApiPlugin() {
             cube[r.year][r.base][r.origin] = { total: r.total, red: r.red }
           }
 
+          // Per-date excursion stats (for the bar chart)
+          // Uses % of total flight length in each zone, aggregated per date
+          const byDateSql = `
+            SELECT date,
+                   count(*)::int AS flights,
+                   SUM(len_total_ft)::real AS total_ft,
+                   SUM(len_yellow_ft)::real AS yellow_ft,
+                   SUM(len_orange_ft)::real AS orange_ft,
+                   SUM(len_red_ft)::real AS red_ft
+            FROM tracks
+            WHERE ${where} AND date IS NOT NULL
+            GROUP BY date ORDER BY date
+          `
+          const byDateRes = await db.queryDb(byDateSql, params)
+          const byDate = byDateRes.rows.map(r => ({
+            date: r.date,
+            flights: r.flights,
+            totalFt: r.total_ft,
+            yellowFt: r.yellow_ft,
+            orangeFt: r.orange_ft,
+            redFt: r.red_ft,
+            // Percentages for easy consumption
+            yellowPct: r.total_ft > 0 ? r.yellow_ft / r.total_ft * 100 : 0,
+            orangePct: r.total_ft > 0 ? r.orange_ft / r.total_ft * 100 : 0,
+            redPct: r.total_ft > 0 ? r.red_ft / r.total_ft * 100 : 0,
+          }))
+
           // Available filters
           const yearsRes = await db.queryDb('SELECT DISTINCT year FROM tracks WHERE year IS NOT NULL ORDER BY year')
           const basesRes = await db.queryDb('SELECT DISTINCT base_airport FROM tracks WHERE base_airport IS NOT NULL ORDER BY base_airport')
@@ -1703,6 +1730,7 @@ function noiseApiPlugin() {
           res.end(JSON.stringify({
             perTail,
             cube,
+            byDate,
             years: yearsRes.rows.map(r => r.year),
             bases: basesRes.rows.map(r => r.base_airport),
             schools: schoolsRes.rows.map(r => r.school),

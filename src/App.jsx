@@ -1692,42 +1692,25 @@ function MapPage() {
 
   // Trends by date — aggregated from the UNDECIMATED rawStats.perTrack cache
   // with the current filter state applied. Full fidelity, fast filter updates.
+  // Per-date excursion stats — from server API (already filtered)
   const byDate = useMemo(() => {
+    if (noiseStats?.byDate) return noiseStats.byDate
+    // Fallback: client-side computation from rawStats
     const map = new Map()
     for (const pt of rawStats.perTrack) {
       if (!pt.date) continue
-      if (yearFilter !== null && yearFilter !== 'all' && pt.year !== yearFilter) continue
-      if (baseFilter !== 'all') {
-        const info = tailToBaseInfo.get(pt.tail)
-        if (!info || !info.allBases.has(baseFilter)) continue
-      }
-      if (schoolFilter !== 'all') {
-        const sch = schoolsByTail.get(pt.tail)
-        if (!sch || sch.school !== schoolFilter) continue
-      }
-      if (originFilter === 'local' && !pt.isLocal) continue
-      if (originFilter === 'transient' && pt.isLocal) continue
-      if (onlyViolations && pt.red === 0 && pt.orange === 0) continue
       let b = map.get(pt.date)
       if (!b) {
-        b = {
-          date: pt.date,
-          total: 0, yellow: 0, orange: 0, red: 0,
-          totalFt: 0, yellowFt: 0, orangeFt: 0, redFt: 0,
-        }
+        b = { date: pt.date, totalFt: 0, yellowFt: 0, orangeFt: 0, redFt: 0 }
         map.set(pt.date, b)
       }
-      b.total += pt.total
-      b.yellow += pt.yellow
-      b.orange += pt.orange
-      b.red += pt.red
       b.totalFt += pt.totalFt
       b.yellowFt += pt.yellowFt
       b.orangeFt += pt.orangeFt
       b.redFt += pt.redFt
     }
     return Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date))
-  }, [rawStats, yearFilter, baseFilter, schoolFilter, originFilter, onlyViolations, tailToBaseInfo, schoolsByTail])
+  }, [noiseStats, rawStats])
 
   // Live offenses — walk each aircraft's points, find contiguous runs of
   // non-clean points, summarize each as an event. Sorted worst-class first,
@@ -2291,60 +2274,60 @@ function MapPage() {
           </div>
         )}
         {byDate.length > 0 && (() => {
-          // Compute bar values per-date based on the selected tab
+          // Excursion % per date: what fraction of total flight miles
+          // were in noise zones, broken down by severity
           const bars = byDate.map((b) => {
-            if (trendTab === 'pct') {
-              const yp = b.total ? (b.yellow / b.total) * 100 : 0
-              const op = b.total ? (b.orange / b.total) * 100 : 0
-              const rp = b.total ? (b.red / b.total) * 100 : 0
-              return { date: b.date, y: yp, o: op, r: rp, sum: yp + op + rp }
-            }
+            const t = b.totalFt || 0
             return {
               date: b.date,
-              y: b.yellowFt / 6076,
-              o: b.orangeFt / 6076,
-              r: b.redFt / 6076,
-              sum: (b.yellowFt + b.orangeFt + b.redFt) / 6076,
+              flights: b.flights || 0,
+              y: t > 0 ? (b.yellowFt / t) * 100 : 0,
+              o: t > 0 ? (b.orangeFt / t) * 100 : 0,
+              r: t > 0 ? (b.redFt / t) * 100 : 0,
+              sum: t > 0 ? ((b.yellowFt + b.orangeFt + b.redFt) / t) * 100 : 0,
             }
           })
-          const maxSum = Math.max(1, ...bars.map((b) => b.sum))
-          const W = 320, H = 110
+          const maxSum = Math.max(0.5, ...bars.map((b) => b.sum))
+          const W = 360, H = 130
           const padL = 4, padR = 4, padT = 6, padB = 22
           const barArea = W - padL - padR
           const chartH = H - padT - padB
-          const bw = barArea / bars.length
+          const bw = barArea / Math.max(1, bars.length)
+
+          // Linear trend line (least-squares) for each color
+          const linReg = (vals) => {
+            const n = vals.length
+            if (n < 2) return null
+            let sx = 0, sy = 0, sxx = 0, sxy = 0
+            for (let i = 0; i < n; i++) {
+              sx += i; sy += vals[i]; sxx += i * i; sxy += i * vals[i]
+            }
+            const slope = (n * sxy - sx * sy) / (n * sxx - sx * sx)
+            const intercept = (sy - slope * sx) / n
+            return { y0: intercept, y1: intercept + slope * (n - 1) }
+          }
+          const trendR = linReg(bars.map(b => b.r))
+          const trendO = linReg(bars.map(b => b.o))
+          const trendY = linReg(bars.map(b => b.y))
+          const trendLine = (trend, color) => {
+            if (!trend) return null
+            const x1 = padL + bw / 2
+            const x2 = padL + (bars.length - 1) * bw + bw / 2
+            const y1 = padT + chartH - (trend.y0 / maxSum) * chartH
+            const y2 = padT + chartH - (trend.y1 / maxSum) * chartH
+            return <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={color} strokeWidth="1.5" strokeDasharray="4 3" opacity="0.7" />
+          }
+
           return (
             <div className="absolute bottom-3 left-3 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2">
               <div className="flex items-center gap-2 mb-1 px-1">
-                <div className="flex items-center gap-0 rounded overflow-hidden border border-white/15">
-                  <button
-                    onClick={() => setTrendTab('pct')}
-                    className={`px-2 py-0.5 text-[10px] ${
-                      trendTab === 'pct' ? 'bg-cyan-500/30 text-white' : 'text-white/60 hover:text-white'
-                    }`}
-                  >
-                    Highest %
-                  </button>
-                  <button
-                    onClick={() => setTrendTab('len')}
-                    className={`px-2 py-0.5 text-[10px] ${
-                      trendTab === 'len' ? 'bg-cyan-500/30 text-white' : 'text-white/60 hover:text-white'
-                    }`}
-                  >
-                    Most
-                  </button>
-                </div>
+                <span className="text-white/70 text-[10px] font-medium">Excursion %</span>
                 <span className="text-white/40 text-[9px]">
                   {bars.length} days · {bars[0]?.date?.slice(2)} → {bars[bars.length - 1]?.date?.slice(2)}
                 </span>
                 <span className="ml-auto text-white/40 text-[9px] tabular-nums">
-                  {(() => {
-                    const avg = bars.length
-                      ? bars.reduce((s, b) => s + b.sum, 0) / bars.length
-                      : 0
-                    const suffix = trendTab === 'pct' ? '%' : ' nm'
-                    return `avg ${avg.toFixed(1)}${suffix} · max ${maxSum.toFixed(1)}${suffix}`
-                  })()}
+                  avg {(bars.reduce((s, b) => s + b.sum, 0) / Math.max(1, bars.length)).toFixed(2)}%
+                  · max {maxSum.toFixed(1)}%
                 </span>
               </div>
               <svg width={W} height={H} className="block">
@@ -2363,15 +2346,20 @@ function MapPage() {
                       <rect x={x} y={yO} width={colW} height={hO} fill="#f97316" />
                       <rect x={x} y={yY} width={colW} height={hY} fill="#facc15" />
                       <title>
-                        {b.date}
-                        {'\n'}yellow: {trendTab === 'pct' ? `${b.y.toFixed(1)}%` : `${b.y.toFixed(2)} nm`}
-                        {'\n'}orange: {trendTab === 'pct' ? `${b.o.toFixed(1)}%` : `${b.o.toFixed(2)} nm`}
-                        {'\n'}red: {trendTab === 'pct' ? `${b.r.toFixed(1)}%` : `${b.r.toFixed(2)} nm`}
+                        {b.date} ({b.flights} flights)
+                        {'\n'}yellow: {b.y.toFixed(2)}%
+                        {'\n'}orange: {b.o.toFixed(2)}%
+                        {'\n'}red: {b.r.toFixed(2)}%
+                        {'\n'}total: {b.sum.toFixed(2)}%
                       </title>
                     </g>
                   )
                 })}
-                {/* X-axis labels — just first, middle, last to avoid clutter */}
+                {/* Trend lines */}
+                {trendLine(trendR, '#dc2626')}
+                {trendLine(trendO, '#f97316')}
+                {trendLine(trendY, '#facc15')}
+                {/* X-axis labels */}
                 {Array.from(new Set([0, Math.floor(bars.length / 2), bars.length - 1]))
                   .filter((i) => i >= 0 && i < bars.length)
                   .map((i) => (
