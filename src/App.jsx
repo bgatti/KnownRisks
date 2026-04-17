@@ -696,7 +696,7 @@ function MapPage() {
   }, [showHeatmap])
   const [onlyViolations, setOnlyViolations] = useState(false)
   const [realImpact, setRealImpact] = useState(true)
-  const [impactOpacity, setImpactOpacity] = useState(1.0)
+  const [impactOpacity, setImpactOpacity] = useState(0.6)
   const [showPopDensity, setShowPopDensity] = useState(false)
   const [popDensityOverlay, setPopDensityOverlay] = useState(null)
   const [popDensityOpacity, setPopDensityOpacity] = useState(0.5)
@@ -2839,7 +2839,7 @@ The team at Boulder Municipal Airport (KBDU)`
 
           {/* Impact raster — fades between frames during TOD animation */}
           {realImpact && impactRaster && (
-            <Pane name="impact-pane" style={{ transition: 'opacity 0.6s ease-in-out' }}>
+            <Pane name="impact-pane" style={{ transition: 'opacity 0.6s ease-in-out', zIndex: 300 }}>
               <ImageOverlay
                 key={todFilter ? `tod-${todStart}-${todEnd}` : 'all'}
                 url={impactRaster.dataUrl}
