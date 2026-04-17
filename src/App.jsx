@@ -763,6 +763,7 @@ function MapPage() {
   // Re-fetches when filters change. ~50KB response vs 60MB before.
   useEffect(() => {
     if (!useServerApi) return
+    if (todAnimate) return // animate manages its own fetches via cache
     const params = new URLSearchParams()
     if (yearFilter && yearFilter !== 'all') params.set('year', yearFilter)
     if (baseFilter !== 'all') params.set('base', baseFilter)
@@ -776,12 +777,13 @@ function MapPage() {
         setNoiseStats(data)
       })
       .catch(e => console.error('[noise-api] stats error:', e))
-  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter, todFilter, todStart, todEnd])
+  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter, todFilter, todStart, todEnd, todAnimate])
 
   // --- Server-side API: fetch pre-banded tracks for map ---
   // ~200-500KB for 500 tracks. Re-fetches on filter change.
   useEffect(() => {
     if (!useServerApi) return
+    if (todAnimate) return // animate manages its own fetches via cache
     setServerLoading(true)
     const params = new URLSearchParams()
     if (yearFilter && yearFilter !== 'all') params.set('year', yearFilter)
@@ -802,7 +804,7 @@ function MapPage() {
         console.error('[noise-api] tracks error:', e)
         setServerLoading(false)
       })
-  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter, onlyViolations, todFilter, todStart, todEnd])
+  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter, onlyViolations, todFilter, todStart, todEnd, todAnimate])
 
   // --- Fallback: load all tracks from file for local dev ---
   useEffect(() => {
@@ -1304,20 +1306,66 @@ function MapPage() {
   const [todAnimate, setTodAnimate] = useState(false)
   const [todAnimIdx, setTodAnimIdx] = useState(0)
   const todTimerRef = useRef(null)
+  // Cache: pre-fetched tracks + stats for each TOD block
+  const [todCache, setTodCache] = useState(null) // { blocks: [{tracks, stats, raster},...] }
+
+  // When animate starts, pre-fetch all 4 TOD blocks in parallel and cache
   useEffect(() => {
-    if (!todAnimate || !todFilter) return
+    if (!todAnimate) { setTodCache(null); return }
+    setTodFilter(true)
     const blocks = TOD_PRESETS.slice(0, 4)
-    setTodStart(blocks[0].start); setTodEnd(blocks[0].end)
-    todTimerRef.current = setInterval(() => {
-      setTodAnimIdx((i) => {
+    let cancelled = false
+
+    const buildParams = (block) => {
+      const p = new URLSearchParams()
+      if (yearFilter && yearFilter !== 'all') p.set('year', yearFilter)
+      if (baseFilter !== 'all') p.set('base', baseFilter)
+      if (schoolFilter !== 'all') p.set('school', schoolFilter)
+      if (purposeFilter !== 'all') p.set('purpose', purposeFilter)
+      p.set('tod_start', block.start)
+      p.set('tod_end', block.end)
+      return p
+    }
+
+    Promise.all(blocks.map(async (block) => {
+      const p = buildParams(block)
+      const [statsRes, tracksRes] = await Promise.all([
+        fetch(`/api/noise/stats?${p}`).then(r => r.json()),
+        fetch(`/api/noise/tracks?${p}&limit=500`).then(r => r.json()),
+      ])
+      return { label: block.label, start: block.start, end: block.end, stats: statsRes, tracks: tracksRes }
+    })).then(cached => {
+      if (cancelled) return
+      console.log('[tod-animate] cached all 4 blocks:', cached.map(c => `${c.label}:${c.tracks.tracks?.length}`))
+      setTodCache({ blocks: cached })
+      // Start animation from block 0
+      setTodAnimIdx(0)
+      setTodStart(blocks[0].start)
+      setTodEnd(blocks[0].end)
+      setNoiseStats(cached[0].stats)
+      setServerTracks(cached[0].tracks)
+    }).catch(e => console.error('[tod-animate] prefetch error:', e))
+
+    return () => { cancelled = true }
+  }, [todAnimate, yearFilter, baseFilter, schoolFilter, purposeFilter])
+
+  // Cycle through cached blocks
+  useEffect(() => {
+    if (!todAnimate || !todCache) return
+    const blocks = todCache.blocks
+    const timer = setInterval(() => {
+      setTodAnimIdx(i => {
         const next = (i + 1) % blocks.length
-        setTodStart(blocks[next].start)
-        setTodEnd(blocks[next].end)
+        const b = blocks[next]
+        setTodStart(b.start)
+        setTodEnd(b.end)
+        setNoiseStats(b.stats)
+        setServerTracks(b.tracks)
         return next
       })
-    }, 2000)
-    return () => clearInterval(todTimerRef.current)
-  }, [todAnimate, todFilter])
+    }, 3000)
+    return () => clearInterval(timer)
+  }, [todAnimate, todCache])
 
   // HP-based noise raster
   const [impactRaster, setImpactRaster] = useState(null)
@@ -2311,13 +2359,18 @@ function MapPage() {
           const trendR = linReg(bars.map(b => b.r))
           const trendO = linReg(bars.map(b => b.o))
           const trendY = linReg(bars.map(b => b.y))
-          const trendLine = (trend, color) => {
+          const trendLine = (trend, color, id) => {
             if (!trend) return null
             const x1 = padL + bw / 2
             const x2 = padL + (bars.length - 1) * bw + bw / 2
             const y1 = padT + chartH - (trend.y0 / maxSum) * chartH
             const y2 = padT + chartH - (trend.y1 / maxSum) * chartH
-            return <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={color} strokeWidth="1.5" strokeDasharray="4 3" opacity="0.7" />
+            return (
+              <g key={id}>
+                <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="black" strokeWidth="3" opacity="0.4" />
+                <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={color} strokeWidth="1.5" opacity="0.9" />
+              </g>
+            )
           }
 
           return (
@@ -2358,9 +2411,10 @@ function MapPage() {
                   )
                 })}
                 {/* Trend lines */}
-                {trendLine(trendR, '#dc2626')}
-                {trendLine(trendO, '#f97316')}
-                {trendLine(trendY, '#facc15')}
+                {/* Trend lines: yellow bottom, red on top */}
+                {trendLine(trendY, '#facc15', 'ty')}
+                {trendLine(trendO, '#f97316', 'to')}
+                {trendLine(trendR, '#dc2626', 'tr')}
                 {/* X-axis labels */}
                 {Array.from(new Set([0, Math.floor(bars.length / 2), bars.length - 1]))
                   .filter((i) => i >= 0 && i < bars.length)
