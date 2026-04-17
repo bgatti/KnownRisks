@@ -2074,7 +2074,7 @@ function MapPage() {
               <input
                 type="range"
                 min="0.1"
-                max="3"
+                max="1"
                 step="0.1"
                 value={impactOpacity}
                 onChange={(e) => setImpactOpacity(Number(e.target.value))}
