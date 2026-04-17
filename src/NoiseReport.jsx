@@ -152,7 +152,8 @@ function formatAgo(ms) {
   const m = Math.floor(s / 60)
   if (m < 60) return `${m} min${m === 1 ? '' : 's'} ago`
   const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h ago`
+  const rm = m % 60
+  if (h < 24) return rm ? `${h}:${String(rm).padStart(2, '0')} hours ago` : `${h}h ago`
   const d = Math.floor(h / 24)
   return `${d}d ago`
 }
@@ -500,11 +501,11 @@ export function NoiseStudio() {
     const tails = Object.keys(segmentsByTail)
     if (!tails.length) return
 
-    const makeHoverHandlers = (tail) => {
+    const makeHoverHandlers = (tail, lastSeenMs) => {
       const showHover = (e) => {
         if (hoverHideRef.current) { clearTimeout(hoverHideRef.current); hoverHideRef.current = null }
         const oe = e.originalEvent
-        setHoverCard({ tail, x: oe.clientX, y: oe.clientY })
+        setHoverCard({ tail, x: oe.clientX, y: oe.clientY, lastSeenMs })
       }
       const hideHover = () => {
         if (hoverHideRef.current) clearTimeout(hoverHideRef.current)
@@ -518,12 +519,16 @@ export function NoiseStudio() {
       const data = segmentsByTail[tail]
       if (!data?.tracks?.length) continue
       const isDim = selectedTail != null && selectedTail !== tail
-      const { showHover, hideHover } = makeHoverHandlers(tail)
 
       for (const track of data.tracks) {
         for (const seg of track.segments || []) {
           if (!seg.points || seg.points.length < 2) continue
           const latlngs = seg.points.map((p) => [p[0], p[1]])
+          let segLastMs = 0
+          for (const p of seg.points) {
+            if (typeof p[3] === 'number' && p[3] > segLastMs) segLastMs = p[3]
+          }
+          const { showHover, hideHover } = makeHoverHandlers(tail, segLastMs || null)
           const color = KLASS_COLORS[seg.klass] || 'rgba(200,200,200,0.55)'
           const baseWeight = seg.klass === 'red' ? 4 : seg.klass === 'orange' ? 3.5 : seg.klass === 'yellow' ? 3 : 2
           const weight = selectedTail === tail ? baseWeight + 1 : baseWeight
@@ -1155,7 +1160,13 @@ export function NoiseStudio() {
             Report this Noise Excursion
             {(() => {
               const match = activeList.find((a) => a.tail === hoverCard.tail)
-              return match ? <span className="text-[10px] text-white/80">· {match.type}</span> : null
+              const ago = hoverCard.lastSeenMs ? formatAgo(hoverCard.lastSeenMs) : null
+              return (
+                <span className="text-[10px] text-white/80">
+                  {match && `· ${match.type}`}
+                  {ago && ` · ${ago}`}
+                </span>
+              )
             })()}
           </button>
           <div
