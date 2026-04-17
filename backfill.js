@@ -141,8 +141,7 @@ function classifyTrack(points, call, src, schoolMap) {
   }
 
   // Build banded runs for map rendering (using ALL points, not just <7500)
-  // Only include points within the map ring
-  const ringPts = (points || []).filter(p => nmFrom(p[0], p[1], KBDU[0], KBDU[1]) <= MAP_RADIUS_NM)
+  const ringPts = points || []
   const bands = []
   if (ringPts.length >= 2) {
     let cur = null
