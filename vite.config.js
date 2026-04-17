@@ -1630,6 +1630,111 @@ function noiseApiPlugin() {
         }
       })
 
+      // GET /api/noise/leaderboard?days=90&limit=20&by=tail|base|school
+      //
+      // Public leaderboard API. Returns top entities ranked by clean flight
+      // miles (total miles minus excursion miles) over the last N days.
+      //
+      // Response shape:
+      //   { generated_at, window: {days, from, to}, by, entries: [{
+      //       name, flights, total_nm, clean_nm, excursion_nm,
+      //       clean_pct, red_pct, orange_pct, yellow_pct
+      //   }] }
+      server.middlewares.use('/api/noise/leaderboard', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const days = Math.min(3650, Math.max(1, parseInt(u.searchParams.get('days') || '90')))
+          const limit = Math.min(100, Math.max(1, parseInt(u.searchParams.get('limit') || '20')))
+          const by = u.searchParams.get('by') || 'tail' // tail | base | school
+
+          const cutoff = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10)
+          const FT_PER_NM = 6076
+
+          let sql, groupLabel
+          if (by === 'base') {
+            groupLabel = 'base_airport'
+            sql = `
+              SELECT base_airport AS name,
+                     count(*)::int AS flights,
+                     round((SUM(len_total_ft) / ${FT_PER_NM})::numeric, 1) AS total_nm,
+                     round((SUM(len_total_ft - len_red_ft - len_orange_ft - len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS clean_nm,
+                     round((SUM(len_red_ft + len_orange_ft + len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS excursion_nm,
+                     round((SUM(len_red_ft) / ${FT_PER_NM})::numeric, 1) AS red_nm,
+                     round((SUM(len_orange_ft) / ${FT_PER_NM})::numeric, 1) AS orange_nm,
+                     round((SUM(len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS yellow_nm
+              FROM tracks
+              WHERE date >= $1 AND len_total_ft > 0 AND base_airport IS NOT NULL
+              GROUP BY base_airport
+              HAVING SUM(len_total_ft) > 0
+              ORDER BY SUM(len_total_ft - len_red_ft - len_orange_ft - len_yellow_ft) DESC
+              LIMIT $2
+            `
+          } else if (by === 'school') {
+            sql = `
+              SELECT school AS name,
+                     count(*)::int AS flights,
+                     round((SUM(len_total_ft) / ${FT_PER_NM})::numeric, 1) AS total_nm,
+                     round((SUM(len_total_ft - len_red_ft - len_orange_ft - len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS clean_nm,
+                     round((SUM(len_red_ft + len_orange_ft + len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS excursion_nm,
+                     round((SUM(len_red_ft) / ${FT_PER_NM})::numeric, 1) AS red_nm,
+                     round((SUM(len_orange_ft) / ${FT_PER_NM})::numeric, 1) AS orange_nm,
+                     round((SUM(len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS yellow_nm
+              FROM tracks
+              WHERE date >= $1 AND len_total_ft > 0 AND school IS NOT NULL
+              GROUP BY school
+              HAVING SUM(len_total_ft) > 0
+              ORDER BY SUM(len_total_ft - len_red_ft - len_orange_ft - len_yellow_ft) DESC
+              LIMIT $2
+            `
+          } else {
+            // by tail (default)
+            sql = `
+              SELECT call AS name, MAX(type) AS type, MAX(school) AS school,
+                     MAX(base_airport) AS base, MAX(purpose) AS purpose,
+                     count(*)::int AS flights,
+                     round((SUM(len_total_ft) / ${FT_PER_NM})::numeric, 1) AS total_nm,
+                     round((SUM(len_total_ft - len_red_ft - len_orange_ft - len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS clean_nm,
+                     round((SUM(len_red_ft + len_orange_ft + len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS excursion_nm,
+                     round((SUM(len_red_ft) / ${FT_PER_NM})::numeric, 1) AS red_nm,
+                     round((SUM(len_orange_ft) / ${FT_PER_NM})::numeric, 1) AS orange_nm,
+                     round((SUM(len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS yellow_nm
+              FROM tracks
+              WHERE date >= $1 AND len_total_ft > 0
+              GROUP BY call
+              HAVING SUM(len_total_ft) > 0
+              ORDER BY SUM(len_total_ft - len_red_ft - len_orange_ft - len_yellow_ft) DESC
+              LIMIT $2
+            `
+          }
+
+          const r = await db.queryDb(sql, [cutoff, limit])
+          const entries = r.rows.map(row => ({
+            ...row,
+            clean_pct: row.total_nm > 0 ? Math.round(row.clean_nm / row.total_nm * 1000) / 10 : 0,
+            red_pct: row.total_nm > 0 ? Math.round(row.red_nm / row.total_nm * 1000) / 10 : 0,
+            orange_pct: row.total_nm > 0 ? Math.round(row.orange_nm / row.total_nm * 1000) / 10 : 0,
+            yellow_pct: row.total_nm > 0 ? Math.round(row.yellow_nm / row.total_nm * 1000) / 10 : 0,
+          }))
+
+          const now = new Date()
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.setHeader('Cache-Control', 'public, max-age=300') // 5 min cache
+          res.end(JSON.stringify({
+            generated_at: now.toISOString(),
+            window: { days, from: cutoff, to: now.toISOString().slice(0, 10) },
+            by,
+            entries,
+          }))
+        } catch (e) {
+          console.error('[noise-api] /leaderboard error', e)
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: String(e) }))
+        }
+      })
+
       // Shared: parse URL filter params into SQL WHERE + params array.
       // Supports year, base (comma-multi), school, purpose, tod_start/tod_end.
       function buildFilters(u, baseConds = ['seg_total > 0']) {
