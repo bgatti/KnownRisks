@@ -1398,14 +1398,14 @@ function MapPage() {
       .filter((t) => selectedSet.size === 0 || selectedSet.has(t.call || t.reg))
       .map((t) => ({ points: t.points, type: t.type, t0: t.t0 }))
     if (!tracks.length) { setImpactRaster(null); return }
-    const rasterOpts = {}
-    if (todFilter) { rasterOpts.todStart = todStart; rasterOpts.todEnd = todEnd }
+    // TOD filtering is done server-side — tracks are already filtered,
+    // so no need to pass todStart/todEnd to the raster computation.
     const id = setTimeout(() => {
-      const result = computeNoiseRaster(tracks, rasterOpts)
+      const result = computeNoiseRaster(tracks, {})
       setImpactRaster(result)
     }, 0)
     return () => clearTimeout(id)
-  }, [visible, realImpact, selectedTails, todFilter, todStart, todEnd])
+  }, [visible, realImpact, selectedTails])
 
   // Noise × population density impact raster
   const [showImpact, setShowImpact] = useState(false)
@@ -1426,14 +1426,12 @@ function MapPage() {
       .filter((t) => selectedSet.size === 0 || selectedSet.has(t.call || t.reg))
       .map((t) => ({ points: t.points, type: t.type, t0: t.t0 }))
     if (!tracks.length) { setImpactPopRaster(null); return }
-    const rasterOpts = {}
-    if (todFilter) { rasterOpts.todStart = todStart; rasterOpts.todEnd = todEnd }
     const id = setTimeout(() => {
-      const result = computeImpactRaster(tracks, popDataForImpact, rasterOpts)
+      const result = computeImpactRaster(tracks, popDataForImpact, {})
       setImpactPopRaster(result)
     }, 0)
     return () => clearTimeout(id)
-  }, [visible, showImpact, popDataForImpact, selectedTails, todFilter, todStart, todEnd])
+  }, [visible, showImpact, popDataForImpact, selectedTails])
 
   // Aggregate currently-visible tracks by tail number. For each tail, count
   // segments by class and rank by % red. Also tally likely "based" airport
