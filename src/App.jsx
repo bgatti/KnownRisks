@@ -10,6 +10,7 @@ import NoticePage from './NoticePage.jsx'
 import ThinningTest from './ThinningTest.jsx'
 import NoiseImpactTest from './NoiseImpactTest.jsx'
 import { computeNoiseRaster } from './noiseRaster'
+import { loadPopulationDensity, rasterizePopulation } from './populationRaster'
 
 function ComposeNoticeModal({ compose, onClose }) {
   const [status, setStatus] = useState('')
@@ -690,6 +691,21 @@ function MapPage() {
   const [onlyViolations, setOnlyViolations] = useState(false)
   const [realImpact, setRealImpact] = useState(true)
   const [impactOpacity, setImpactOpacity] = useState(1.0)
+  const [showPopDensity, setShowPopDensity] = useState(false)
+  const [popDensityOverlay, setPopDensityOverlay] = useState(null)
+  const [popDensityOpacity, setPopDensityOpacity] = useState(0.5)
+  useEffect(() => {
+    if (!showPopDensity) { setPopDensityOverlay(null); return }
+    let cancelled = false
+    loadPopulationDensity()
+      .then((data) => {
+        if (cancelled) return
+        const result = rasterizePopulation(data)
+        setPopDensityOverlay(result)
+      })
+      .catch((e) => console.warn('population density load failed:', e))
+    return () => { cancelled = true }
+  }, [showPopDensity])
   const [clipToRadius, setClipToRadius] = useState(false)
   const mapRef = useRef(null)
   const [todFilter, setTodFilter] = useState(false)
@@ -1819,6 +1835,25 @@ function MapPage() {
             <span>Noise heatmap</span>
           </label>
           <label className="flex items-center gap-1.5 cursor-pointer">
+            <input type="checkbox" checked={showPopDensity} onChange={(e) => setShowPopDensity(e.target.checked)} />
+            <span>Population density</span>
+          </label>
+          {showPopDensity && popDensityOverlay && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-white/60">density opacity</span>
+              <input
+                type="range"
+                min="0.1"
+                max="1"
+                step="0.05"
+                value={popDensityOpacity}
+                onChange={(e) => setPopDensityOpacity(Number(e.target.value))}
+                className="w-24"
+              />
+              <span className="w-8 tabular-nums text-right">{popDensityOpacity.toFixed(2)}</span>
+            </div>
+          )}
+          <label className="flex items-center gap-1.5 cursor-pointer">
             <input type="checkbox" checked={onlyViolations} onChange={(e) => setOnlyViolations(e.target.checked)} />
             <span>Only violators</span>
           </label>
@@ -2570,6 +2605,16 @@ The team at Boulder Municipal Airport (KBDU)`
                 </Tooltip>
               </Polygon>
             ))}
+
+          {/* Population density underlay */}
+          {showPopDensity && popDensityOverlay && (
+            <ImageOverlay
+              url={popDensityOverlay.dataUrl}
+              bounds={popDensityOverlay.latLngBounds}
+              opacity={popDensityOpacity}
+              interactive={false}
+            />
+          )}
 
           {/* Impact raster — single ImageOverlay, optionally TOD-filtered */}
           {realImpact && impactRaster && (

@@ -1604,6 +1604,171 @@ function dbTracksPlugin() {
   }
 }
 
+// Pre-aggregated noise stats and filtered tracks from Postgres.
+// Replaces the 60MB bulk download + client-side classification with
+// lightweight server-side queries against pre-computed columns.
+function noiseApiPlugin() {
+  if (!db.useDb) return null // only on Railway
+  return {
+    name: 'noise-api',
+    configureServer(server) {
+      console.log('[noise-api] registered /api/noise/stats, /api/noise/tracks, /api/noise/years')
+
+      // GET /api/noise/years — distinct years for filter pills
+      server.middlewares.use('/api/noise/years', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const r = await db.queryDb('SELECT DISTINCT year FROM tracks WHERE year IS NOT NULL ORDER BY year')
+          const years = r.rows.map(row => row.year)
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({ years }))
+        } catch (e) {
+          console.error('[noise-api] /years error', e)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(e) }))
+        }
+      })
+
+      // GET /api/noise/stats?year=X&base=X&school=X&origin=X
+      // Returns per-tail rankings + cube aggregation for the sidebar.
+      // Payload: ~50-100KB vs 60MB before.
+      server.middlewares.use('/api/noise/stats', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const year = u.searchParams.get('year') || null
+          const base = u.searchParams.get('base') || null
+          const school = u.searchParams.get('school') || null
+          const origin = u.searchParams.get('origin') || null
+
+          // Build WHERE clause from filters
+          const conds = ['seg_total > 0']
+          const params = []
+          if (year) { params.push(year); conds.push(`year = $${params.length}`) }
+          if (base) { params.push(base); conds.push(`base_airport = $${params.length}`) }
+          if (school) { params.push(school); conds.push(`school = $${params.length}`) }
+          if (origin) { params.push(origin); conds.push(`origin = $${params.length}`) }
+          const where = conds.join(' AND ')
+
+          // Per-tail rankings
+          const tailSql = `
+            SELECT call AS tail, type, desc_text AS desc, school, base_airport AS base, origin,
+                   SUM(seg_total)::int AS total, SUM(seg_red)::int AS red,
+                   SUM(seg_orange)::int AS orange, SUM(seg_yellow)::int AS yellow,
+                   SUM(len_total_ft)::real AS total_ft, SUM(len_red_ft)::real AS red_ft,
+                   SUM(len_orange_ft)::real AS orange_ft, SUM(len_yellow_ft)::real AS yellow_ft,
+                   MAX(CASE worst_class WHEN 'red' THEN 3 WHEN 'orange' THEN 2 WHEN 'yellow' THEN 1 ELSE 0 END) AS worst_rank,
+                   COUNT(*)::int AS track_count
+            FROM tracks
+            WHERE ${where}
+            GROUP BY call, type, desc_text, school, base_airport, origin
+            HAVING SUM(seg_total) > 0
+            ORDER BY SUM(seg_red)::float / NULLIF(SUM(seg_total), 0) DESC
+            LIMIT 200
+          `
+          const tailRes = await db.queryDb(tailSql, params)
+          const worstMap = { 3: 'red', 2: 'orange', 1: 'yellow' }
+          const perTail = tailRes.rows.map(r => ({
+            ...r, worst: worstMap[r.worst_rank] || null,
+          }))
+
+          // Cube: year × base × origin → { total, red }
+          const cubeSql = `
+            SELECT year, base_airport AS base, origin,
+                   SUM(seg_total)::int AS total, SUM(seg_red)::int AS red
+            FROM tracks WHERE seg_total > 0
+            GROUP BY year, base_airport, origin
+          `
+          const cubeRes = await db.queryDb(cubeSql)
+          const cube = {}
+          for (const r of cubeRes.rows) {
+            if (!cube[r.year]) cube[r.year] = {}
+            if (!cube[r.year][r.base]) cube[r.year][r.base] = {}
+            cube[r.year][r.base][r.origin] = { total: r.total, red: r.red }
+          }
+
+          // Available filters
+          const yearsRes = await db.queryDb('SELECT DISTINCT year FROM tracks WHERE year IS NOT NULL ORDER BY year')
+          const basesRes = await db.queryDb('SELECT DISTINCT base_airport FROM tracks WHERE base_airport IS NOT NULL ORDER BY base_airport')
+          const schoolsRes = await db.queryDb('SELECT DISTINCT school FROM tracks WHERE school IS NOT NULL ORDER BY school')
+
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({
+            perTail,
+            cube,
+            years: yearsRes.rows.map(r => r.year),
+            bases: basesRes.rows.map(r => r.base_airport),
+            schools: schoolsRes.rows.map(r => r.school),
+          }))
+        } catch (e) {
+          console.error('[noise-api] /stats error', e)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(e) }))
+        }
+      })
+
+      // GET /api/noise/tracks?year=X&base=X&school=X&violations_only=1&limit=500&offset=0
+      // Returns pre-banded tracks for map rendering. Each track includes
+      // bands (colored polyline segments) — the client just renders them.
+      // Payload: ~200-500KB for 500 tracks vs 60MB for all.
+      server.middlewares.use('/api/noise/tracks', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const year = u.searchParams.get('year') || null
+          const base = u.searchParams.get('base') || null
+          const school = u.searchParams.get('school') || null
+          const violationsOnly = u.searchParams.get('violations_only') === '1'
+          const limit = Math.min(2000, Math.max(1, parseInt(u.searchParams.get('limit') || '500')))
+          const offset = Math.max(0, parseInt(u.searchParams.get('offset') || '0'))
+
+          const conds = ['in_ring = true']
+          const params = []
+          if (year) { params.push(year); conds.push(`year = $${params.length}`) }
+          if (base) { params.push(base); conds.push(`base_airport = $${params.length}`) }
+          if (school) { params.push(school); conds.push(`school = $${params.length}`) }
+          if (violationsOnly) { conds.push('worst_class IS NOT NULL') }
+          const where = conds.join(' AND ')
+
+          // Count total matching
+          const countRes = await db.queryDb(`SELECT count(*)::int AS n FROM tracks WHERE ${where}`, params)
+          const total = countRes.rows[0].n
+
+          // Fetch page of tracks with pre-computed bands
+          const pIdx = params.length
+          params.push(limit, offset)
+          const sql = `
+            SELECT call, type, desc_text AS desc, own_op AS "ownOp", src,
+                   year, date, base_airport AS base, origin, worst_class AS worst,
+                   seg_total, seg_red, seg_orange, seg_yellow, school, bands
+            FROM tracks
+            WHERE ${where}
+            ORDER BY id
+            LIMIT $${pIdx + 1} OFFSET $${pIdx + 2}
+          `
+          const r = await db.queryDb(sql, params)
+
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({
+            tracks: r.rows,
+            total,
+            limit,
+            offset,
+            pages: Math.ceil(total / limit),
+          }))
+        } catch (e) {
+          console.error('[noise-api] /tracks error', e)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(e), tracks: [] }))
+        }
+      })
+    },
+  }
+}
+
 function externalDataPlugin() {
   const DATA_PATH = 'C:\\tmp\\noise_data\\tracks_yearly.json'
   return {
@@ -1630,6 +1795,7 @@ export default defineConfig({
     react(),
     // On Railway, serve tracks from Postgres; locally, from C:\tmp\noise_data\
     db.useDb ? dbTracksPlugin() : externalDataPlugin(),
+    noiseApiPlugin(),  // pre-aggregated stats + filtered tracks (DB-only)
     sendNoticePlugin(),
     offensesApiPlugin(),
     complaintsApiPlugin(),
