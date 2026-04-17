@@ -1729,7 +1729,7 @@ function noiseApiPlugin() {
           const limit = Math.min(2000, Math.max(1, parseInt(u.searchParams.get('limit') || '500')))
           const offset = Math.max(0, parseInt(u.searchParams.get('offset') || '0'))
 
-          const conds = ['in_ring = true']
+          const conds = ['1=1']
           const params = []
           if (year) { params.push(year); conds.push(`year = $${params.length}`) }
           if (base) { params.push(base); conds.push(`base_airport = $${params.length}`) }
