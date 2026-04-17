@@ -524,6 +524,7 @@ export function NoiseStudio() {
         for (const seg of track.segments || []) {
           if (!seg.points || seg.points.length < 2) continue
           const latlngs = seg.points.map((p) => [p[0], p[1]])
+          // Grab the most recent per-point timestamp in this segment (p[3] = epoch-ms).
           let segLastMs = 0
           for (const p of seg.points) {
             if (typeof p[3] === 'number' && p[3] > segLastMs) segLastMs = p[3]
@@ -1182,8 +1183,8 @@ export function NoiseStudio() {
       )}
 
       {/* Top header */}
-      <header className="absolute top-0 left-0 right-0 z-[1000] p-4 pointer-events-none">
-        <div className="max-w-5xl mx-auto flex items-start justify-between gap-4">
+      <header className="absolute top-0 left-0 right-0 z-[1000] p-2 sm:p-4 pointer-events-none">
+        <div className="max-w-5xl mx-auto flex items-start justify-between gap-2 sm:gap-4">
           <div className="pointer-events-auto bg-black/60 backdrop-blur-md border border-white/10 rounded-lg px-4 py-2.5 shadow-2xl">
             <p className="text-[10px] uppercase tracking-[0.2em] text-neutral-500">Aircraft Noise</p>
             <h1 className="text-base font-semibold text-neutral-100">Noise Report</h1>
@@ -1241,8 +1242,9 @@ export function NoiseStudio() {
         />
       )}
 
-      {/* Active excursions panel */}
-      <aside className="absolute top-24 left-4 z-[1000] w-72 max-h-[60vh] pointer-events-auto">
+      {/* Active excursions panel — horizontal strip on mobile, sidebar on desktop */}
+      <aside className="absolute z-[1000] pointer-events-auto
+        bottom-20 left-2 right-2 sm:bottom-auto sm:top-24 sm:left-4 sm:right-auto sm:w-72 sm:max-h-[60vh]">
         <ExcursionList
           activeList={activeList}
           activeStatus={activeStatus}
@@ -1253,16 +1255,16 @@ export function NoiseStudio() {
         />
       </aside>
 
-      {/* Bottom Report button */}
+      {/* Bottom Report button — sits above the mobile excursion strip */}
       {!reportOpen && (
-        <div className="absolute bottom-8 left-0 right-0 z-[1000] flex justify-center pointer-events-none">
+        <div className="absolute bottom-[7.5rem] sm:bottom-8 left-0 right-0 z-[1000] flex justify-center pointer-events-none pb-[env(safe-area-inset-bottom)]">
           <button
             onClick={() => openReport(activeList.length ? 'excursion' : 'general')}
-            className="pointer-events-auto group relative flex items-center gap-3 rounded-full bg-gradient-to-r from-rose-500 to-amber-500 px-7 py-4 text-base font-semibold text-white shadow-[0_10px_40px_rgba(244,63,94,0.45)] hover:shadow-[0_10px_50px_rgba(244,63,94,0.65)] transition-all hover:scale-[1.02]"
+            className="pointer-events-auto group relative flex items-center gap-2 sm:gap-3 rounded-full bg-gradient-to-r from-rose-500 to-amber-500 px-5 sm:px-7 py-3 sm:py-4 text-sm sm:text-base font-semibold text-white shadow-[0_10px_40px_rgba(244,63,94,0.45)] hover:shadow-[0_10px_50px_rgba(244,63,94,0.65)] transition-all hover:scale-[1.02]"
           >
-            <IconAlertTriangle size={20} />
+            <IconAlertTriangle size={18} />
             Report Noise Excursion
-            <IconArrowRight size={18} />
+            <IconArrowRight size={16} />
           </button>
         </div>
       )}
@@ -1501,58 +1503,93 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
     return arr
   }, [activeList, distanceByTail])
 
+  const items = groups.map((g) => {
+    const selectedInGroup = g.tails.find((a) => a.tail === selectedTail)
+    const anyActive = !!selectedInGroup
+    const onClick = () => {
+      if (!g.tails.length) return
+      if (anyActive) {
+        const idx = g.tails.findIndex((a) => a.tail === selectedTail)
+        const next = g.tails[(idx + 1) % g.tails.length]
+        onSelectTail(g.tails.length === 1 ? null : next.tail)
+      } else {
+        const pick = g.tails.reduce((r, a) => ((a.lastSeenMs || 0) > (r.lastSeenMs || 0) ? a : r), g.tails[0])
+        onSelectTail(pick.tail)
+      }
+    }
+    return { ...g, anyActive, onClick }
+  })
+
   return (
     <div className="bg-black/60 backdrop-blur-md border border-white/10 rounded-lg shadow-2xl flex flex-col overflow-hidden">
-      <div className="px-3 py-2.5 border-b border-white/10">
-        <p className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">Active Excursions</p>
-        <p className="text-[11px] text-neutral-400">
-          {activeStatus === 'loading' && 'Loading…'}
-          {activeStatus === 'error' && <span className="text-rose-300">Feed unavailable</span>}
-          {activeStatus === 'ok' && `${activeList.length} aircraft · 2h`}
-        </p>
+      {/* ─ Mobile: horizontal scroll strip ─ */}
+      <div className="sm:hidden">
+        <ul className="flex gap-1.5 overflow-x-auto p-1.5 scrollbar-none">
+          {activeStatus === 'ok' && items.length === 0 && (
+            <li className="px-3 py-2 text-[10px] text-neutral-500 whitespace-nowrap">No excursions</li>
+          )}
+          {items.map((g) => (
+            <li key={g.type} className="flex-shrink-0">
+              <button
+                onClick={g.onClick}
+                className={[
+                  'flex flex-col items-center w-16 rounded-lg overflow-hidden border transition-colors',
+                  g.anyActive
+                    ? 'border-sky-400/60 bg-sky-400/15'
+                    : 'border-white/10 bg-white/[0.02]',
+                ].join(' ')}
+              >
+                <div className="relative w-full aspect-square bg-black/40">
+                  {typePhotos?.[g.type] ? (
+                    <img src={typePhotos[g.type]} alt="" loading="lazy" className="absolute inset-0 w-full h-full object-cover" />
+                  ) : (
+                    <div className="absolute inset-0 flex items-center justify-center"><IconVideo size={12} className="text-neutral-700" /></div>
+                  )}
+                  <span
+                    className="absolute top-0.5 left-0.5 h-1.5 w-1.5 rounded-full"
+                    style={{ background: KLASS_COLORS[g.worst], boxShadow: `0 0 5px ${KLASS_COLORS[g.worst]}` }}
+                  />
+                </div>
+                <div className="w-full px-1 py-1 text-center">
+                  <div className="text-[9px] font-semibold text-neutral-100 truncate leading-tight">{g.type}</div>
+                  <div className="text-[8px] text-neutral-500 truncate leading-tight">
+                    {g.nearestMeters != null ? formatMiles(g.nearestMeters) : (formatAgo(g.mostRecentMs) || g.worst)}
+                  </div>
+                </div>
+              </button>
+            </li>
+          ))}
+        </ul>
       </div>
-      <ul className="overflow-y-auto">
-        {activeStatus === 'ok' && groups.length === 0 && (
-          <li className="px-3 py-3 text-[11px] text-neutral-500">No recent excursions.</li>
-        )}
-        {groups.map((g) => {
-          const selectedInGroup = g.tails.find((a) => a.tail === selectedTail)
-          const anyActive = !!selectedInGroup
-          // If multiple tails of this type: clicking cycles through them;
-          // otherwise just toggles selection on the single one.
-          const onClick = () => {
-            if (!g.tails.length) return
-            if (anyActive) {
-              const idx = g.tails.findIndex((a) => a.tail === selectedTail)
-              const next = g.tails[(idx + 1) % g.tails.length]
-              onSelectTail(g.tails.length === 1 ? null : next.tail)
-            } else {
-              // Prefer the most-recently-seen tail of this type
-              const pick = g.tails.reduce((r, a) => ((a.lastSeenMs || 0) > (r.lastSeenMs || 0) ? a : r), g.tails[0])
-              onSelectTail(pick.tail)
-            }
-          }
-          return (
+
+      {/* ─ Desktop: vertical list (unchanged layout) ─ */}
+      <div className="hidden sm:flex sm:flex-col sm:overflow-hidden">
+        <div className="px-3 py-2.5 border-b border-white/10">
+          <p className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">Active Excursions</p>
+          <p className="text-[11px] text-neutral-400">
+            {activeStatus === 'loading' && 'Loading…'}
+            {activeStatus === 'error' && <span className="text-rose-300">Feed unavailable</span>}
+            {activeStatus === 'ok' && `${activeList.length} aircraft · 2h`}
+          </p>
+        </div>
+        <ul className="overflow-y-auto">
+          {activeStatus === 'ok' && items.length === 0 && (
+            <li className="px-3 py-3 text-[11px] text-neutral-500">No recent excursions.</li>
+          )}
+          {items.map((g) => (
             <li key={g.type} className="border-b border-white/5 last:border-b-0">
               <button
-                onClick={onClick}
+                onClick={g.onClick}
                 className={[
                   'w-full text-left px-3 py-2.5 flex items-center gap-2.5 transition-colors',
-                  anyActive ? 'bg-white/10' : 'hover:bg-white/5',
+                  g.anyActive ? 'bg-white/10' : 'hover:bg-white/5',
                 ].join(' ')}
               >
                 <div className="relative h-10 w-14 flex-shrink-0 rounded overflow-hidden bg-black/40 border border-white/10">
                   {typePhotos?.[g.type] ? (
-                    <img
-                      src={typePhotos[g.type]}
-                      alt=""
-                      loading="lazy"
-                      className="absolute inset-0 w-full h-full object-cover"
-                    />
+                    <img src={typePhotos[g.type]} alt="" loading="lazy" className="absolute inset-0 w-full h-full object-cover" />
                   ) : (
-                    <div className="absolute inset-0 flex items-center justify-center">
-                      <IconVideo size={14} className="text-neutral-700" />
-                    </div>
+                    <div className="absolute inset-0 flex items-center justify-center"><IconVideo size={14} className="text-neutral-700" /></div>
                   )}
                   <span
                     className="absolute top-0.5 left-0.5 h-1.5 w-1.5 rounded-full"
@@ -1572,12 +1609,6 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
                     <span>{g.tails.length} aircraft</span>
                     <span>·</span>
                     <span>{formatAgo(g.mostRecentMs) || g.worst}</span>
-                    {anyActive && g.tails.length > 1 && (
-                      <>
-                        <span>·</span>
-                        <span>cycle</span>
-                      </>
-                    )}
                   </div>
                   <ExcursionStatusBar
                     reportCount={g.reportCount}
@@ -1588,9 +1619,9 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
                 </div>
               </button>
             </li>
-          )
-        })}
-      </ul>
+          ))}
+        </ul>
+      </div>
     </div>
   )
 }
