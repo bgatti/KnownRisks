@@ -1227,7 +1227,7 @@ function MapPage() {
   const [didInitYear, setDidInitYear] = useState(false)
   useEffect(() => {
     if (!didInitYear && yearFilter == null && availableYears.length > 0) {
-      setYearFilter(availableYears[0])
+      setYearFilter('all')
       setDidInitYear(true)
     }
   }, [availableYears, yearFilter, didInitYear])
