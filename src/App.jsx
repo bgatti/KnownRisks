@@ -1353,6 +1353,7 @@ function MapPage() {
   // a re-render loop. Minimum 2s display per frame.
   const todFrameReady = useRef(false)
   const todAdvanceTimer = useRef(null)
+  const [impactRaster, setImpactRaster] = useState(null)
 
   // Mark frame as ready when impactRaster updates (or when raster is off)
   useEffect(() => {
@@ -1390,7 +1391,6 @@ function MapPage() {
   }, [todAnimate, todCache, realImpact])
 
   // HP-based noise raster
-  const [impactRaster, setImpactRaster] = useState(null)
   useEffect(() => {
     if (!realImpact) { setImpactRaster(null); return }
     const selectedSet = new Set(selectedTails)
