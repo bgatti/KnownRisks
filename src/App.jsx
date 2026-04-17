@@ -652,6 +652,7 @@ function MapPage() {
       .catch(() => {})
   }, [])
   const [altCap, setAltCap] = useState(7500)
+  const [showPaths, setShowPaths] = useState(true)
   const [showZones, setShowZones] = useState(true)
   const [showHeatmap, setShowHeatmap] = useState(false) // legacy — kept for code refs but unused
   const [heatmap, setHeatmap] = useState(null) // { url, bounds } — global PNG
@@ -1938,6 +1939,7 @@ function MapPage() {
           </button>
           <div className="flex items-center gap-1 flex-wrap">
             {[
+              { label: 'Paths', active: showPaths, toggle: () => setShowPaths((v) => !v) },
               { label: 'Zones', active: showZones, toggle: () => setShowZones((v) => !v) },
               { label: 'Heatmap', active: realImpact, toggle: () => setRealImpact((v) => !v) },
               { label: 'Population', active: showPopDensity, toggle: () => setShowPopDensity((v) => !v) },
@@ -2783,7 +2785,7 @@ The team at Boulder Municipal Airport (KBDU)`
           )}
 
           {/* Full-track overlay for the clicked aircraft — drawn last so it sits on top */}
-          {selectedOverlays.flatMap((t, ti) =>
+          {showPaths && selectedOverlays.flatMap((t, ti) =>
             t.overlayRuns.map((r, ri) => {
               const color = r.klass ? CLASS_COLOR[r.klass] : (t._cleanColor || '#1a7070')
               return (
@@ -2823,7 +2825,7 @@ The team at Boulder Municipal Airport (KBDU)`
             })
           )}
 
-          {visible.flatMap((t, ti) => {
+          {showPaths && visible.flatMap((t, ti) => {
             if (t._src === 'live') return [] // rendered separately with age-based opacity
             const tail = t.call || t.reg
             // Isolation: when any tail is selected, hide every other track on
