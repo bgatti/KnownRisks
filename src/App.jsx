@@ -386,42 +386,23 @@ const CLASS_COLOR = {
   yellow: '#facc15',
 }
 
-// Color for clean (non-violation) track segments based on altitude.
-// Calibrated to real data: p10=5750 ft, median=7100 ft, p90=8000 ft.
-// The worst 10% (low-flying) get a warm amber; the default/majority
-// is a dark cool cyan that reads clearly as "safe". The gradient is
-// compressed into the 5500–8000 ft range where most flights sit.
+// Color for clean (non-violation) portions of a track, based on what
+// fraction of the TOTAL flight is spent in noise zones.
+// Calibrated to real data: 89% of flights have 0% excursion,
+// p90 = 1.8%, p95 = 16%. So the gradient maxes at ~15%.
 //
-//   ≤5500 ft  → warm amber   rgb(180,120,60)   — unusually low
-//    6000 ft  → muted olive  rgb(100,120,80)
-//    7000 ft  → dark teal    rgb(40,110,110)    — typical
-//   ≥8000 ft  → dark cyan    rgb(30,90,120)     — high, safe
-const CLEAN_STOPS = [
-  [5500, [180, 120,  60]],   // warm amber — bottom 10%
-  [6000, [100, 120,  80]],   // muted olive
-  [7000, [ 40, 110, 110]],   // dark teal — median
-  [8000, [ 30,  90, 120]],   // dark cyan — top 10%
-]
-
-function cleanColor(avgAlt) {
-  if (avgAlt == null) return '#1e6060' // dark teal fallback
-  if (avgAlt <= CLEAN_STOPS[0][0]) {
-    const [, c] = CLEAN_STOPS[0]
-    return `rgb(${c[0]},${c[1]},${c[2]})`
-  }
-  for (let i = 0; i < CLEAN_STOPS.length - 1; i++) {
-    const [a0, c0] = CLEAN_STOPS[i]
-    const [a1, c1] = CLEAN_STOPS[i + 1]
-    if (avgAlt <= a1) {
-      const t = (avgAlt - a0) / (a1 - a0)
-      const r = Math.round(c0[0] + (c1[0] - c0[0]) * t)
-      const g = Math.round(c0[1] + (c1[1] - c0[1]) * t)
-      const b = Math.round(c0[2] + (c1[2] - c0[2]) * t)
-      return `rgb(${r},${g},${b})`
-    }
-  }
-  const [, c] = CLEAN_STOPS[CLEAN_STOPS.length - 1]
-  return `rgb(${c[0]},${c[1]},${c[2]})`
+//   0% excursion  → dark cyan    — clean flight, the majority
+//   ~2%           → teal         — slight incursion
+//   ~5%           → muted olive  — notable
+//  ≥15%           → warm amber   — worst 5%, significant excursion
+function trackCleanColor(excursionPct) {
+  if (excursionPct == null || excursionPct <= 0) return '#1a7070' // dark cyan — zero excursion
+  const t = Math.min(1, excursionPct / 0.15) // normalize to 0–1, max at 15%
+  // dark cyan → warm amber
+  const r = Math.round(26 + (180 - 26) * t)
+  const g = Math.round(112 + (120 - 112) * t)
+  const b = Math.round(112 + (50 - 112) * t)
+  return `rgb(${r},${g},${b})`
 }
 
 // Split a track into runs of identical classification so we can draw each run
@@ -1004,6 +985,14 @@ function MapPage() {
         // Collect all points for compatibility with code that reads t.points
         const allPts = []
         for (const r of runs) for (const p of r.points) allPts.push(p)
+        // Per-track excursion fractions (% of total flight in each zone)
+        const totalFt = t.len_total_ft || 0
+        const pctRed = totalFt > 0 ? (t.len_red_ft || 0) / totalFt : 0
+        const pctOrange = totalFt > 0 ? (t.len_orange_ft || 0) / totalFt : 0
+        const pctYellow = totalFt > 0 ? (t.len_yellow_ft || 0) / totalFt : 0
+        const excursionPct = pctRed + pctOrange + pctYellow
+        const _cleanColor = trackCleanColor(excursionPct)
+
         out.push({
           call: t.call, type: t.type, desc: t.desc, ownOp: t.ownOp, src: t.src,
           year: t.year, t0: null,
@@ -1017,6 +1006,9 @@ function MapPage() {
           lastBase: null,
           worst: t.worst,
           depDir: null,
+          pctRed, pctOrange, pctYellow, excursionPct,
+          totalFt,
+          _cleanColor,
         })
       }
       // Add live tracks if active
@@ -2789,7 +2781,7 @@ The team at Boulder Municipal Airport (KBDU)`
           {/* Full-track overlay for the clicked aircraft — drawn last so it sits on top */}
           {selectedOverlays.flatMap((t, ti) =>
             t.overlayRuns.map((r, ri) => {
-              const color = r.klass ? CLASS_COLOR[r.klass] : cleanColor(r.avgAlt)
+              const color = r.klass ? CLASS_COLOR[r.klass] : (t._cleanColor || '#1a7070')
               return (
                 <Polyline
                   key={`sel-${t._src}-${ti}-${ri}`}
@@ -2835,7 +2827,7 @@ The team at Boulder Municipal Airport (KBDU)`
             if (selectedTails.length > 0 && !selectedTails.includes(tail)) return []
             const agg = byTailMap.get(tail)
             return t.runs.map((r, ri) => {
-              const color = r.klass ? CLASS_COLOR[r.klass] : cleanColor(r.avgAlt)
+              const color = r.klass ? CLASS_COLOR[r.klass] : (t._cleanColor || '#1a7070')
               return (
                 <Polyline
                   key={`${t._src}-${ti}-${ri}`}
