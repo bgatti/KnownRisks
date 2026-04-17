@@ -1218,7 +1218,7 @@ export function NoiseStudio() {
 
       {/* Active excursions panel — floating tiles on mobile, sidebar on desktop */}
       <aside className="absolute z-[1000] pointer-events-auto
-        bottom-14 left-2 md:bottom-auto md:top-24 md:left-4 md:right-auto md:w-72 md:max-h-[60vh]">
+        bottom-[4.5rem] left-2 md:bottom-auto md:top-24 md:left-4 md:right-auto md:w-72 md:max-h-[60vh]">
         <ExcursionList
           activeList={activeList}
           activeStatus={activeStatus}
@@ -1231,7 +1231,7 @@ export function NoiseStudio() {
 
       {/* Bottom Report button — sits above the mobile excursion strip */}
       {!reportOpen && (
-        <div className="absolute bottom-[3.75rem] md:bottom-8 left-0 right-0 z-[1000] flex justify-center pointer-events-none pb-[env(safe-area-inset-bottom)]">
+        <div className="absolute bottom-4 md:bottom-8 left-0 right-0 z-[1000] flex justify-center pointer-events-none pb-[env(safe-area-inset-bottom)]">
           <button
             onClick={() => openReport(activeList.length ? 'excursion' : 'general')}
             className="pointer-events-auto group relative flex items-center gap-1.5 md:gap-3 rounded-full bg-gradient-to-r from-rose-500 to-amber-500 px-3.5 md:px-7 py-2 md:py-4 text-[11px] md:text-base font-semibold text-white shadow-[0_10px_40px_rgba(244,63,94,0.45)] hover:shadow-[0_10px_50px_rgba(244,63,94,0.65)] transition-all hover:scale-[1.02]"
