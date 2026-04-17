@@ -1348,23 +1348,46 @@ function MapPage() {
     return () => { cancelled = true }
   }, [todAnimate, yearFilter, baseFilter, schoolFilter, purposeFilter])
 
-  // Cycle through cached blocks
+  // Advance to next TOD block only after current frame has rendered.
+  // Uses a ref so the raster effect can signal "done" without causing
+  // a re-render loop. Minimum 2s display per frame.
+  const todFrameReady = useRef(false)
+  const todAdvanceTimer = useRef(null)
+
+  // Mark frame as ready when impactRaster updates (or when raster is off)
+  useEffect(() => {
+    if (!todAnimate || !todCache) return
+    todFrameReady.current = true
+  }, [impactRaster, todAnimate, todCache])
+
+  // Advance loop: check every 500ms if frame is ready + min time elapsed
   useEffect(() => {
     if (!todAnimate || !todCache) return
     const blocks = todCache.blocks
-    const timer = setInterval(() => {
-      setTodAnimIdx(i => {
-        const next = (i + 1) % blocks.length
-        const b = blocks[next]
-        setTodStart(b.start)
-        setTodEnd(b.end)
-        setNoiseStats(b.stats)
-        setServerTracks(b.tracks)
-        return next
-      })
-    }, 3000)
-    return () => clearInterval(timer)
-  }, [todAnimate, todCache])
+    let frameStart = Date.now()
+    todFrameReady.current = !realImpact // if heatmap is off, ready immediately
+    const MIN_DISPLAY_MS = 2500
+
+    const check = () => {
+      const elapsed = Date.now() - frameStart
+      if (todFrameReady.current && elapsed >= MIN_DISPLAY_MS) {
+        // Advance to next block
+        setTodAnimIdx(i => {
+          const next = (i + 1) % blocks.length
+          const b = blocks[next]
+          setTodStart(b.start)
+          setTodEnd(b.end)
+          setNoiseStats(b.stats)
+          setServerTracks(b.tracks)
+          return next
+        })
+        todFrameReady.current = false
+        frameStart = Date.now()
+      }
+    }
+    todAdvanceTimer.current = setInterval(check, 500)
+    return () => clearInterval(todAdvanceTimer.current)
+  }, [todAnimate, todCache, realImpact])
 
   // HP-based noise raster
   const [impactRaster, setImpactRaster] = useState(null)
