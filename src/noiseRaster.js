@@ -295,8 +295,8 @@ function paletteLookup(t) {
   return [(a[0]+(b[0]-a[0])*f)|0, (a[1]+(b[1]-a[1])*f)|0, (a[2]+(b[2]-a[2])*f)|0]
 }
 
-function rasterize(blobs, gridW, gridH, latMin, latMax, lonMin, lonMax, gain, scaleCfg) {
-  if (!blobs.length) return null
+// ── Energy accumulator (shared by noise and impact rasters) ────────────────
+function accumulate(blobs, gridW, gridH, latMin, latMax, lonMin, lonMax, gain) {
   const mPerDegLat = 111320
   const mPerDegLon = 111320 * Math.cos(((latMin+latMax)/2) * Math.PI / 180)
   const dLat = latMax - latMin, dLon = lonMax - lonMin
@@ -332,6 +332,11 @@ function rasterize(blobs, gridW, gridH, latMin, latMax, lonMin, lonMax, gain, sc
       }
     }
   }
+  return energy
+}
+
+// ── Colorize an energy grid into a canvas PNG ──────────────────────────────
+function colorize(energy, gridW, gridH, latMin, latMax, lonMin, lonMax, scaleCfg, palFn) {
   const nonZero = []
   for (let i = 0; i < energy.length; i++) if (energy[i] > 0) nonZero.push(energy[i])
   nonZero.sort((x, y) => x - y)
@@ -346,10 +351,11 @@ function rasterize(blobs, gridW, gridH, latMin, latMax, lonMin, lonMax, gain, sc
     loL = Math.log(Math.max(1e-12, loObs)); hiL = Math.log(Math.max(1e-12, hiObs))
   }
   const span = Math.max(0.01, hiL - loL)
+  const lookup = palFn || paletteLookup
   const LUT_SIZE = 256
   const lutR = new Uint8Array(LUT_SIZE), lutG = new Uint8Array(LUT_SIZE), lutB = new Uint8Array(LUT_SIZE)
   for (let k = 0; k < LUT_SIZE; k++) {
-    const [r, g2, b2] = paletteLookup(k / (LUT_SIZE - 1))
+    const [r, g2, b2] = lookup(k / (LUT_SIZE - 1))
     lutR[k] = r; lutG[k] = g2; lutB[k] = b2
   }
   const canvas = document.createElement('canvas')
@@ -373,9 +379,18 @@ function rasterize(blobs, gridW, gridH, latMin, latMax, lonMin, lonMax, gain, sc
     latLngBounds: [[latMin, lonMin], [latMax, lonMax]],
     stats: {
       loLog10: loObsLog10, hiLog10: hiObsLog10,
-      cells: nonZero.length, blobs: blobs.length,
+      cells: nonZero.length, blobs: energy.length,
     },
   }
+}
+
+function rasterize(blobs, gridW, gridH, latMin, latMax, lonMin, lonMax, gain, scaleCfg) {
+  if (!blobs.length) return null
+  const dLat = latMax - latMin, dLon = lonMax - lonMin
+  if (dLat <= 0 || dLon <= 0) return null
+  const energy = accumulate(blobs, gridW, gridH, latMin, latMax, lonMin, lonMax, gain)
+  if (!energy) return null
+  return colorize(energy, gridW, gridH, latMin, latMax, lonMin, lonMax, scaleCfg)
 }
 
 // ─── Main export ────────────────────────────────────────────────────────────
@@ -497,6 +512,164 @@ export function computeNoiseRaster(tracks, opts = {}) {
     result.stats.rawBlobs = rawBlobCount
     result.stats.decimation = decimation
     result.stats.tracks = tracks.length
+  }
+  return result
+}
+
+// ─── Population impact raster ───────────────────────────────────────────────
+// noise energy × population density = "people affected" heat map.
+// `popData` is the parsed population_density.json (grid, bounds, gridW, gridH).
+
+// Magenta-based palette for the impact layer — visually distinct from the
+// blue→red noise palette and the yellow→brown density palette.
+const IMPACT_PALETTE = [
+  [ 60,  20, 80],  // deep purple
+  [ 90,  30,120],  // purple
+  [140,  30,150],  // magenta
+  [180,  40,140],  // hot pink
+  [220,  60,100],  // raspberry
+  [240, 100, 60],  // coral
+  [250, 150, 40],  // tangerine
+  [255, 200, 60],  // gold
+  [255, 240,120],  // pale yellow
+  [255, 255,200],  // cream (hottest)
+]
+function impactPaletteLookup(t) {
+  const c = Math.max(0, Math.min(1, t))
+  const pos = c * (IMPACT_PALETTE.length - 1)
+  const i = pos | 0, f = pos - i
+  const a = IMPACT_PALETTE[i]
+  const b = IMPACT_PALETTE[Math.min(IMPACT_PALETTE.length - 1, i + 1)]
+  return [
+    (a[0] + (b[0] - a[0]) * f) | 0,
+    (a[1] + (b[1] - a[1]) * f) | 0,
+    (a[2] + (b[2] - a[2]) * f) | 0,
+  ]
+}
+
+// Sample the population density grid at a given (lat, lon). Returns
+// people/km² or 0 if outside the grid.
+function samplePopDensity(popData, lat, lon) {
+  const { bounds, gridW, gridH, grid } = popData
+  const { latMin, latMax, lonMin, lonMax } = bounds
+  if (lat < latMin || lat > latMax || lon < lonMin || lon > lonMax) return 0
+  // grid row 0 = north (latMax), row gridH-1 = south (latMin)
+  const row = Math.floor(((latMax - lat) / (latMax - latMin)) * gridH)
+  const col = Math.floor(((lon - lonMin) / (lonMax - lonMin)) * gridW)
+  if (row < 0 || row >= gridH || col < 0 || col >= gridW) return 0
+  return grid[row]?.[col] || 0
+}
+
+export function computeImpactRaster(tracks, popData, opts = {}) {
+  const {
+    radiusScale = 3.0,
+    directionalGain = 0.6,
+    noiseResolution = 4,
+    gapThresholdFt = 3000,
+    samplePeriodS = 1,
+    maxBlobs = 50000,
+    rasterPx = 1200,
+    todStart = null,
+    todEnd = null,
+    tzOffsetS = -7 * 3600,
+  } = opts
+
+  if (!popData || !popData.grid) return null
+
+  const hasTodFilter = todStart != null && todEnd != null
+  function inTodRange(t0, tSec) {
+    if (!hasTodFilter || t0 == null || tSec == null) return !hasTodFilter
+    const localS = (t0 + tSec + tzOffsetS)
+    const hour = Math.floor((((localS % 86400) + 86400) % 86400) / 3600)
+    if (todStart <= todEnd) return hour >= todStart && hour < todEnd
+    return hour >= todStart || hour < todEnd
+  }
+
+  const effectiveMult = Math.max(1, Math.min(16, noiseResolution | 0))
+  const lerp = (a, b, t) => a + (b - a) * t
+  let allBlobs = []
+  for (const t of tracks) {
+    const pts = t.points || []
+    if (pts.length < 3) continue
+    const prof = buildEnergyProfile(pts, samplePeriodS, t.type)
+    let blobs = computeBlobs(pts, prof.perPoint, radiusScale)
+    if (hasTodFilter) {
+      blobs = blobs.filter((b, i) => {
+        const p = pts[i]
+        return inTodRange(t.t0, p && p[3])
+      })
+    }
+    for (let i = 0; i < blobs.length; i++) {
+      const a = blobs[i], b = blobs[i + 1]
+      allBlobs.push({ ...a, hp: a.hp / effectiveMult })
+      if (!b || effectiveMult <= 1) continue
+      const mPerDegLat = 111320
+      const mPerDegLon = 111320 * Math.cos(((a.lat + b.lat) / 2) * Math.PI / 180)
+      const segM = Math.hypot((b.lon-a.lon)*mPerDegLon, (b.lat-a.lat)*mPerDegLat)
+      if (segM * 3.281 > gapThresholdFt) continue
+      for (let k = 1; k < effectiveMult; k++) {
+        const tf = k / effectiveMult
+        allBlobs.push({
+          lat: lerp(a.lat, b.lat, tf), lon: lerp(a.lon, b.lon, tf),
+          radius_m: lerp(a.radius_m, b.radius_m, tf),
+          hp: lerp(a.hp, b.hp, tf) / effectiveMult,
+          heading: bearing([a.lat, a.lon], [b.lat, b.lon]),
+        })
+      }
+    }
+  }
+  if (!allBlobs.length) return null
+
+  let decimation = 1
+  if (maxBlobs > 0 && allBlobs.length > maxBlobs) {
+    decimation = Math.ceil(allBlobs.length / maxBlobs)
+    const decimated = []
+    for (let i = 0; i < allBlobs.length; i += decimation) {
+      decimated.push({ ...allBlobs[i], hp: allBlobs[i].hp * decimation })
+    }
+    allBlobs = decimated
+  }
+
+  // Bbox from blobs
+  const g = Math.max(0, Math.min(0.95, directionalGain))
+  const sideBoost = 1 / Math.sqrt(Math.max(0.1, 1 - g * 0.85)) * 1.05
+  let latMin = Infinity, latMax = -Infinity, lonMin = Infinity, lonMax = -Infinity
+  for (const b of allBlobs) {
+    const rPad = b.radius_m * sideBoost
+    const dLat = rPad / 111320, dLon = rPad / (111320 * Math.cos(b.lat * Math.PI / 180))
+    if (b.lat-dLat < latMin) latMin = b.lat-dLat
+    if (b.lat+dLat > latMax) latMax = b.lat+dLat
+    if (b.lon-dLon < lonMin) lonMin = b.lon-dLon
+    if (b.lon+dLon > lonMax) lonMax = b.lon+dLon
+  }
+  const dLat = latMax - latMin, dLon = lonMax - lonMin
+  if (dLat <= 0 || dLon <= 0) return null
+  const aspect = (dLon * Math.cos((latMin+latMax)/2 * Math.PI / 180)) / dLat
+  const gridW = aspect >= 1 ? rasterPx : Math.max(64, Math.round(rasterPx * aspect))
+  const gridH = aspect >= 1 ? Math.max(64, Math.round(rasterPx / aspect)) : rasterPx
+
+  // Step 1: accumulate noise energy
+  const energy = accumulate(allBlobs, gridW, gridH, latMin, latMax, lonMin, lonMax, directionalGain)
+  if (!energy) return null
+
+  // Step 2: multiply each cell by population density at that cell's location
+  const impact = new Float32Array(gridW * gridH)
+  for (let row = 0; row < gridH; row++) {
+    const lat = latMax - (row + 0.5) / gridH * (latMax - latMin)
+    for (let col = 0; col < gridW; col++) {
+      const lon = lonMin + (col + 0.5) / gridW * (lonMax - lonMin)
+      const e = energy[row * gridW + col]
+      if (e <= 0) continue
+      const pop = samplePopDensity(popData, lat, lon)
+      impact[row * gridW + col] = e * pop
+    }
+  }
+
+  // Step 3: colorize with the impact palette
+  const result = colorize(impact, gridW, gridH, latMin, latMax, lonMin, lonMax, null, impactPaletteLookup)
+  if (result) {
+    result.stats.tracks = tracks.length
+    result.stats.decimation = decimation
   }
   return result
 }

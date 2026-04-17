@@ -173,44 +173,61 @@ function classifyTrack(points, call, src, schoolMap) {
 }
 
 // --- Main ---
+// Only processes tracks where year IS NULL (not yet backfilled).
+// Uses transactions per batch. Safe to re-run — picks up where it left off.
 async function main() {
   await migrate()
   const schoolMap = await loadSchoolMap()
 
-  // Count total
-  const countRes = await pool.query('SELECT count(*) FROM tracks')
-  const total = parseInt(countRes.rows[0].count)
-  console.log(`[backfill] processing ${total} tracks...`)
-
-  const BATCH = 500
+  const BATCH = 100
   let processed = 0
 
-  for (let offset = 0; offset < total; offset += BATCH) {
+  // Loop until no un-backfilled tracks remain
+  while (true) {
     const res = await pool.query(
-      'SELECT id, call, src, points FROM tracks ORDER BY id LIMIT $1 OFFSET $2',
-      [BATCH, offset]
+      'SELECT id, call, src, points FROM tracks WHERE year IS NULL ORDER BY id LIMIT $1',
+      [BATCH]
     )
+    if (res.rows.length === 0) break
 
-    for (const row of res.rows) {
-      const stats = classifyTrack(row.points, row.call, row.src, schoolMap)
-      await pool.query(`
-        UPDATE tracks SET
-          year=$2, date=$3, base_airport=$4, origin=$5, worst_class=$6,
-          seg_total=$7, seg_red=$8, seg_orange=$9, seg_yellow=$10,
-          len_total_ft=$11, len_red_ft=$12, len_orange_ft=$13, len_yellow_ft=$14,
-          in_ring=$15, school=$16, bands=$17
-        WHERE id=$1
-      `, [
-        row.id, stats.year, stats.date, stats.base_airport, stats.origin, stats.worst_class,
-        stats.seg_total, stats.seg_red, stats.seg_orange, stats.seg_yellow,
-        stats.len_total_ft, stats.len_red_ft, stats.len_orange_ft, stats.len_yellow_ft,
-        stats.in_ring, stats.school, JSON.stringify(stats.bands),
-      ])
+    // Classify all tracks in this batch in JS
+    const updates = res.rows.map(row => ({
+      id: row.id,
+      stats: classifyTrack(row.points, row.call, row.src, schoolMap),
+    }))
+
+    // Write the whole batch in a single transaction
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      for (const { id, stats } of updates) {
+        await client.query(`
+          UPDATE tracks SET
+            year=$2, date=$3, base_airport=$4, origin=$5, worst_class=$6,
+            seg_total=$7, seg_red=$8, seg_orange=$9, seg_yellow=$10,
+            len_total_ft=$11, len_red_ft=$12, len_orange_ft=$13, len_yellow_ft=$14,
+            in_ring=$15, school=$16, bands=$17
+          WHERE id=$1
+        `, [
+          id, stats.year, stats.date, stats.base_airport, stats.origin, stats.worst_class,
+          stats.seg_total, stats.seg_red, stats.seg_orange, stats.seg_yellow,
+          stats.len_total_ft, stats.len_red_ft, stats.len_orange_ft, stats.len_yellow_ft,
+          stats.in_ring, stats.school, JSON.stringify(stats.bands),
+        ])
+      }
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      console.error(`[backfill] batch error at ${processed}, retrying...`, e.message)
+      client.release()
+      continue // retry same batch
     }
+    client.release()
 
     processed += res.rows.length
-    if (processed % 2000 === 0 || processed === total) {
-      console.log(`[backfill] ${processed}/${total} (${(processed/total*100).toFixed(1)}%)`)
+    if (processed % 2000 < BATCH) {
+      const remaining = await pool.query('SELECT count(*)::int AS n FROM tracks WHERE year IS NULL')
+      console.log(`[backfill] ${processed} done, ${remaining.rows[0].n} remaining`)
     }
   }
 
@@ -225,9 +242,10 @@ async function main() {
     FROM tracks
   `)
   const s = statsRes.rows[0]
-  console.log(`[backfill] done! ${s.total} tracks, ${s.with_violations} with violations, ${s.in_ring} in ring, ${s.years} years, DB=${s.db_size}`)
+  console.log(`[backfill] COMPLETE! ${s.total} tracks, ${s.with_violations} with violations, ${s.in_ring} in ring, ${s.years} years, DB=${s.db_size}`)
 
   await pool.end()
+  process.exit(0)
 }
 
 main().catch(e => { console.error(e); process.exit(1) })

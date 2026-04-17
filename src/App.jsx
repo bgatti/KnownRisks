@@ -9,7 +9,7 @@ import BasesDiagnostic from './BasesDiagnostic.jsx'
 import NoticePage from './NoticePage.jsx'
 import ThinningTest from './ThinningTest.jsx'
 import NoiseImpactTest from './NoiseImpactTest.jsx'
-import { computeNoiseRaster } from './noiseRaster'
+import { computeNoiseRaster, computeImpactRaster } from './noiseRaster'
 import { loadPopulationDensity, rasterizePopulation } from './populationRaster'
 import { loadTerrain, terrainAt } from './terrain'
 
@@ -1322,6 +1322,34 @@ function MapPage() {
     return () => clearTimeout(id)
   }, [visible, realImpact, selectedTails, todFilter, todStart, todEnd])
 
+  // Noise × population density impact raster
+  const [showImpact, setShowImpact] = useState(false)
+  const [impactPopRaster, setImpactPopRaster] = useState(null)
+  const [impactPopOpacity, setImpactPopOpacity] = useState(1.0)
+  const [popDataForImpact, setPopDataForImpact] = useState(null)
+  useEffect(() => {
+    if (!showImpact) return
+    if (popDataForImpact) return // already loaded
+    loadPopulationDensity()
+      .then((d) => setPopDataForImpact(d))
+      .catch((e) => console.warn('population density load failed:', e))
+  }, [showImpact, popDataForImpact])
+  useEffect(() => {
+    if (!showImpact || !popDataForImpact) { setImpactPopRaster(null); return }
+    const selectedSet = new Set(selectedTails)
+    const tracks = visible
+      .filter((t) => selectedSet.size === 0 || selectedSet.has(t.call || t.reg))
+      .map((t) => ({ points: t.points, type: t.type, t0: t.t0 }))
+    if (!tracks.length) { setImpactPopRaster(null); return }
+    const rasterOpts = {}
+    if (todFilter) { rasterOpts.todStart = todStart; rasterOpts.todEnd = todEnd }
+    const id = setTimeout(() => {
+      const result = computeImpactRaster(tracks, popDataForImpact, rasterOpts)
+      setImpactPopRaster(result)
+    }, 0)
+    return () => clearTimeout(id)
+  }, [visible, showImpact, popDataForImpact, selectedTails, todFilter, todStart, todEnd])
+
   // Aggregate currently-visible tracks by tail number. For each tail, count
   // segments by class and rank by % red. Also tally likely "based" airport
   // from each day's first observed position.
@@ -1947,6 +1975,25 @@ function MapPage() {
                 className="w-24"
               />
               <span className="w-8 tabular-nums text-right">{popDensityOpacity.toFixed(2)}</span>
+            </div>
+          )}
+          <label className="flex items-center gap-1.5 cursor-pointer">
+            <input type="checkbox" checked={showImpact} onChange={(e) => setShowImpact(e.target.checked)} />
+            <span>Impact (noise × population)</span>
+          </label>
+          {showImpact && impactPopRaster && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-white/60">impact opacity</span>
+              <input
+                type="range"
+                min="0.1"
+                max="3"
+                step="0.1"
+                value={impactPopOpacity}
+                onChange={(e) => setImpactPopOpacity(Number(e.target.value))}
+                className="w-24"
+              />
+              <span className="w-8 tabular-nums text-right">{impactPopOpacity.toFixed(1)}×</span>
             </div>
           )}
           <label className="flex items-center gap-1.5 cursor-pointer">
@@ -2727,6 +2774,17 @@ The team at Boulder Municipal Airport (KBDU)`
               url={impactRaster.dataUrl}
               bounds={impactRaster.latLngBounds}
               opacity={impactOpacity}
+              interactive={false}
+            />
+          )}
+
+          {/* Noise × population impact raster */}
+          {showImpact && impactPopRaster && (
+            <ImageOverlay
+              key={todFilter ? `impact-${todStart}-${todEnd}` : 'impact-all'}
+              url={impactPopRaster.dataUrl}
+              bounds={impactPopRaster.latLngBounds}
+              opacity={impactPopOpacity}
               interactive={false}
             />
           )}
