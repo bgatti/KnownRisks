@@ -2387,8 +2387,8 @@ function MapPage() {
             const y2 = padT + chartH - (trend.y1 / maxSum) * chartH
             return (
               <g key={id}>
-                <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="black" strokeWidth="3" opacity="0.4" />
-                <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={color} strokeWidth="1.5" opacity="0.9" />
+                <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="black" strokeWidth="5" opacity="0.5" />
+                <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={color} strokeWidth="2" opacity="0.95" />
               </g>
             )
           }
