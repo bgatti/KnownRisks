@@ -1762,8 +1762,15 @@ function MapPage() {
 
   // Trends by date — aggregated from the UNDECIMATED rawStats.perTrack cache
   // with the current filter state applied. Full fidelity, fast filter updates.
-  // Per-date excursion stats — from server API (already filtered)
+  // Per-date excursion stats — from server API (already filtered).
+  // During TOD animation, use the cached stats for the current block
+  // so the chart updates instantly without waiting for API.
   const byDate = useMemo(() => {
+    // Animation: use cached block stats
+    if (todAnimate && todCache) {
+      const block = todCache.blocks[todAnimIdx]
+      if (block?.stats?.byDate) return block.stats.byDate
+    }
     if (noiseStats?.byDate) return noiseStats.byDate
     // Fallback: client-side computation from rawStats
     const map = new Map()
@@ -1780,7 +1787,7 @@ function MapPage() {
       b.redFt += pt.redFt
     }
     return Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date))
-  }, [noiseStats, rawStats])
+  }, [noiseStats, rawStats, todAnimate, todCache, todAnimIdx])
 
   // Live offenses — walk each aircraft's points, find contiguous runs of
   // non-clean points, summarize each as an event. Sorted worst-class first,
@@ -2826,15 +2833,17 @@ The team at Boulder Municipal Airport (KBDU)`
             />
           )}
 
-          {/* Impact raster — single ImageOverlay, optionally TOD-filtered */}
+          {/* Impact raster — fades between frames during TOD animation */}
           {realImpact && impactRaster && (
-            <ImageOverlay
-              key={todFilter ? `tod-${todStart}-${todEnd}` : 'all'}
-              url={impactRaster.dataUrl}
-              bounds={impactRaster.latLngBounds}
-              opacity={impactOpacity}
-              interactive={false}
-            />
+            <Pane name="impact-pane" style={{ transition: 'opacity 0.6s ease-in-out' }}>
+              <ImageOverlay
+                key={todFilter ? `tod-${todStart}-${todEnd}` : 'all'}
+                url={impactRaster.dataUrl}
+                bounds={impactRaster.latLngBounds}
+                opacity={impactOpacity}
+                interactive={false}
+              />
+            </Pane>
           )}
 
           {/* Noise × population impact raster */}
