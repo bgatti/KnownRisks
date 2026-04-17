@@ -386,25 +386,36 @@ const CLASS_COLOR = {
   yellow: '#facc15',
 }
 
-// Altitude color for segments that are clean (not near any zone).
-function altColor(altFt, lat, lon) {
-  const agl = Math.max(0, altFt - terrainAt(lat || 0, lon || 0))
-  const t = Math.min(1, agl / 2200)
-  const stops = [
-    [239, 68, 68],
-    [249, 115, 22],
-    [234, 179, 8],
-    [34, 211, 238],
-  ]
-  const seg = t * (stops.length - 1)
-  const i = Math.floor(seg)
-  const f = seg - i
-  const a = stops[i]
-  const b = stops[Math.min(stops.length - 1, i + 1)]
-  const r = Math.round(a[0] + (b[0] - a[0]) * f)
-  const g = Math.round(a[1] + (b[1] - a[1]) * f)
-  const bl = Math.round(a[2] + (b[2] - a[2]) * f)
-  return `rgb(${r},${g},${bl})`
+// Dirty-pastel color for clean (non-violation) track segments.
+// Maps altitude to a cool→warm gradient:
+//   high (≥7500 ft) → dusty slate blue (safe, well above)
+//   mid  (~5500 ft) → muted sage green
+//   low  (≤3500 ft) → warm clay/terracotta (low, approaching risk)
+// Uses MSL altitude; the field elevation (~5300 ft) sits mid-range.
+const CLEAN_STOPS = [
+  [3500, [178, 132, 120]],  // warm clay — low, near terrain
+  [4500, [186, 156, 130]],  // dusty tan
+  [5500, [152, 170, 140]],  // sage green — mid altitude
+  [6500, [130, 160, 160]],  // muted teal
+  [7500, [140, 155, 180]],  // dusty slate blue — high, safe
+]
+
+function cleanColor(avgAlt) {
+  if (avgAlt == null) return '#9ca3af' // gray fallback
+  for (let i = 0; i < CLEAN_STOPS.length - 1; i++) {
+    const [a0, c0] = CLEAN_STOPS[i]
+    const [a1, c1] = CLEAN_STOPS[i + 1]
+    if (avgAlt <= a1) {
+      const t = Math.max(0, Math.min(1, (avgAlt - a0) / (a1 - a0)))
+      const r = Math.round(c0[0] + (c1[0] - c0[0]) * t)
+      const g = Math.round(c0[1] + (c1[1] - c0[1]) * t)
+      const b = Math.round(c0[2] + (c1[2] - c0[2]) * t)
+      return `rgb(${r},${g},${b})`
+    }
+  }
+  // Above highest stop
+  const [, c] = CLEAN_STOPS[CLEAN_STOPS.length - 1]
+  return `rgb(${c[0]},${c[1]},${c[2]})`
 }
 
 // Split a track into runs of identical classification so we can draw each run
@@ -2820,7 +2831,7 @@ The team at Boulder Municipal Airport (KBDU)`
           {/* Full-track overlay for the clicked aircraft — drawn last so it sits on top */}
           {selectedOverlays.flatMap((t, ti) =>
             t.overlayRuns.map((r, ri) => {
-              const color = r.klass ? CLASS_COLOR[r.klass] : '#ffffff'
+              const color = r.klass ? CLASS_COLOR[r.klass] : cleanColor(r.avgAlt)
               return (
                 <Polyline
                   key={`sel-${t._src}-${ti}-${ri}`}
@@ -2866,7 +2877,7 @@ The team at Boulder Municipal Airport (KBDU)`
             if (selectedTails.length > 0 && !selectedTails.includes(tail)) return []
             const agg = byTailMap.get(tail)
             return t.runs.map((r, ri) => {
-              const color = r.klass ? CLASS_COLOR[r.klass] : '#7cb8b4'
+              const color = r.klass ? CLASS_COLOR[r.klass] : cleanColor(r.avgAlt)
               return (
                 <Polyline
                   key={`${t._src}-${ti}-${ri}`}
