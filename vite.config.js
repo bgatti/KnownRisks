@@ -1638,24 +1638,26 @@ function noiseApiPlugin() {
         try {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const year = u.searchParams.get('year') || null
-          const base = u.searchParams.get('base') || null
+          const base = u.searchParams.get('base') || null // comma-separated for multi-select
           const school = u.searchParams.get('school') || null
-          const origin = u.searchParams.get('origin') || null
           const purpose = u.searchParams.get('purpose') || null
 
-          // Build WHERE clause from filters
+          // Build WHERE clause — base supports multi-select (KBDU,KAPA,KBJC)
           const conds = ['seg_total > 0']
           const params = []
           if (year) { params.push(year); conds.push(`year = $${params.length}`) }
-          if (base) { params.push(base); conds.push(`base_airport = $${params.length}`) }
+          if (base) {
+            const bases = base.split(',').map(b => b.trim()).filter(Boolean)
+            if (bases.length === 1) { params.push(bases[0]); conds.push(`base_airport = $${params.length}`) }
+            else { params.push(bases); conds.push(`base_airport = ANY($${params.length})`) }
+          }
           if (school) { params.push(school); conds.push(`school = $${params.length}`) }
-          if (origin) { params.push(origin); conds.push(`origin = $${params.length}`) }
           if (purpose) { params.push(purpose); conds.push(`purpose = $${params.length}`) }
           const where = conds.join(' AND ')
 
           // Per-tail rankings
           const tailSql = `
-            SELECT call AS tail, type, desc_text AS desc, school, base_airport AS base, origin, purpose,
+            SELECT call AS tail, type, desc_text AS desc, school, base_airport AS base, purpose,
                    SUM(seg_total)::int AS total, SUM(seg_red)::int AS red,
                    SUM(seg_orange)::int AS orange, SUM(seg_yellow)::int AS yellow,
                    SUM(len_total_ft)::real AS total_ft, SUM(len_red_ft)::real AS red_ft,
@@ -1664,7 +1666,7 @@ function noiseApiPlugin() {
                    COUNT(*)::int AS track_count
             FROM tracks
             WHERE ${where}
-            GROUP BY call, type, desc_text, school, base_airport, origin, purpose
+            GROUP BY call, type, desc_text, school, base_airport, purpose
             HAVING SUM(seg_total) > 0
             ORDER BY SUM(seg_red)::float / NULLIF(SUM(seg_total), 0) DESC
             LIMIT 200
@@ -1722,17 +1724,21 @@ function noiseApiPlugin() {
         try {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const year = u.searchParams.get('year') || null
-          const base = u.searchParams.get('base') || null
+          const base = u.searchParams.get('base') || null // comma-separated multi-select
           const school = u.searchParams.get('school') || null
           const purpose = u.searchParams.get('purpose') || null
           const violationsOnly = u.searchParams.get('violations_only') === '1'
           const limit = Math.min(2000, Math.max(1, parseInt(u.searchParams.get('limit') || '500')))
           const offset = Math.max(0, parseInt(u.searchParams.get('offset') || '0'))
 
-          const conds = ['1=1']
+          const conds = ['bands IS NOT NULL']
           const params = []
           if (year) { params.push(year); conds.push(`year = $${params.length}`) }
-          if (base) { params.push(base); conds.push(`base_airport = $${params.length}`) }
+          if (base) {
+            const bases = base.split(',').map(b => b.trim()).filter(Boolean)
+            if (bases.length === 1) { params.push(bases[0]); conds.push(`base_airport = $${params.length}`) }
+            else { params.push(bases); conds.push(`base_airport = ANY($${params.length})`) }
+          }
           if (school) { params.push(school); conds.push(`school = $${params.length}`) }
           if (purpose) { params.push(purpose); conds.push(`purpose = $${params.length}`) }
           if (violationsOnly) { conds.push('worst_class IS NOT NULL') }
@@ -1742,16 +1748,19 @@ function noiseApiPlugin() {
           const countRes = await db.queryDb(`SELECT count(*)::int AS n FROM tracks WHERE ${where}`, params)
           const total = countRes.rows[0].n
 
-          // Fetch page of tracks with pre-computed bands
+          // Fetch tracks ordered by rand_key for equal representation
+          // across airports, dates, and aircraft types
           const pIdx = params.length
           params.push(limit, offset)
           const sql = `
             SELECT call, type, desc_text AS desc, own_op AS "ownOp", src,
-                   year, date, base_airport AS base, origin, worst_class AS worst,
-                   seg_total, seg_red, seg_orange, seg_yellow, school, purpose, bands
+                   year, date, base_airport AS base, worst_class AS worst,
+                   seg_total, seg_red, seg_orange, seg_yellow,
+                   len_total_ft, len_red_ft, len_orange_ft, len_yellow_ft,
+                   school, purpose, bands
             FROM tracks
             WHERE ${where}
-            ORDER BY id
+            ORDER BY rand_key
             LIMIT $${pIdx + 1} OFFSET $${pIdx + 2}
           `
           const r = await db.queryDb(sql, params)

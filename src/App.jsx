@@ -1953,21 +1953,30 @@ function MapPage() {
               )
             })}
           </div>
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <input type="checkbox" checked={showZones} onChange={(e) => setShowZones(e.target.checked)} />
-            <span>Noise zones</span>
-          </label>
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <input type="checkbox" checked={realImpact} onChange={(e) => setRealImpact(e.target.checked)} />
-            <span>Noise heatmap</span>
-          </label>
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <input type="checkbox" checked={showPopDensity} onChange={(e) => setShowPopDensity(e.target.checked)} />
-            <span>Population density</span>
-          </label>
+          <div className="flex items-center gap-1 flex-wrap">
+            {[
+              { label: 'Zones', active: showZones, toggle: () => setShowZones((v) => !v) },
+              { label: 'Heatmap', active: realImpact, toggle: () => setRealImpact((v) => !v) },
+              { label: 'Population', active: showPopDensity, toggle: () => setShowPopDensity((v) => !v) },
+              { label: 'Impact', active: showImpact, toggle: () => setShowImpact((v) => !v) },
+              { label: 'Violators', active: onlyViolations, toggle: () => setOnlyViolations((v) => !v) },
+            ].map((b) => (
+              <button
+                key={b.label}
+                onClick={b.toggle}
+                className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${
+                  b.active
+                    ? 'border-cyan-400 text-cyan-200 bg-cyan-500/20'
+                    : 'border-white/20 text-white/50 hover:border-white/40 hover:text-white/70'
+                }`}
+              >
+                {b.label}
+              </button>
+            ))}
+          </div>
           {showPopDensity && popDensityOverlay && (
             <div className="flex items-center gap-1.5">
-              <span className="text-white/60">density opacity</span>
+              <span className="text-white/50 text-[10px]">density</span>
               <input
                 type="range"
                 min="0.1"
@@ -1975,18 +1984,14 @@ function MapPage() {
                 step="0.05"
                 value={popDensityOpacity}
                 onChange={(e) => setPopDensityOpacity(Number(e.target.value))}
-                className="w-24"
+                className="w-20 accent-cyan-400"
               />
-              <span className="w-8 tabular-nums text-right">{popDensityOpacity.toFixed(2)}</span>
+              <span className="w-6 text-[10px] tabular-nums text-right text-white/50">{popDensityOpacity.toFixed(1)}</span>
             </div>
           )}
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <input type="checkbox" checked={showImpact} onChange={(e) => setShowImpact(e.target.checked)} />
-            <span>Impact (noise × population)</span>
-          </label>
           {showImpact && impactPopRaster && (
             <div className="flex items-center gap-1.5">
-              <span className="text-white/60">impact opacity</span>
+              <span className="text-white/50 text-[10px]">impact</span>
               <input
                 type="range"
                 min="0.1"
@@ -1994,15 +1999,11 @@ function MapPage() {
                 step="0.1"
                 value={impactPopOpacity}
                 onChange={(e) => setImpactPopOpacity(Number(e.target.value))}
-                className="w-24"
+                className="w-20 accent-cyan-400"
               />
-              <span className="w-8 tabular-nums text-right">{impactPopOpacity.toFixed(1)}×</span>
+              <span className="w-6 text-[10px] tabular-nums text-right text-white/50">{impactPopOpacity.toFixed(1)}</span>
             </div>
           )}
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <input type="checkbox" checked={onlyViolations} onChange={(e) => setOnlyViolations(e.target.checked)} />
-            <span>Only violators</span>
-          </label>
           <div className="flex items-center gap-1 flex-wrap">
             {[
               { code: 'KBDU', lat: 40.0394, lon: -105.2258, zoom: 13 },
@@ -2024,7 +2025,7 @@ function MapPage() {
           </div>
           {realImpact && (
             <div className="flex items-center gap-1.5">
-              <span className="text-white/60">opacity</span>
+              <span className="text-white/50 text-[10px]">heatmap</span>
               <input
                 type="range"
                 min="0.1"
@@ -2032,9 +2033,9 @@ function MapPage() {
                 step="0.1"
                 value={impactOpacity}
                 onChange={(e) => setImpactOpacity(Number(e.target.value))}
-                className="w-24"
+                className="w-20 accent-cyan-400"
               />
-              <span className="w-8 tabular-nums text-right">{impactOpacity.toFixed(1)}×</span>
+              <span className="w-6 text-[10px] tabular-nums text-right text-white/50">{impactOpacity.toFixed(1)}</span>
             </div>
           )}
           <div className="flex items-center gap-1">
@@ -2042,10 +2043,10 @@ function MapPage() {
               <button
                 key={d}
                 onClick={() => setDirFilter(d)}
-                className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${
                   dirFilter === d
                     ? 'border-cyan-400 text-cyan-200 bg-cyan-500/20'
-                    : 'border-white/20 text-white/60 hover:text-white'
+                    : 'border-white/20 text-white/50 hover:border-white/40 hover:text-white/70'
                 }`}
               >
                 {d === 'all' ? 'All dirs' : d === 'east' ? 'East dep' : 'West dep'}
@@ -2053,10 +2054,16 @@ function MapPage() {
             ))}
           </div>
           <div className="flex items-center gap-1.5">
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <input type="checkbox" checked={todFilter} onChange={(e) => { setTodFilter(e.target.checked); if (!e.target.checked) setTodAnimate(false) }} />
-              <span>Time of day</span>
-            </label>
+            <button
+              onClick={() => { setTodFilter((v) => { if (v) setTodAnimate(false); return !v }); }}
+              className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${
+                todFilter
+                  ? 'border-cyan-400 text-cyan-200 bg-cyan-500/20'
+                  : 'border-white/20 text-white/50 hover:border-white/40 hover:text-white/70'
+              }`}
+            >
+              Time of day
+            </button>
             {todAnimate && (
               <button
                 onClick={() => setTodAnimate(false)}
@@ -2859,7 +2866,7 @@ The team at Boulder Municipal Airport (KBDU)`
             if (selectedTails.length > 0 && !selectedTails.includes(tail)) return []
             const agg = byTailMap.get(tail)
             return t.runs.map((r, ri) => {
-              const color = r.klass ? CLASS_COLOR[r.klass] : '#9ca3af'
+              const color = r.klass ? CLASS_COLOR[r.klass] : '#7cb8b4'
               return (
                 <Polyline
                   key={`${t._src}-${ti}-${ri}`}
@@ -2867,7 +2874,7 @@ The team at Boulder Municipal Airport (KBDU)`
                   pathOptions={{
                     color,
                     weight: 3,
-                    opacity: r.klass ? 0.3 : 0.1,
+                    opacity: r.klass ? 0.3 : 0.18,
                   }}
                   eventHandlers={{
                     click: (e) => selectTail(tail, e.originalEvent),
