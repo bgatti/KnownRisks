@@ -1938,32 +1938,6 @@ function MapPage() {
               </span>
             )}
           </button>
-          <div
-            className="flex items-center gap-0 rounded overflow-hidden border border-white/15"
-            title="Local = flight originates within 3 nm of KBDU. Transient = originates elsewhere."
-          >
-            {['all', 'local', 'transient'].map((v) => {
-              const pct = v === 'all' ? null : pillStats.originPct?.[v]
-              const bg = v === 'all'
-                ? undefined
-                : thermalColor(pct || 0, pillStats.maxOrigin || 0)
-              return (
-                <button
-                  key={v}
-                  onClick={() => setOriginFilter(v)}
-                  style={bg ? { backgroundColor: bg } : undefined}
-                  className={`px-2 py-0.5 text-xs text-white/90 ${
-                    originFilter === v
-                      ? 'ring-2 ring-cyan-400 ring-inset'
-                      : 'hover:brightness-125'
-                  }`}
-                  title={pct != null ? `${v} · ${pct.toFixed(1)}% red` : v}
-                >
-                  {v}
-                </button>
-              )
-            })}
-          </div>
           <div className="flex items-center gap-1 flex-wrap">
             {[
               { label: 'Zones', active: showZones, toggle: () => setShowZones((v) => !v) },
@@ -2157,25 +2131,15 @@ function MapPage() {
               })}
             </div>
           )}
-          {schoolsByTail.size > 0 && (
+          {availableSchools.length > 0 && (
             <select
               value={schoolFilter}
               onChange={(e) => setSchoolFilter(e.target.value)}
-              style={{ backgroundColor: '#1f2937', color: '#e5e7eb' }}
-              className="border border-white/15 text-xs rounded px-1.5 py-0.5 hover:border-white/30 max-w-[10rem]"
-              title="Filter tracks by flight school fleet. List is narrowed to schools with matches under the current year / base / origin filters."
+              className="border border-white/15 text-xs rounded-full px-3 py-1 hover:border-white/30 bg-gray-800 text-white/90 max-w-[12rem]"
             >
-              <option style={{ backgroundColor: '#1f2937', color: '#e5e7eb' }} value="all">
-                all schools ({availableSchools.length})
-              </option>
+              <option value="all">all schools</option>
               {availableSchools.map((s) => (
-                <option
-                  key={s}
-                  value={s}
-                  style={{ backgroundColor: '#1f2937', color: '#e5e7eb' }}
-                >
-                  {s}
-                </option>
+                <option key={s} value={s}>{s}</option>
               ))}
             </select>
           )}
@@ -2183,64 +2147,52 @@ function MapPage() {
             <select
               value={purposeFilter}
               onChange={(e) => setPurposeFilter(e.target.value)}
-              style={{ backgroundColor: '#1f2937', color: '#e5e7eb' }}
-              className="border border-white/15 text-xs rounded px-1.5 py-0.5 hover:border-white/30 max-w-[10rem]"
-              title="Filter by aircraft purpose"
+              className="border border-white/15 text-xs rounded-full px-3 py-1 hover:border-white/30 bg-gray-800 text-white/90 max-w-[12rem]"
             >
-              <option style={{ backgroundColor: '#1f2937', color: '#e5e7eb' }} value="all">
-                all purposes
-              </option>
+              <option value="all">all purposes</option>
               {noiseStats.purposes.map((p) => (
-                <option key={p} value={p} style={{ backgroundColor: '#1f2937', color: '#e5e7eb' }}>
-                  {p.replace(/_/g, ' ')}
-                </option>
+                <option key={p} value={p}>{p.replace(/_/g, ' ')}</option>
               ))}
             </select>
           )}
           {availableBases.length > 0 && (
-            <div className="flex items-center gap-0 rounded overflow-hidden border border-white/15">
-              <button
-                onClick={() => setBaseFilter('all')}
-                className={`px-2 py-0.5 text-xs text-white/90 ${
-                  baseFilter === 'all' ? 'ring-2 ring-cyan-400 ring-inset' : 'hover:brightness-125'
-                }`}
-              >
-                all bases
-              </button>
-              {availableBases.map((b) => {
-                const pct = pillStats.basePct[b] ?? 0
-                const bg = thermalColor(pct, pillStats.maxBase)
-                return (
-                  <button
-                    key={b}
-                    onClick={() => setBaseFilter(b)}
-                    style={{ backgroundColor: bg }}
-                    className={`px-2 py-0.5 text-xs font-mono text-white/90 ${
-                      baseFilter === b ? 'ring-2 ring-cyan-400 ring-inset' : 'hover:brightness-125'
-                    }`}
-                    title={`${b} · ${pct.toFixed(1)}% red`}
-                  >
-                    {b}
-                  </button>
-                )
-              })}
+            <div className="flex flex-col gap-1">
+              <div className="text-[9px] text-white/40 uppercase tracking-wider px-1">Saved Views</div>
+              <div className="flex items-center gap-1 flex-wrap">
+                <button
+                  onClick={() => setBaseFilter('all')}
+                  className={`px-2.5 py-0.5 text-xs rounded-full border ${
+                    baseFilter === 'all'
+                      ? 'border-cyan-400 bg-cyan-500/20 text-white'
+                      : 'border-white/15 text-white/60 hover:text-white hover:border-white/30'
+                  }`}
+                >
+                  all airports
+                </button>
+                {availableBases.map((b) => {
+                  const pct = pillStats.basePct[b] ?? 0
+                  const bg = thermalColor(pct, pillStats.maxBase)
+                  return (
+                    <button
+                      key={b}
+                      onClick={() => setBaseFilter(b)}
+                      style={baseFilter !== b ? { backgroundColor: bg } : undefined}
+                      className={`px-2.5 py-0.5 text-xs font-mono rounded-full border ${
+                        baseFilter === b
+                          ? 'border-cyan-400 bg-cyan-500/20 text-white'
+                          : 'border-white/10 text-white/90 hover:brightness-125'
+                      }`}
+                      title={`${b} · ${pct.toFixed(1)}% red`}
+                    >
+                      {b}
+                    </button>
+                  )
+                })}
+              </div>
             </div>
           )}
         </div>
 
-        <div className="ml-auto flex items-center gap-2 text-xs">
-          <label className="text-white/70">alt ≤</label>
-          <input
-            type="range"
-            min="5500"
-            max="7500"
-            step="100"
-            value={altCap}
-            onChange={(e) => setAltCap(Number(e.target.value))}
-            className="w-48"
-          />
-          <span className="w-14 text-right tabular-nums">{altCap} ft</span>
-        </div>
       </header>
 
       <div
