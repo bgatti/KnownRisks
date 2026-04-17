@@ -105,18 +105,18 @@ function classifyTrack(points, call, src, schoolMap) {
   const isLocal = nmFrom(first[0], first[1], KBDU[0], KBDU[1]) <= LOCAL_RADIUS_NM
   const origin = isLocal ? 'local' : 'transient'
 
-  // Classify each point
+  // Classify each point against all noise zones
   const tags = pts.map(p => classifyPoint(p[0], p[1], p[2], NOISE_ZONES))
 
-  // Compute segment stats (only within violation radius of KBDU)
+  // Compute segment stats — total track length is the FULL flight,
+  // infraction lengths are wherever the flight enters any noise zone.
+  // No geographic restriction (not limited to KBDU vicinity).
   let seg_total = 0, seg_red = 0, seg_orange = 0, seg_yellow = 0
   let len_total_ft = 0, len_red_ft = 0, len_orange_ft = 0, len_yellow_ft = 0
   let worst_class = null
 
   for (let i = 1; i < pts.length; i++) {
     const a = pts[i - 1], b = pts[i]
-    const midNm = nmFrom((a[0]+b[0])/2, (a[1]+b[1])/2, KBDU[0], KBDU[1])
-    if (midNm > VIOLATION_RADIUS_NM) continue
     const seg = distFt(a[0], a[1], b[0], b[1])
     seg_total++
     len_total_ft += seg
