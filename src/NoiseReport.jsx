@@ -1242,9 +1242,9 @@ export function NoiseStudio() {
         />
       )}
 
-      {/* Active excursions panel — horizontal strip on mobile, sidebar on desktop */}
+      {/* Active excursions panel — compact strip on mobile, sidebar on desktop */}
       <aside className="absolute z-[1000] pointer-events-auto
-        bottom-20 left-2 right-2 sm:bottom-auto sm:top-24 sm:left-4 sm:right-auto sm:w-72 sm:max-h-[60vh]">
+        bottom-16 left-1 right-1 sm:bottom-auto sm:top-24 sm:left-4 sm:right-auto sm:w-72 sm:max-h-[60vh]">
         <ExcursionList
           activeList={activeList}
           activeStatus={activeStatus}
@@ -1257,14 +1257,14 @@ export function NoiseStudio() {
 
       {/* Bottom Report button — sits above the mobile excursion strip */}
       {!reportOpen && (
-        <div className="absolute bottom-[7.5rem] sm:bottom-8 left-0 right-0 z-[1000] flex justify-center pointer-events-none pb-[env(safe-area-inset-bottom)]">
+        <div className="absolute bottom-[4.5rem] sm:bottom-8 left-0 right-0 z-[1000] flex justify-center pointer-events-none pb-[env(safe-area-inset-bottom)]">
           <button
             onClick={() => openReport(activeList.length ? 'excursion' : 'general')}
-            className="pointer-events-auto group relative flex items-center gap-2 sm:gap-3 rounded-full bg-gradient-to-r from-rose-500 to-amber-500 px-5 sm:px-7 py-3 sm:py-4 text-sm sm:text-base font-semibold text-white shadow-[0_10px_40px_rgba(244,63,94,0.45)] hover:shadow-[0_10px_50px_rgba(244,63,94,0.65)] transition-all hover:scale-[1.02]"
+            className="pointer-events-auto group relative flex items-center gap-2 rounded-full bg-gradient-to-r from-rose-500 to-amber-500 px-4 sm:px-7 py-2.5 sm:py-4 text-xs sm:text-base font-semibold text-white shadow-[0_10px_40px_rgba(244,63,94,0.45)] hover:shadow-[0_10px_50px_rgba(244,63,94,0.65)] transition-all hover:scale-[1.02]"
           >
-            <IconAlertTriangle size={18} />
+            <IconAlertTriangle size={16} />
             Report Noise Excursion
-            <IconArrowRight size={16} />
+            <IconArrowRight size={14} />
           </button>
         </div>
       )}
@@ -1522,40 +1522,30 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
 
   return (
     <div className="bg-black/60 backdrop-blur-md border border-white/10 rounded-lg shadow-2xl flex flex-col overflow-hidden">
-      {/* ─ Mobile: horizontal scroll strip ─ */}
+      {/* ─ Mobile: ultra-compact thumbnail strip ─ */}
       <div className="sm:hidden">
-        <ul className="flex gap-1.5 overflow-x-auto p-1.5 scrollbar-none">
-          {activeStatus === 'ok' && items.length === 0 && (
-            <li className="px-3 py-2 text-[10px] text-neutral-500 whitespace-nowrap">No excursions</li>
-          )}
+        <ul className="flex gap-1 overflow-x-auto px-1 py-0.5 scrollbar-none">
           {items.map((g) => (
             <li key={g.type} className="flex-shrink-0">
               <button
                 onClick={g.onClick}
+                title={`${g.type}${g.nearestMeters != null ? ' · ' + formatMiles(g.nearestMeters) : ''}`}
                 className={[
-                  'flex flex-col items-center w-16 rounded-lg overflow-hidden border transition-colors',
+                  'relative h-10 w-10 rounded overflow-hidden border transition-colors',
                   g.anyActive
-                    ? 'border-sky-400/60 bg-sky-400/15'
-                    : 'border-white/10 bg-white/[0.02]',
+                    ? 'border-sky-400 ring-1 ring-sky-400/50'
+                    : 'border-white/15',
                 ].join(' ')}
               >
-                <div className="relative w-full aspect-square bg-black/40">
-                  {typePhotos?.[g.type] ? (
-                    <img src={typePhotos[g.type]} alt="" loading="lazy" className="absolute inset-0 w-full h-full object-cover" />
-                  ) : (
-                    <div className="absolute inset-0 flex items-center justify-center"><IconVideo size={12} className="text-neutral-700" /></div>
-                  )}
-                  <span
-                    className="absolute top-0.5 left-0.5 h-1.5 w-1.5 rounded-full"
-                    style={{ background: KLASS_COLORS[g.worst], boxShadow: `0 0 5px ${KLASS_COLORS[g.worst]}` }}
-                  />
-                </div>
-                <div className="w-full px-1 py-1 text-center">
-                  <div className="text-[9px] font-semibold text-neutral-100 truncate leading-tight">{g.type}</div>
-                  <div className="text-[8px] text-neutral-500 truncate leading-tight">
-                    {g.nearestMeters != null ? formatMiles(g.nearestMeters) : (formatAgo(g.mostRecentMs) || g.worst)}
-                  </div>
-                </div>
+                {typePhotos?.[g.type] ? (
+                  <img src={typePhotos[g.type]} alt={g.type} loading="lazy" className="absolute inset-0 w-full h-full object-cover" />
+                ) : (
+                  <div className="absolute inset-0 bg-neutral-900 flex items-center justify-center text-[7px] text-neutral-400 font-semibold leading-none text-center px-0.5">{g.type}</div>
+                )}
+                <span
+                  className="absolute bottom-0.5 right-0.5 h-1.5 w-1.5 rounded-full"
+                  style={{ background: KLASS_COLORS[g.worst], boxShadow: `0 0 4px ${KLASS_COLORS[g.worst]}` }}
+                />
               </button>
             </li>
           ))}
