@@ -768,6 +768,7 @@ function MapPage() {
     if (baseFilter !== 'all') params.set('base', baseFilter)
     if (schoolFilter !== 'all') params.set('school', schoolFilter)
     if (purposeFilter !== 'all') params.set('purpose', purposeFilter)
+    if (todFilter) { params.set('tod_start', todStart); params.set('tod_end', todEnd) }
     fetch(`/api/noise/stats?${params}`)
       .then(r => r.ok ? r.json() : r.json().then(d => Promise.reject(d.error || r.status)))
       .then(data => {
@@ -775,7 +776,7 @@ function MapPage() {
         setNoiseStats(data)
       })
       .catch(e => console.error('[noise-api] stats error:', e))
-  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter])
+  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter, todFilter, todStart, todEnd])
 
   // --- Server-side API: fetch pre-banded tracks for map ---
   // ~200-500KB for 500 tracks. Re-fetches on filter change.
@@ -787,6 +788,7 @@ function MapPage() {
     if (baseFilter !== 'all') params.set('base', baseFilter)
     if (schoolFilter !== 'all') params.set('school', schoolFilter)
     if (purposeFilter !== 'all') params.set('purpose', purposeFilter)
+    if (todFilter) { params.set('tod_start', todStart); params.set('tod_end', todEnd) }
     if (onlyViolations) params.set('violations_only', '1')
     params.set('limit', '500')
     fetch(`/api/noise/tracks?${params}`)
@@ -800,7 +802,7 @@ function MapPage() {
         console.error('[noise-api] tracks error:', e)
         setServerLoading(false)
       })
-  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter, onlyViolations])
+  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter, onlyViolations, todFilter, todStart, todEnd])
 
   // --- Fallback: load all tracks from file for local dev ---
   useEffect(() => {

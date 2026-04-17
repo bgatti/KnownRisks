@@ -1630,30 +1630,42 @@ function noiseApiPlugin() {
         }
       })
 
-      // GET /api/noise/stats?year=X&base=X&school=X&origin=X
-      // Returns per-tail rankings + cube aggregation for the sidebar.
-      // Payload: ~50-100KB vs 60MB before.
+      // Shared: parse URL filter params into SQL WHERE + params array.
+      // Supports year, base (comma-multi), school, purpose, tod_start/tod_end.
+      function buildFilters(u, baseConds = ['seg_total > 0']) {
+        const conds = [...baseConds]
+        const params = []
+        const year = u.searchParams.get('year') || null
+        const base = u.searchParams.get('base') || null
+        const school = u.searchParams.get('school') || null
+        const purpose = u.searchParams.get('purpose') || null
+        const todStart = u.searchParams.get('tod_start')
+        const todEnd = u.searchParams.get('tod_end')
+        if (year) { params.push(year); conds.push(`year = $${params.length}`) }
+        if (base) {
+          const bases = base.split(',').map(b => b.trim()).filter(Boolean)
+          if (bases.length === 1) { params.push(bases[0]); conds.push(`base_airport = $${params.length}`) }
+          else { params.push(bases); conds.push(`base_airport = ANY($${params.length})`) }
+        }
+        if (school) { params.push(school); conds.push(`school = $${params.length}`) }
+        if (purpose) { params.push(purpose); conds.push(`purpose = $${params.length}`) }
+        if (todStart != null && todEnd != null) {
+          const s = parseInt(todStart), e = parseInt(todEnd)
+          if (s <= e) {
+            params.push(s, e); conds.push(`start_hour >= $${params.length - 1} AND start_hour < $${params.length}`)
+          } else {
+            params.push(s, e); conds.push(`(start_hour >= $${params.length - 1} OR start_hour < $${params.length})`)
+          }
+        }
+        return { where: conds.join(' AND '), params }
+      }
+
+      // GET /api/noise/stats?year=X&base=X&school=X&tod_start=8&tod_end=17
       server.middlewares.use('/api/noise/stats', async (req, res, next) => {
         if (req.method !== 'GET') return next()
         try {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-          const year = u.searchParams.get('year') || null
-          const base = u.searchParams.get('base') || null // comma-separated for multi-select
-          const school = u.searchParams.get('school') || null
-          const purpose = u.searchParams.get('purpose') || null
-
-          // Build WHERE clause — base supports multi-select (KBDU,KAPA,KBJC)
-          const conds = ['seg_total > 0']
-          const params = []
-          if (year) { params.push(year); conds.push(`year = $${params.length}`) }
-          if (base) {
-            const bases = base.split(',').map(b => b.trim()).filter(Boolean)
-            if (bases.length === 1) { params.push(bases[0]); conds.push(`base_airport = $${params.length}`) }
-            else { params.push(bases); conds.push(`base_airport = ANY($${params.length})`) }
-          }
-          if (school) { params.push(school); conds.push(`school = $${params.length}`) }
-          if (purpose) { params.push(purpose); conds.push(`purpose = $${params.length}`) }
-          const where = conds.join(' AND ')
+          const { where, params } = buildFilters(u)
 
           // Per-tail rankings
           const tailSql = `
@@ -1751,26 +1763,14 @@ function noiseApiPlugin() {
         if (req.method !== 'GET') return next()
         try {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-          const year = u.searchParams.get('year') || null
-          const base = u.searchParams.get('base') || null // comma-separated multi-select
-          const school = u.searchParams.get('school') || null
-          const purpose = u.searchParams.get('purpose') || null
           const violationsOnly = u.searchParams.get('violations_only') === '1'
           const limit = Math.min(2000, Math.max(1, parseInt(u.searchParams.get('limit') || '500')))
           const offset = Math.max(0, parseInt(u.searchParams.get('offset') || '0'))
 
-          const conds = ['bands IS NOT NULL']
-          const params = []
-          if (year) { params.push(year); conds.push(`year = $${params.length}`) }
-          if (base) {
-            const bases = base.split(',').map(b => b.trim()).filter(Boolean)
-            if (bases.length === 1) { params.push(bases[0]); conds.push(`base_airport = $${params.length}`) }
-            else { params.push(bases); conds.push(`base_airport = ANY($${params.length})`) }
-          }
-          if (school) { params.push(school); conds.push(`school = $${params.length}`) }
-          if (purpose) { params.push(purpose); conds.push(`purpose = $${params.length}`) }
-          if (violationsOnly) { conds.push('worst_class IS NOT NULL') }
-          const where = conds.join(' AND ')
+          const { where: baseWhere, params } = buildFilters(u, ['bands IS NOT NULL'])
+          const extraConds = []
+          if (violationsOnly) extraConds.push('worst_class IS NOT NULL')
+          const where = extraConds.length ? `${baseWhere} AND ${extraConds.join(' AND ')}` : baseWhere
 
           // Count total matching
           const countRes = await db.queryDb(`SELECT count(*)::int AS n FROM tracks WHERE ${where}`, params)
