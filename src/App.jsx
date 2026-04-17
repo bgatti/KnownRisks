@@ -718,6 +718,8 @@ function MapPage() {
   }, [showPopDensity])
   const [clipToRadius, setClipToRadius] = useState(false)
   const mapRef = useRef(null)
+  const [mobilePanel, setMobilePanel] = useState(null) // null | 'stats' | 'chart'
+  const isMobile = typeof window !== 'undefined' && window.innerWidth < 640
   const [todFilter, setTodFilter] = useState(false)
   const [todStart, setTodStart] = useState(7)
   const [todEnd, setTodEnd] = useState(22)
@@ -2270,8 +2272,38 @@ function MapPage() {
           clearSelected()
         }}
       >
-        {byTail.length > 0 && (
-          <div className="absolute top-3 right-3 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] max-h-[calc(100%-1.5rem)] overflow-y-auto w-72 max-sm:w-52 max-sm:right-1 max-sm:top-1">
+        {/* Mobile toggle buttons */}
+        {isMobile && (
+          <div className="absolute top-2 right-2 z-[1001] flex gap-1">
+            {byTail.length > 0 && (
+              <button
+                onClick={() => setMobilePanel(mobilePanel === 'stats' ? null : 'stats')}
+                className={`px-2 py-1 text-[10px] rounded-full border backdrop-blur-sm ${
+                  mobilePanel === 'stats' ? 'border-cyan-400 bg-cyan-500/30 text-white' : 'border-white/30 bg-black/60 text-white/70'
+                }`}
+              >
+                Rankings
+              </button>
+            )}
+            {byDate.length > 0 && (
+              <button
+                onClick={() => setMobilePanel(mobilePanel === 'chart' ? null : 'chart')}
+                className={`px-2 py-1 text-[10px] rounded-full border backdrop-blur-sm ${
+                  mobilePanel === 'chart' ? 'border-cyan-400 bg-cyan-500/30 text-white' : 'border-white/30 bg-black/60 text-white/70'
+                }`}
+              >
+                Trend
+              </button>
+            )}
+          </div>
+        )}
+
+        {byTail.length > 0 && (!isMobile || mobilePanel === 'stats') && (
+          <div className={`absolute z-[1000] bg-black/85 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] overflow-y-auto ${
+            isMobile
+              ? 'bottom-0 left-0 right-0 max-h-[50vh] rounded-b-none border-b-0'
+              : 'top-3 right-3 w-72 max-h-[calc(100%-1.5rem)]'
+          }`}>
             <div className="flex items-center justify-between mb-1 px-1 gap-2">
               <div className="flex items-center gap-0 rounded overflow-hidden border border-white/15">
                 <button
@@ -2405,7 +2437,11 @@ function MapPage() {
           }
 
           return (
-            <div className="absolute bottom-3 left-3 max-sm:left-1 max-sm:bottom-1 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 max-sm:max-w-[calc(100%-0.5rem)]">
+            <div className={`absolute z-[1000] bg-black/85 backdrop-blur-sm border border-white/10 rounded-lg p-2 ${
+              isMobile
+                ? (mobilePanel === 'chart' ? 'bottom-0 left-0 right-0 rounded-b-none border-b-0' : 'hidden')
+                : 'bottom-3 left-3'
+            }`}>
               <div className="flex items-center gap-2 mb-1 px-1">
                 <span className="text-white/70 text-[10px] font-medium">Excursion %</span>
                 <span className="text-white/40 text-[9px]">
@@ -2473,7 +2509,9 @@ function MapPage() {
             ...liveOffenses.flatMap((a) => a.events.map((e) => e.distFt)),
           )
           return (
-            <div className="absolute top-3 right-[19.5rem] max-sm:right-1 max-sm:top-[45%] z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] w-64 max-sm:w-52 max-h-[70%] max-sm:max-h-[50%] overflow-y-auto">
+            <div className={`absolute top-3 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] w-64 max-h-[70%] overflow-y-auto ${
+              isMobile ? 'hidden' : 'right-[19.5rem]'
+            }`}>
               <div className="text-white/50 uppercase tracking-wide text-[9px] mb-1 px-1 flex items-center justify-between">
                 <span>Live offenders · {liveOffenses.length}</span>
                 {selectedTails.length > 0 && (
@@ -2641,7 +2679,9 @@ The team at Boulder Municipal Airport (KBDU)`
           )
         })()}
         {byBase.length > 0 && (
-          <div className="absolute bottom-3 right-3 max-sm:right-1 max-sm:bottom-1 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] w-64 max-sm:w-52">
+          <div className={`absolute bottom-3 right-3 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] w-64 ${
+            isMobile ? 'hidden' : ''
+          }`}>
             <div className="flex items-center gap-2 mb-1 px-1">
               <div className="flex items-center gap-0 rounded overflow-hidden border border-white/15">
                 <button
@@ -2712,7 +2752,7 @@ The team at Boulder Municipal Airport (KBDU)`
         )}
         {/* TOD indicator — shows active time range when filter is on */}
         {todFilter && (
-          <div className="absolute top-3 right-3 z-[1000] pointer-events-none">
+          <div className={`absolute top-3 right-3 z-[1000] pointer-events-none ${isMobile ? 'hidden' : ''}`}>
             <div className="bg-black/80 backdrop-blur-sm border border-white/20 rounded-lg px-3 py-2 flex flex-col items-center">
               {/* 24-hour clock face showing the active arc */}
               <svg viewBox="0 0 44 44" width="40" height="40">
