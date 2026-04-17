@@ -1,6 +1,8 @@
 // Client-side port of noise/noise_heatmap.py. Used to compute a one-shot
 // noise footprint for a single selected aircraft's track on the map.
 
+import { terrainAt, buildTerrainArray } from './terrain'
+
 export const DEFAULT_HP = 180
 
 export const HP_BY_ICAO = {
@@ -61,7 +63,6 @@ export function hpForType(type) {
 const REF_SOURCE_DB = 110
 const HP_REF = 100
 const V_REF_KTS = 100
-const GROUND_ELEV_FT = 5300
 const FT_PER_M = 3.28084
 const G_TERRAIN = 0.65
 const ALPHA_ATM = 0.0016
@@ -102,7 +103,7 @@ export function computeSingleTrackHeatmap(points, icaoType, opts = {}) {
   // drop high-altitude cruise AND any point with a missing altitude
   let base = points.filter(
     (p) => p && p[0] != null && p[1] != null && p[2] != null
-           && p[2] <= GROUND_ELEV_FT + maxAglFt
+           && (p[2] - terrainAt(p[0], p[1])) <= maxAglFt
   )
   // Optional geographic clip. Keeps giant cross-country tracks from
   // blowing up the grid math — only points inside a circle around
@@ -137,6 +138,7 @@ export function computeSingleTrackHeatmap(points, icaoType, opts = {}) {
 
   const n = Math.max(32, Math.round((2 * halfKm * 1000) / cellM))
   const energy = new Float64Array(n * n)
+  const terrainGrid = buildTerrainArray(lat0, lon0, n, cellM)
   const halfIdx = (n - 1) / 2
   const infM = influenceKm * 1000
   const infM2 = infM * infM
@@ -191,7 +193,9 @@ export function computeSingleTrackHeatmap(points, icaoType, opts = {}) {
         const qx = xa + segDx * tParam
         const qy = ya + segDy * tParam
         const qAlt = a[2] + (b[2] - a[2]) * tParam
-        const qAglFt = Math.max(qAlt - GROUND_ELEV_FT, 0)
+        // AGL relative to the receiving cell's terrain elevation
+        const cellTerrain = terrainGrid[row * n + col]
+        const qAglFt = Math.max(qAlt - cellTerrain, 0)
 
         const sdx = cellX - qx
         const sdy = cellY - qy
@@ -286,7 +290,7 @@ export function computeSingleTrackHeatmap(points, icaoType, opts = {}) {
   const agls = []
   let climb = 0, cruise = 0, descent = 0
   for (let i = 0; i < base.length; i++) {
-    agls.push(Math.max(base[i][2] - GROUND_ELEV_FT, 0))
+    agls.push(Math.max(base[i][2] - terrainAt(base[i][0], base[i][1]), 0))
     if (i > 0) {
       const dz = base[i][2] - base[i - 1][2]
       if (dz > 50) climb++
@@ -351,10 +355,10 @@ export function computeMultiTrackHeatmap(tracks, opts = {}) {
 
   const n = Math.max(32, Math.round((2 * halfKm * 1000) / cellM))
   const energy = new Float64Array(n * n) // holds LMax linear power per cell
+  const terrainGrid = buildTerrainArray(lat0, lon0, n, cellM)
   const halfIdx = (n - 1) / 2
   const infM = influenceKm * 1000
   const infM2 = infM * infM
-  const cap_msl = GROUND_ELEV_FT + maxAglFt
 
   let aircraftUsed = 0
   let pointsUsed = 0
@@ -366,12 +370,12 @@ export function computeMultiTrackHeatmap(tracks, opts = {}) {
     if (hp <= 0) continue
     const hpDb = 10 * Math.log10(hp / HP_REF)
 
-    // Filter points: altitude cap + KBDU 5 nm clip. Keeps giant
+    // Filter points: AGL cap + KBDU 5 nm clip. Keeps giant
     // transits from contributing outside the local area.
     const base = []
     for (const p of pts) {
       if (!p || p[0] == null || p[1] == null || p[2] == null) continue
-      if (p[2] > cap_msl) continue
+      if ((p[2] - terrainAt(p[0], p[1])) > maxAglFt) continue
       const dy = (p[0] - lat0) * mPerDegLat
       const dx = (p[1] - lon0) * mPerDegLon
       if (dx * dx + dy * dy > maxM2) continue
@@ -423,7 +427,8 @@ export function computeMultiTrackHeatmap(tracks, opts = {}) {
           const qx = xa + segDx * tParam
           const qy = ya + segDy * tParam
           const qAlt = a[2] + (b[2] - a[2]) * tParam
-          const qAglFt = Math.max(qAlt - GROUND_ELEV_FT, 0)
+          const cellTerrain = terrainGrid[row * n + col]
+          const qAglFt = Math.max(qAlt - cellTerrain, 0)
 
           const sdx = cellX - qx
           const sdy = cellY - qy

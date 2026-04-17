@@ -2,10 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { MapContainer, TileLayer, Polyline, Circle, Marker, Polygon, Tooltip, ImageOverlay } from 'react-leaflet'
 import L from 'leaflet'
 import { NOISE_ZONES } from './noiseZones'
+import { terrainAt } from './terrain'
 
 // ─── Shared constants ─────────────────────────────────────────────────────────
 const KBDU = [40.0394, -105.2258]
-const KBDU_ELEV_FT = 5288
 const FT_PER_DEG_LAT = 364560
 const MILE_FT = 5280
 const FT_PER_SEC_PER_KT = 1.6878
@@ -301,14 +301,14 @@ function hpIntensityScalar(hp, radiusM, logLo, logHi) {
 // scaled by that same scalar so quiet points fade into the map and loud
 // ones dominate.
 function computeLoudnessPerPoint(points, params, perPoint, bounds) {
-  const { radiusScale, baseOpacity, opacityMult, fieldElev } = params
+  const { radiusScale, baseOpacity, opacityMult } = params
   const { logLo, logHi } = bounds
   const out = new Array(points.length)
   for (let i = 0; i < points.length; i++) {
     const p = points[i]
     const prev = points[Math.max(0, i - 1)]
     const next = points[Math.min(points.length - 1, i + 1)]
-    const agl = Math.max(0, p[2] - fieldElev)
+    const agl = Math.max(0, p[2] - terrainAt(p[0], p[1]))
     if (agl < 50) { out[i] = null; continue }
     const radius_m = Math.max(1, agl * 0.3048 * radiusScale)
     const hp = (perPoint && perPoint[i] && perPoint[i].hp) || 0
@@ -849,7 +849,6 @@ const DEFAULT_PARAMS = {
   referenceHp: 80,
   referenceAglFt: 1000,
   spanDecades: 3.0,
-  fieldElev: KBDU_ELEV_FT,
 }
 
 // Curated example tracks — picked to exercise the model across a useful

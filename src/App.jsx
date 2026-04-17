@@ -11,6 +11,7 @@ import ThinningTest from './ThinningTest.jsx'
 import NoiseImpactTest from './NoiseImpactTest.jsx'
 import { computeNoiseRaster } from './noiseRaster'
 import { loadPopulationDensity, rasterizePopulation } from './populationRaster'
+import { loadTerrain, terrainAt } from './terrain'
 
 function ComposeNoticeModal({ compose, onClose }) {
   const [status, setStatus] = useState('')
@@ -206,7 +207,6 @@ function Nav({ route }) {
 }
 
 const KBDU = [40.0394, -105.2258]
-const KBDU_ELEV_FT = 5288
 const LOCAL_RADIUS_NM = 3
 const MAP_RADIUS_NM = 6 // drop segments outside this ring for render perf
 
@@ -387,8 +387,8 @@ const CLASS_COLOR = {
 }
 
 // Altitude color for segments that are clean (not near any zone).
-function altColor(altFt) {
-  const agl = Math.max(0, altFt - KBDU_ELEV_FT)
+function altColor(altFt, lat, lon) {
+  const agl = Math.max(0, altFt - terrainAt(lat || 0, lon || 0))
   const t = Math.min(1, agl / 2200)
   const stops = [
     [239, 68, 68],
@@ -619,6 +619,12 @@ function MapPage() {
   const [datasets, setDatasets] = useState({})
   const [errors, setErrors] = useState({})
   const [loadProgress, setLoadProgress] = useState(null) // { loaded, total, status } or null
+
+  // --- Server-side pre-computed stats (from /api/noise/stats) ---
+  const [noiseStats, setNoiseStats] = useState(null) // { perTail, cube, years, bases, schools }
+  const [serverTracks, setServerTracks] = useState(null) // { tracks, total }
+  const [serverLoading, setServerLoading] = useState(false)
+  const useServerApi = true // toggle for DB-backed mode
   const [schoolsByTail, setSchoolsByTail] = useState(new Map())
   const [compose, setCompose] = useState(null) // { to, subject, body, school, tail }
 
@@ -749,25 +755,68 @@ function MapPage() {
   useEffect(() => { clearSelected() }, [yearFilter, baseFilter])
 
   useEffect(() => {
-    // Load tracks — tries paginated /api/tracks first (Railway/Postgres),
-    // falls back to single /tracks_yearly.json fetch (local dev).
+    // Pre-load terrain grid for AGL calculations (non-blocking).
+    loadTerrain()
+  }, [])
+
+  // --- Server-side API: fetch stats (sidebar rankings, cube) ---
+  // Re-fetches when filters change. ~50KB response vs 60MB before.
+  useEffect(() => {
+    if (!useServerApi) return
+    const params = new URLSearchParams()
+    if (yearFilter && yearFilter !== 'all') params.set('year', yearFilter)
+    if (baseFilter !== 'all') params.set('base', baseFilter)
+    if (schoolFilter !== 'all') params.set('school', schoolFilter)
+    fetch(`/api/noise/stats?${params}`)
+      .then(r => r.ok ? r.json() : r.json().then(d => Promise.reject(d.error || r.status)))
+      .then(data => {
+        console.log('[noise-api] stats loaded:', data.perTail?.length, 'tails')
+        setNoiseStats(data)
+      })
+      .catch(e => console.error('[noise-api] stats error:', e))
+  }, [useServerApi, yearFilter, baseFilter, schoolFilter])
+
+  // --- Server-side API: fetch pre-banded tracks for map ---
+  // ~200-500KB for 500 tracks. Re-fetches on filter change.
+  useEffect(() => {
+    if (!useServerApi) return
+    setServerLoading(true)
+    const params = new URLSearchParams()
+    if (yearFilter && yearFilter !== 'all') params.set('year', yearFilter)
+    if (baseFilter !== 'all') params.set('base', baseFilter)
+    if (schoolFilter !== 'all') params.set('school', schoolFilter)
+    if (onlyViolations) params.set('violations_only', '1')
+    params.set('limit', '500')
+    fetch(`/api/noise/tracks?${params}`)
+      .then(r => r.ok ? r.json() : r.json().then(d => Promise.reject(d.error || r.status)))
+      .then(data => {
+        console.log(`[noise-api] tracks loaded: ${data.tracks?.length}/${data.total}`)
+        setServerTracks(data)
+        setServerLoading(false)
+      })
+      .catch(e => {
+        console.error('[noise-api] tracks error:', e)
+        setServerLoading(false)
+      })
+  }, [useServerApi, yearFilter, baseFilter, schoolFilter, onlyViolations])
+
+  // --- Fallback: load all tracks from file for local dev ---
+  useEffect(() => {
+    if (useServerApi) return
     setLoadProgress({ loaded: 0, total: 0, status: 'Starting...' })
     fetchTracksChunked(
       (loaded, total) => setLoadProgress(p => ({ ...p, loaded, total })),
       (status) => setLoadProgress(p => ({ ...p, status }))
     )
       .then((d) => {
-        console.log(`[tracks-loader] setting datasets.yearly: ${d.tracks?.length} tracks, sample:`, d.tracks?.[0])
         setDatasets((s) => ({ ...s, yearly: d }))
         setLoadProgress(null)
       })
       .catch((e) => {
-        console.error('[tracks-loader] setting error:', e)
         setErrors((s) => ({ ...s, yearly: String(e) }))
-        // Keep progress bar visible with error
         setLoadProgress(p => ({ ...p, status: `FAILED: ${e.message}`, error: true }))
       })
-  }, [])
+  }, [useServerApi])
 
   // Precompute everything that depends on the FULL raw dataset. Heavy work
   // (classifying ~1.2M points) is chunked and yields to the main thread every
@@ -921,6 +970,52 @@ function MapPage() {
   // and alt cap — expensive when data is large, so do it once.
   const banded = useMemo(() => {
     const out = []
+
+    // --- Server-side path: tracks come pre-banded from /api/noise/tracks ---
+    if (useServerApi && serverTracks?.tracks) {
+      for (const t of serverTracks.tracks) {
+        // Map server bands to the runs format the renderer expects
+        const runs = (t.bands || []).map(b => ({
+          klass: b.klass,
+          points: b.points,
+          avgAlt: b.points.length ? b.points.reduce((s, p) => s + (p[2] || 0), 0) / b.points.length : 0,
+        }))
+        if (runs.length === 0) continue
+        // Collect all points for compatibility with code that reads t.points
+        const allPts = []
+        for (const r of runs) for (const p of r.points) allPts.push(p)
+        out.push({
+          call: t.call, type: t.type, desc: t.desc, ownOp: t.ownOp, src: t.src,
+          year: t.year, t0: null,
+          _src: 'yearly',
+          points: allPts,
+          rawPoints: allPts,
+          runs,
+          isLocal: t.origin === 'local',
+          base: t.base,
+          firstBase: t.base,
+          lastBase: null,
+          worst: t.worst,
+          depDir: null,
+        })
+      }
+      // Add live tracks if active
+      if (liveActive && liveAircraft.length) {
+        for (const a of liveAircraft) {
+          const pts = (a.points || []).filter(p => nmFromKBDU(p[0], p[1]) <= MAP_RADIUS_NM)
+          if (pts.length < 2) continue
+          const runs = bandTrack(pts)
+          out.push({
+            ...a, _src: 'live', points: pts, rawPoints: a.points, runs,
+            isLocal: nmFromKBDU(pts[0][0], pts[0][1]) <= LOCAL_RADIUS_NM,
+            base: nearestAirport(pts[0][0], pts[0][1], 3),
+          })
+        }
+      }
+      return out
+    }
+
+    // --- Fallback: client-side computation for local dev ---
     const allTracks = []
     // Historical datasets — progressively decimated for render perf.
     //   specific year: start with every 10th track (mod 10 = 0). If fewer
@@ -1003,11 +1098,11 @@ function MapPage() {
         })
     }
     return out
-  }, [datasets, altCap, liveActive, liveAircraft, yearFilter, schoolFilter, schoolsByTail, onlyViolations, rawStats, clipToRadius])
+  }, [datasets, altCap, liveActive, liveAircraft, yearFilter, schoolFilter, schoolsByTail, onlyViolations, rawStats, clipToRadius, useServerApi, serverTracks])
 
-  // Unique years present in the RAW loaded data — independent of any
-  // filter so the year-pill row always appears as soon as data arrives.
+  // Unique years — from server stats or from loaded data
   const availableYears = useMemo(() => {
+    if (noiseStats?.years) return noiseStats.years
     const ys = new Set()
     for (const ds of DATASETS) {
       const d = datasets[ds.id]
@@ -1015,7 +1110,7 @@ function MapPage() {
       for (const t of d.tracks) if (t.year) ys.add(t.year)
     }
     return Array.from(ys).sort()
-  }, [datasets])
+  }, [noiseStats, datasets])
 
   const tailToBaseInfo = rawStats.tailToBaseInfo
 
@@ -1092,29 +1187,27 @@ function MapPage() {
   }, [rawStats, yearFilter, baseFilter, originFilter])
 
   const availableBases = useMemo(() => {
+    if (noiseStats?.bases) return noiseStats.bases
     const bs = new Set()
     for (const info of tailToBaseInfo.values()) {
       for (const b of info.allBases) bs.add(b)
     }
     return Array.from(bs).sort()
-  }, [tailToBaseInfo])
+  }, [noiseStats, tailToBaseInfo])
 
   // Schools actually present in the current filter context (year + base +
   // origin). Computed from the UNDECIMATED rawStats.perTrack cache so the
   // dropdown always reflects the true set available under the filters, not
   // whatever happened to survive the render decimation.
   const availableSchools = useMemo(() => {
-    // Populate directly from the fleet file as soon as it loads (~25 KB),
-    // so the dropdown is ready before the heavy track files finish parsing.
-    // Show every named school that has at least one tail in its fleet,
-    // regardless of whether we've seen it fly yet.
+    if (noiseStats?.schools) return noiseStats.schools
     if (schoolsByTail.size === 0) return []
     const s = new Set()
     for (const [, info] of schoolsByTail) {
       if (info?.school) s.add(info.school)
     }
     return Array.from(s).sort()
-  }, [schoolsByTail])
+  }, [noiseStats, schoolsByTail])
 
   // On first data load, default the year filter to the first available year
   // (rather than 'all') so the initial render isn't overwhelmed. Runs once.
@@ -1128,26 +1221,29 @@ function MapPage() {
 
   const visible = useMemo(() => {
     return banded.filter((t) => {
+      // Server API already filters by year/base/school/violations — only
+      // apply remaining client-side filters (origin, live toggle, tod, dir).
       if (!enabled[t._src]) return false
-      if (onlyViolations && !t.runs.some((r) => r.klass === 'orange' || r.klass === 'red')) return false
+      if (!useServerApi) {
+        if (onlyViolations && !t.runs.some((r) => r.klass === 'orange' || r.klass === 'red')) return false
+        if (yearFilter === null) {
+          if (t._src !== 'live') return false
+        } else if (yearFilter !== 'all' && t.year !== yearFilter) {
+          return false
+        }
+        if (baseFilter !== 'all') {
+          const tail = t.call || t.reg
+          const info = tailToBaseInfo.get(tail)
+          if (!info || !info.allBases.has(baseFilter)) return false
+        }
+        if (schoolFilter !== 'all') {
+          const tail = t.call || t.reg
+          const sch = schoolsByTail.get(tail)
+          if (!sch || sch.school !== schoolFilter) return false
+        }
+      }
       if (originFilter === 'local' && !t.isLocal) return false
       if (originFilter === 'transient' && t.isLocal) return false
-      // null = historical hidden (only live flows through); 'all' = show all years; specific = match
-      if (yearFilter === null) {
-        if (t._src !== 'live') return false
-      } else if (yearFilter !== 'all' && t.year !== yearFilter) {
-        return false
-      }
-      if (baseFilter !== 'all') {
-        const tail = t.call || t.reg
-        const info = tailToBaseInfo.get(tail)
-        if (!info || !info.allBases.has(baseFilter)) return false
-      }
-      if (schoolFilter !== 'all') {
-        const tail = t.call || t.reg
-        const sch = schoolsByTail.get(tail)
-        if (!sch || sch.school !== schoolFilter) return false
-      }
       // Direction filter: east/west departure direction.
       if (dirFilter !== 'all') {
         if (t.depDir && t.depDir !== dirFilter) return false
@@ -2548,6 +2644,14 @@ The team at Boulder Municipal Airport (KBDU)`
             </div>
           </div>
         )}
+        {serverLoading && (
+          <div className="absolute top-0 left-0 right-0 z-[1000] bg-gray-900/90 px-4 py-2 flex items-center gap-3">
+            <div className="flex-1 bg-gray-700 rounded-full h-1.5 overflow-hidden">
+              <div className="bg-cyan-400 h-full w-1/3 animate-pulse" />
+            </div>
+            <span className="text-xs text-white/60">Loading tracks...</span>
+          </div>
+        )}
         {loadProgress && (
           <div className={`absolute top-0 left-0 right-0 z-[1000] px-4 py-3 flex items-center gap-3 ${
             loadProgress.error ? 'bg-red-900/95' : 'bg-gray-900/90'
@@ -2563,9 +2667,9 @@ The team at Boulder Municipal Airport (KBDU)`
             </span>
           </div>
         )}
-        {errors.yearly && !loadProgress && (
+        {(errors.yearly || errors.stats || errors.tracks) && !loadProgress && (
           <div className="absolute top-0 left-0 right-0 z-[1000] bg-red-900/95 px-4 py-3 text-xs text-white">
-            Track loading failed: {errors.yearly}
+            Error: {errors.yearly || errors.stats || errors.tracks}
           </div>
         )}
         <MapContainer center={[39.97, -105.03]} zoom={10} className="h-full w-full" preferCanvas={true} ref={mapRef}>

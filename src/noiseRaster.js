@@ -6,7 +6,7 @@
 //   const result = computeNoiseRaster(tracks, opts)
 //   // result = { dataUrl, latLngBounds, stats } or null
 
-const KBDU_ELEV_FT = 5288
+import { terrainAt } from './terrain'
 const FT_PER_DEG_LAT = 364560
 const FT_PER_SEC_PER_KT = 1.6878
 
@@ -267,13 +267,13 @@ function buildEnergyProfile(points, samplePeriodS, typeCode) {
 // through ground-level or zero-HP sections without breaking the path.
 // Points with hp=0 contribute nothing to the raster accumulator but
 // they maintain sequence continuity for the interpolation step.
-function computeBlobs(points, perPoint, radiusScale, fieldElev) {
+function computeBlobs(points, perPoint, radiusScale) {
   const out = []
   for (let i = 0; i < points.length; i++) {
     const p = points[i]
     const prev = points[Math.max(0, i - 1)]
     const next = points[Math.min(points.length - 1, i + 1)]
-    const agl = Math.max(0, p[2] - fieldElev)
+    const agl = Math.max(0, p[2] - terrainAt(p[0], p[1]))
     const radius_m = Math.max(1, Math.max(50, agl) * 0.3048 * radiusScale)
     const hp = agl < 50 ? 0 : ((perPoint[i] && perPoint[i].hp) || 0)
     out.push({ lat: p[0], lon: p[1], radius_m, hp, heading: bearing(prev, next) })
@@ -381,7 +381,7 @@ function rasterize(blobs, gridW, gridH, latMin, latMax, lonMin, lonMax, gain, sc
 // ─── Main export ────────────────────────────────────────────────────────────
 // tracks: [{ points: [[lat,lon,alt],...], type: 'C172' }, ...]
 // opts:   { radiusScale, directionalGain, noiseResolution, gapThresholdFt,
-//           accumAutoRange, accumLogLo, accumLogHi, fieldElev, samplePeriodS,
+//           accumAutoRange, accumLogLo, accumLogHi, samplePeriodS,
 //           maxBlobs }
 //
 // `maxBlobs` caps the total blob count fed to the rasterizer. When the raw
@@ -399,7 +399,6 @@ export function computeNoiseRaster(tracks, opts = {}) {
     accumAutoRange = false,
     accumLogLo = -6.90,
     accumLogHi = -0.60,
-    fieldElev = KBDU_ELEV_FT,
     samplePeriodS = 1,
     maxBlobs = 50000,
     rasterPx = 1200,       // pixels on the longer grid axis
@@ -433,7 +432,7 @@ export function computeNoiseRaster(tracks, opts = {}) {
     const pts = t.points || []
     if (pts.length < 3) continue
     const prof = buildEnergyProfile(pts, samplePeriodS, t.type)
-    let blobs = computeBlobs(pts, prof.perPoint, radiusScale, fieldElev)
+    let blobs = computeBlobs(pts, prof.perPoint, radiusScale)
     if (hasTodFilter) {
       blobs = blobs.filter((b, i) => {
         const p = pts[i]
@@ -523,7 +522,6 @@ export function computeHourlyRasters(tracks, opts = {}, onFrame, onDone) {
     accumAutoRange = false,
     accumLogLo = -6.90,
     accumLogHi = -0.60,
-    fieldElev = KBDU_ELEV_FT,
     samplePeriodS = 1,
     maxBlobs = 50000,
     startHour = 7,
@@ -538,7 +536,7 @@ export function computeHourlyRasters(tracks, opts = {}, onFrame, onDone) {
     const pts = t.points || []
     if (pts.length < 3) continue
     const prof = buildEnergyProfile(pts, samplePeriodS, t.type)
-    const blobs = computeBlobs(pts, prof.perPoint, radiusScale, fieldElev)
+    const blobs = computeBlobs(pts, prof.perPoint, radiusScale)
     for (let i = 0; i < blobs.length; i++) {
       const p = pts[i + (pts.length - blobs.length)]  // blobs may be shorter (skipped ground)
       // Find the matching source point for this blob to get its timestamp.
