@@ -2839,7 +2839,7 @@ The team at Boulder Municipal Airport (KBDU)`
 
           {/* Impact raster — fades between frames during TOD animation */}
           {realImpact && impactRaster && (
-            <Pane name="impact-pane" style={{ transition: 'opacity 0.6s ease-in-out', zIndex: 300, mixBlendMode: 'screen' }}>
+            <Pane name="impact-pane" style={{ transition: 'opacity 0.6s ease-in-out', zIndex: 300, mixBlendMode: 'multiply' }}>
               <ImageOverlay
                 key={todFilter ? `tod-${todStart}-${todEnd}` : 'all'}
                 url={impactRaster.dataUrl}
