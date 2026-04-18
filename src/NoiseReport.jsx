@@ -708,27 +708,43 @@ export function NoiseStudio() {
     )
   }
 
-  /* ── Draw selected segments as orange highlights on the main map ── */
+  /* ── Draw selected segments as bright orange on top of everything ── */
   useEffect(() => {
     const L = window.L
     const map = mapRef.current
     for (const p of selectedOverlaysRef.current) p.remove()
     selectedOverlaysRef.current = []
     if (!L || !map || !reportSegments.length) return
+    // Create a pane above the default overlay (z-index 450) so selections
+    // always render over flight traces + the audibility circle.
+    if (!map.getPane('selectedSegments')) {
+      map.createPane('selectedSegments')
+      map.getPane('selectedSegments').style.zIndex = 650
+    }
     for (const seg of reportSegments) {
       if (!seg.points || seg.points.length < 2) continue
       const latlngs = seg.points.map((p) => [p[0], p[1]])
-      const line = L.polyline(latlngs, {
-        color: '#fb923c',
-        weight: 8,
-        opacity: 0.95,
+      // Glow under-stroke
+      const glow = L.polyline(latlngs, {
+        color: '#ff8c00',
+        weight: 14,
+        opacity: 0.25,
         lineCap: 'round',
         lineJoin: 'round',
-        className: 'flight-trace',
+        pane: 'selectedSegments',
+        interactive: false,
       }).addTo(map)
-      selectedOverlaysRef.current.push(line)
+      const line = L.polyline(latlngs, {
+        color: '#ff8c00',
+        weight: 7,
+        opacity: 1,
+        lineCap: 'round',
+        lineJoin: 'round',
+        pane: 'selectedSegments',
+        interactive: false,
+      }).addTo(map)
+      selectedOverlaysRef.current.push(glow, line)
     }
-    if (areaRef.current) areaRef.current.bringToFront()
   }, [reportSegments])
 
   /* ── Draw a saved report's track when viewing from My Reports ──── */
@@ -1346,7 +1362,7 @@ export function NoiseStudio() {
                 addReportSegment({ ...hoverCard, tail: hoverCard.tail })
                 setHoverCard(null)
                 if (crosshairRef.current) { crosshairRef.current.remove(); crosshairRef.current = null }
-                if (!reportOpen) openReport('excursion')
+                // Just select — don't open the wizard. User clicks the bottom Report button when ready.
               }}
               className={`group flex items-center gap-2 rounded-full text-white text-xs font-semibold pl-3 pr-4 py-2 border border-white/15 whitespace-nowrap ${pillBg}`}
             >
