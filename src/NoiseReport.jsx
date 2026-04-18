@@ -458,6 +458,7 @@ export function NoiseStudio() {
 
   /* ── Active excursions (initial + periodic refresh) ────────────── */
   const loadActive = async (signal) => {
+    console.log('[noise-report] loading active excursions…')
     setActiveStatus((prev) => prev === 'ok' ? 'ok' : 'loading')
     try {
       const data = await fetchActiveExcursions({
@@ -466,7 +467,9 @@ export function NoiseStudio() {
         signal,
       })
       if (signal?.aborted) return
-      setActiveList(data.active || [])
+      const active = (data.active || []).sort((a, b) => (b.lastSeenMs || 0) - (a.lastSeenMs || 0))
+      console.log('[noise-report] active:', active.length)
+      setActiveList(active)
       setActiveStatus('ok')
     } catch (err) {
       if (err.name === 'AbortError') return
@@ -625,7 +628,7 @@ export function NoiseStudio() {
     })
   }
 
-  /* ── Draw polylines for every active tail ───────────────────────── */
+  /* ── Segments for every active tail (bulk, with error protection) ─ */
   const didInitialFitRef = useRef(false)
   useEffect(() => {
     const L = window.L
@@ -926,18 +929,30 @@ export function NoiseStudio() {
     if (!rawCoords || rawCoords.source === 'ip') { setNearbyTracks([]); return }
     const ctrl = new AbortController()
     const load = () => {
+      console.log('[noise-report] fetching nearby tracks…')
       fetchNearbyTracks({
         lat: rawCoords.lat,
         lng: rawCoords.lng,
         hours: 2,
-        limit: 50,
+        limit: 15,
         signal: ctrl.signal,
       })
         .then((data) => {
           if (ctrl.signal.aborted) return
-          setNearbyTracks(data.tracks || [])
+          // Thin points: keep every Nth point to cap at ~500 per segment
+          const MAX_PTS = 500
+          const tracks = (data.tracks || []).map((t) => ({
+            ...t,
+            segments: (t.segments || []).map((s) => {
+              if (!s.points || s.points.length <= MAX_PTS) return s
+              const step = Math.ceil(s.points.length / MAX_PTS)
+              return { ...s, points: s.points.filter((_, i) => i % step === 0 || i === s.points.length - 1) }
+            }),
+          }))
+          console.log('[noise-report] nearby tracks:', tracks.length, 'segments:', tracks.reduce((n, t) => n + (t.segments?.length || 0), 0))
+          setNearbyTracks(tracks)
         })
-        .catch(() => {})
+        .catch((err) => { console.error('[noise-report] nearby fetch failed', err) })
     }
     load()
     return () => { ctrl.abort() }
@@ -962,6 +977,7 @@ export function NoiseStudio() {
 
   /* ── Draw nearby tracks (clean + offense) with time-based opacity ── */
   useEffect(() => {
+    console.log('[noise-report] draw nearby effect, tracks:', nearbyTracks.length)
     const L = window.L
     const map = mapRef.current
     if (!L || !map) return
