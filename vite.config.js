@@ -2021,8 +2021,8 @@ function noiseApiPlugin() {
           const countRes = await db.queryDb(`SELECT count(*)::int AS n FROM tracks WHERE ${where}`, params)
           const total = countRes.rows[0].n
 
-          // Fetch tracks ordered by rand_key for equal representation
-          // across airports, dates, and aircraft types
+          // Prioritize purple (rare) and red tracks, then fill with random.
+          // This ensures quiet-hour T&G violations always appear on the map.
           const pIdx = params.length
           params.push(limit, offset)
           const sql = `
@@ -2033,7 +2033,12 @@ function noiseApiPlugin() {
                    school, purpose, bands
             FROM tracks
             WHERE ${where}
-            ORDER BY rand_key
+            ORDER BY
+              CASE WHEN seg_purple > 0 THEN 0
+                   WHEN worst_class = 'red' THEN 1
+                   WHEN worst_class = 'orange' THEN 2
+                   ELSE 3 END,
+              rand_key
             LIMIT $${pIdx + 1} OFFSET $${pIdx + 2}
           `
           const r = await db.queryDb(sql, params)
