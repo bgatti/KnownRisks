@@ -381,6 +381,7 @@ export function NoiseStudio() {
   // My complaints panel (complaints + full reports merged)
   const [myComplaints, setMyComplaints] = useState([])
   const [myReports, setMyReports] = useState([])     // full reports with tracks
+  const [sessionReports, setSessionReports] = useState([]) // local-only for anonymous users
   const [myComplaintsStatus, setMyComplaintsStatus] = useState('idle')
   const [complaintsPanelOpen, setComplaintsPanelOpen] = useState(false)
 
@@ -1305,7 +1306,19 @@ export function NoiseStudio() {
     }
 
     await Promise.all([fullPromise, complaintPromise])
-    // Refresh lists so the user immediately sees report count / history rows.
+    // Track locally so anonymous users see their count increase immediately.
+    setSessionReports((prev) => [{
+      id: fullId || `local-${Date.now()}`,
+      createdAt: new Date().toISOString(),
+      tail: selectedExcursion?.tail,
+      type: selectedExcursion?.type,
+      klass: selectedExcursion?.worst,
+      reportedSegments: reportSegments.map((s) => ({
+        tail: s.tail, klass: s.klass, zone: s.zone, type: s.type,
+        nearestPt: s.nearestPt, points: s.points,
+      })),
+    }, ...prev])
+    // Also refresh server-side lists (works when identity is set).
     loadMyComplaints()
     loadActive()
   }
@@ -1490,9 +1503,9 @@ export function NoiseStudio() {
               >
                 <IconHistory size={12} />
                 My reports
-                {myComplaints.length > 0 && (
+                {(myComplaints.length + sessionReports.length) > 0 && (
                   <span className="ml-0.5 rounded-full bg-sky-400/80 text-[9px] text-white font-semibold px-1.5">
-                    {myComplaints.length}
+                    {myComplaints.length + sessionReports.length}
                   </span>
                 )}
               </button>
@@ -1517,6 +1530,7 @@ export function NoiseStudio() {
           identity={identity}
           complaints={myComplaints}
           reports={myReports}
+          sessionReports={sessionReports}
           status={myComplaintsStatus}
           activeList={activeList}
           locality={locality}
@@ -2804,7 +2818,7 @@ function IdentityModal({ initial, onClose, onSave, onClear }) {
   )
 }
 
-function MyComplaintsPanel({ identity, complaints, reports, status, activeList, locality, viewingReport, onViewReport, onRefresh, onClose, onSetIdentity }) {
+function MyComplaintsPanel({ identity, complaints, reports, sessionReports, status, activeList, locality, viewingReport, onViewReport, onRefresh, onClose, onSetIdentity }) {
   const [repsOpen, setRepsOpen] = useState(false)
 
   // Derive airports in scope. Preference order:
@@ -2874,7 +2888,7 @@ function MyComplaintsPanel({ identity, complaints, reports, status, activeList, 
         {identity && status === 'error' && (
           <p className="p-5 text-[11px] text-rose-300">Feed unavailable.</p>
         )}
-        {identity && status === 'ok' && complaints.length === 0 && (
+        {identity && status === 'ok' && complaints.length === 0 && sessionReports.length === 0 && (
           <p className="p-5 text-[11px] text-neutral-500">No complaints filed yet.</p>
         )}
         <ul className="divide-y divide-white/5">
@@ -2925,6 +2939,38 @@ function MyComplaintsPanel({ identity, complaints, reports, status, activeList, 
                   {c.notes && (
                     <p className="mt-1.5 text-[10px] text-neutral-500 line-clamp-2">{c.notes}</p>
                   )}
+                </button>
+              </li>
+            )
+          })}
+          {/* Session-only reports (before identity is set) */}
+          {sessionReports.map((sr) => {
+            const isViewing = viewingReport === sr
+            return (
+              <li key={sr.id}>
+                <button
+                  onClick={() => onViewReport(isViewing ? null : sr)}
+                  className={[
+                    'w-full text-left px-5 py-3 transition-colors',
+                    isViewing ? 'bg-sky-400/10' : 'hover:bg-white/[0.04] cursor-pointer',
+                  ].join(' ')}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="h-2 w-2 rounded-full flex-shrink-0" style={{ background: '#ff8c00' }} />
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-neutral-100 truncate">
+                          {sr.type || sr.tail || 'Flight report'}
+                          <span className={`ml-1.5 text-[9px] ${isViewing ? 'text-sky-300' : 'text-neutral-500'}`}>
+                            {isViewing ? '(viewing)' : '(tap to view)'}
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-neutral-500 truncate">
+                          {sr.reportedSegments?.length || 0} segment{(sr.reportedSegments?.length || 0) === 1 ? '' : 's'} · {formatAgo(Date.parse(sr.createdAt))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 </button>
               </li>
             )
