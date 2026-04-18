@@ -11,6 +11,31 @@ import ThinningTest from './ThinningTest.jsx'
 import NoiseImpactTest from './NoiseImpactTest.jsx'
 import DescentTest from './DescentTest.jsx'
 import { NoiseStudio as NoiseReportPage } from './NoiseReport.jsx'
+import React from 'react'
+
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null } }
+  static getDerivedStateFromError(error) { return { error } }
+  componentDidCatch(error, info) {
+    console.error('[ErrorBoundary]', error, info)
+    try { localStorage.setItem('noise-report-crash', `${new Date().toISOString()} ${error.message}\n${error.stack}`) } catch {}
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ background: '#111', color: '#f87171', padding: 32, fontFamily: 'monospace', fontSize: 13, whiteSpace: 'pre-wrap', height: '100vh', overflow: 'auto' }}>
+          <h1 style={{ color: '#fff', fontSize: 18, marginBottom: 16 }}>Noise Report crashed</h1>
+          <div>{this.state.error.message}</div>
+          <div style={{ color: '#666', marginTop: 8 }}>{this.state.error.stack}</div>
+          <button onClick={() => { this.setState({ error: null }) }} style={{ marginTop: 16, padding: '8px 16px', background: '#38bdf8', color: '#000', border: 'none', borderRadius: 6, cursor: 'pointer' }}>
+            Retry
+          </button>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
 import { computeNoiseRaster, computeImpactRaster } from './noiseRaster'
 import { loadPopulationDensity, rasterizePopulation } from './populationRaster'
 import { loadTerrain, terrainAt } from './terrain'
@@ -554,7 +579,7 @@ export default function App() {
     return <NoticePage />
   }
   if (route === '/report') {
-    return <NoiseReportPage />
+    return <ErrorBoundary><NoiseReportPage /></ErrorBoundary>
   }
   if (route === '/yoy' || route === '/bases' || route === '/thinning' || route === '/impact') {
     return (
