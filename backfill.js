@@ -28,6 +28,9 @@ const TZ_OFFSET_S = -7 * 3600 // MST
 
 // Detect touch-and-go during quiet hours (5 PM – 5 AM MST).
 // Returns array of {startIdx, endIdx} ranges to mark as 'purple'.
+// KBDU_RADIUS_NM: the T&G low point must be within this distance of KBDU
+const KBDU_TNG_RADIUS_NM = 4
+
 function detectQuietHourTnG(points, t0, fieldElev) {
   if (!points || points.length < 10 || t0 == null) return []
   const LOW_AGL = 250, HIGH_AGL = 800, MAX_TNG_SEC = 90
@@ -43,6 +46,12 @@ function detectQuietHourTnG(points, t0, fieldElev) {
       for (let j = lowStart; j < i; j++) {
         if (points[j][2] < points[bottomIdx][2]) bottomIdx = j
       }
+      // The low point must be within 4nm of KBDU — this is where
+      // the T&G actually happens, not just a flyover
+      const bp = points[bottomIdx]
+      const distNm = nmFrom(bp[0], bp[1], KBDU[0], KBDU[1])
+      if (distNm > KBDU_TNG_RADIUS_NM) { inLow = false; continue }
+
       let ascStart = -1
       for (let j = bottomIdx; j < Math.min(i + 5, points.length - 3); j++) {
         if (points[j+1]?.[2] > points[j][2] && points[j+2]?.[2] > points[j+1][2]) {
@@ -201,14 +210,10 @@ function classifyTrack(points, call, src, schoolMap) {
 
   // Detect quiet-hour T&G (purple excursions).
   // Applies to ANY aircraft performing T&G within 4nm of KBDU during
-  // quiet hours (5 PM – 5 AM MST). KBDU is the only airport with this
-  // voluntary noise abatement procedure.
+  // quiet hours (5 PM – 5 AM MST). The detection function itself checks
+  // that each T&G low point is within 4nm of KBDU.
   const t0 = m ? Math.floor(Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`) / 1000) : null
-  // Check if any points are within 4nm of KBDU
-  const nearKbdu = allPts.some(p => nmFrom(p[0], p[1], KBDU[0], KBDU[1]) <= 4)
-  const tngRanges = nearKbdu
-    ? detectQuietHourTnG(allPts, t0, AIRPORT_ELEVATIONS.KBDU)
-    : []
+  const tngRanges = detectQuietHourTnG(allPts, t0, AIRPORT_ELEVATIONS.KBDU)
 
   // Build a set of point indices that are in purple T&G ranges
   const purpleIdx = new Set()
