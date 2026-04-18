@@ -137,6 +137,23 @@ async function fetchAircraftPhoto(type, { signal } = {}) {
   }
 }
 
+/** Round to nearest Fibonacci tenth of a mile (0.1, 0.2, 0.3, 0.5, 0.8, 1.3, 2.1, 3.4, 5.5, 8.9). */
+const FIB_TENTHS = [0.1, 0.2, 0.3, 0.5, 0.8, 1.3, 2.1, 3.4, 5.5, 8.9]
+function fibMiles(meters) {
+  const mi = meters / 1609.344
+  let best = FIB_TENTHS[0]
+  for (const f of FIB_TENTHS) {
+    if (Math.abs(f - mi) < Math.abs(best - mi)) best = f
+  }
+  return best
+}
+
+/** Clip a points array to only include points within `radiusM` of `center`. */
+function clipSegmentNearPoint(points, center, radiusM) {
+  if (!points || !center) return points || []
+  return points.filter((p) => haversine(center[0], center[1], p[0], p[1]) <= radiusM)
+}
+
 function formatMiles(meters) {
   if (meters == null || !Number.isFinite(meters)) return ''
   const mi = meters / 1609.344
@@ -297,14 +314,19 @@ export function NoiseStudio() {
   // Nearby tracks (all overflights, not just offenses)
   const [nearbyTracks, setNearbyTracks] = useState([])
 
-  // Segments the user selected for the report (multiple allowed)
+  // Segments the user selected for the report (multiple allowed).
+  // Each stored segment is clipped to ~1 mile around the tapped point.
   const [reportSegments, setReportSegments] = useState([])
+  const selectedOverlaysRef = useRef([]) // orange polylines on main map
+
   const addReportSegment = (seg) => {
+    // Clip segment points to ~1 mile (1609m) around nearestPt
+    const clipped = clipSegmentNearPoint(seg.points, seg.nearestPt, 1609)
+    const entry = { ...seg, points: clipped }
     setReportSegments((prev) => {
-      // Dedupe by matching tail + first point
-      const key = `${seg.tail}:${seg.points?.[0]?.[0]},${seg.points?.[0]?.[1]}`
-      if (prev.some((s) => `${s.tail}:${s.points?.[0]?.[0]},${s.points?.[0]?.[1]}` === key)) return prev
-      return [...prev, seg]
+      const key = `${entry.tail}:${entry.nearestPt?.[0]},${entry.nearestPt?.[1]}`
+      if (prev.some((s) => `${s.tail}:${s.nearestPt?.[0]},${s.nearestPt?.[1]}` === key)) return prev
+      return [...prev, entry]
     })
   }
   const removeReportSegment = (idx) => {
@@ -685,6 +707,29 @@ export function NoiseStudio() {
       { enableHighAccuracy: true, timeout: 30000, maximumAge: 60000 },
     )
   }
+
+  /* ── Draw selected segments as orange highlights on the main map ── */
+  useEffect(() => {
+    const L = window.L
+    const map = mapRef.current
+    for (const p of selectedOverlaysRef.current) p.remove()
+    selectedOverlaysRef.current = []
+    if (!L || !map || !reportSegments.length) return
+    for (const seg of reportSegments) {
+      if (!seg.points || seg.points.length < 2) continue
+      const latlngs = seg.points.map((p) => [p[0], p[1]])
+      const line = L.polyline(latlngs, {
+        color: '#fb923c',
+        weight: 8,
+        opacity: 0.95,
+        lineCap: 'round',
+        lineJoin: 'round',
+        className: 'flight-trace',
+      }).addTo(map)
+      selectedOverlaysRef.current.push(line)
+    }
+    if (areaRef.current) areaRef.current.bringToFront()
+  }, [reportSegments])
 
   /* ── Draw a saved report's track when viewing from My Reports ──── */
   useEffect(() => {
@@ -1158,6 +1203,8 @@ export function NoiseStudio() {
     setVideoBlob(null); if (videoUrl) URL.revokeObjectURL(videoUrl); setVideoUrl(null)
     setSelectedExcursion(null)
     setReportSegments([])
+    for (const p of selectedOverlaysRef.current) p.remove()
+    selectedOverlaysRef.current = []
     setStep(1)
     setReportOpen(false)
   }
@@ -1304,7 +1351,7 @@ export function NoiseStudio() {
               className={`group flex items-center gap-2 rounded-full text-white text-xs font-semibold pl-3 pr-4 py-2 border border-white/15 whitespace-nowrap ${pillBg}`}
             >
               <IconAlertTriangle size={14} />
-              {isExcursion ? 'Select Excursion' : 'Select Flight Segment'}
+              Select
               <span className="text-[10px] text-white/80">
                 {hoverCard.type && `· ${hoverCard.type}`}
                 {ago && ` · ${ago}`}
@@ -1466,6 +1513,7 @@ export function NoiseStudio() {
                       reportMode={reportMode}
                       reportSegments={reportSegments}
                       onRemoveSegment={removeReportSegment}
+                      circleCenter={rawCoords}
                     />
                   )}
                 </>
@@ -1985,7 +2033,7 @@ function IdentifyStep({ activeList, activeStatus, typePhotos, selected, onSelect
   )
 }
 
-function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, videoUrl, selectedExcursion, reportMode, reportSegments, onRemoveSegment }) {
+function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, videoUrl, selectedExcursion, reportMode, reportSegments, onRemoveSegment, circleCenter }) {
   return (
     <>
       {/* Mini-map showing reported segments */}
@@ -1994,21 +2042,27 @@ function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, video
           title={`Reported Segment${reportSegments.length > 1 ? 's' : ''}`}
           subtitle={`${reportSegments.length} flight segment${reportSegments.length > 1 ? 's' : ''} selected — tap × to remove`}
         >
-          <SegmentsMiniMap segments={reportSegments} />
+          <SegmentsMiniMap segments={reportSegments} circleCenter={circleCenter} />
           <ul className="mt-2 space-y-1">
             {reportSegments.map((seg, i) => {
               const isExc = !!seg.klass
+              // Distance from reporter to nearest point (Fibonacci tenths of a mile)
+              const distText = (circleCenter && seg.nearestPt)
+                ? `${fibMiles(haversine(circleCenter.lat, circleCenter.lng, seg.nearestPt[0], seg.nearestPt[1]))} mi`
+                : null
               return (
                 <li key={i} className="flex items-center gap-2 text-[11px]">
                   <span
                     className="h-2 w-2 rounded-full flex-shrink-0"
-                    style={{ background: isExc ? (KLASS_COLORS[seg.klass] || '#fb923c') : '#999' }}
+                    style={{ background: '#fb923c' }}
                   />
                   <span className="flex-1 text-neutral-200 truncate">
                     {seg.type || seg.tail || 'Unknown'}
-                    {isExc && <span className="text-neutral-500"> · {seg.klass} · {seg.zone || '—'}</span>}
-                    {!isExc && <span className="text-neutral-500"> · clean overflight</span>}
+                    {isExc && <span className="text-neutral-500"> · {seg.klass}</span>}
                   </span>
+                  {distText && (
+                    <span className="text-[10px] font-mono text-orange-300 flex-shrink-0">{distText}</span>
+                  )}
                   <button
                     onClick={() => onRemoveSegment(i)}
                     className="text-neutral-500 hover:text-rose-300 flex-shrink-0"
@@ -2384,7 +2438,7 @@ function CircularCaptureButton({
   )
 }
 
-function SegmentsMiniMap({ segments }) {
+function SegmentsMiniMap({ segments, circleCenter }) {
   const ref = useRef(null)
   const mapRef2 = useRef(null)
   useEffect(() => {
@@ -2402,22 +2456,41 @@ function SegmentsMiniMap({ segments }) {
     })
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', { maxZoom: 17 }).addTo(map)
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png', { maxZoom: 17 }).addTo(map)
+    // White audibility circle (same as the main map)
+    if (circleCenter) {
+      L.circle([circleCenter.lat, circleCenter.lng], {
+        radius: 4 * 1852, // 4 NM
+        color: '#fafafa',
+        weight: 1.5,
+        opacity: 0.5,
+        fillColor: '#ffffff',
+        fillOpacity: 0.06,
+        interactive: false,
+      }).addTo(map)
+      bounds.extend([circleCenter.lat, circleCenter.lng])
+    }
+    // Orange selected segments
     for (const seg of segments) {
       if (!seg.points?.length) continue
       const pts = seg.points.map((p) => [p[0], p[1]])
-      const color = seg.klass ? (KLASS_COLORS[seg.klass] || '#fb923c') : '#fb923c'
-      L.polyline(pts, { color, weight: 5, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }).addTo(map)
+      L.polyline(pts, {
+        color: '#fb923c',
+        weight: 6,
+        opacity: 0.95,
+        lineCap: 'round',
+        lineJoin: 'round',
+      }).addTo(map)
       if (seg.nearestPt) {
         L.circleMarker([seg.nearestPt[0], seg.nearestPt[1]], {
-          radius: 6, color, weight: 3, fillColor: '#000', fillOpacity: 0.5, interactive: false,
+          radius: 5, color: '#fb923c', weight: 2, fillColor: '#000', fillOpacity: 0.5, interactive: false,
         }).addTo(map)
       }
       pts.forEach((p) => bounds.extend(p))
     }
-    if (bounds.isValid()) map.fitBounds(bounds.pad(0.15), { maxZoom: 14 })
+    if (bounds.isValid()) map.fitBounds(bounds.pad(0.15), { maxZoom: 13 })
     mapRef2.current = map
     return () => { map.remove(); mapRef2.current = null }
-  }, [segments])
+  }, [segments, circleCenter])
 
   return (
     <div ref={ref} className="w-full h-40 rounded-lg overflow-hidden border border-white/10" style={{ background: '#0a0a0a' }} />

@@ -9,6 +9,7 @@ import BasesDiagnostic from './BasesDiagnostic.jsx'
 import NoticePage from './NoticePage.jsx'
 import ThinningTest from './ThinningTest.jsx'
 import NoiseImpactTest from './NoiseImpactTest.jsx'
+import DescentTest from './DescentTest.jsx'
 import { NoiseStudio as NoiseReportPage } from './NoiseReport.jsx'
 import { computeNoiseRaster, computeImpactRaster } from './noiseRaster'
 import { loadPopulationDensity, rasterizePopulation } from './populationRaster'
@@ -203,6 +204,7 @@ function Nav({ route }) {
       {link('/bases', 'Bases')}
       {link('/thinning', 'Thinning')}
       {link('/impact', 'Impact Model')}
+      {link('/descents', 'Descents')}
     </nav>
   )
 }
@@ -509,7 +511,9 @@ export default function App() {
               ? <BasesDiagnostic />
               : route === '/thinning'
                 ? <ThinningTest />
-                : <NoiseImpactTest />}
+                : route === '/descents'
+                  ? <DescentTest />
+                  : <NoiseImpactTest />}
         </div>
       </div>
     )
