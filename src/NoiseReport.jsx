@@ -947,6 +947,23 @@ export function NoiseStudio() {
     return () => { ctrl.abort(); clearInterval(id) }
   }, [rawCoords?.lat, rawCoords?.lng, rawCoords?.source])
 
+  // Build a set of keys for segments already reported (from sessionReports).
+  // Used to render those segments in blue + tooltip.
+  const reportedSegKeys = useMemo(() => {
+    const keys = new Set()
+    for (const sr of sessionReports) {
+      for (const seg of sr.reportedSegments || []) {
+        if (seg.nearestPt) keys.add(`${seg.tail}:${seg.nearestPt[0]},${seg.nearestPt[1]}`)
+      }
+    }
+    return keys
+  }, [sessionReports])
+
+  const isSegReported = (tail, nearestPt) => {
+    if (!nearestPt) return false
+    return reportedSegKeys.has(`${tail}:${nearestPt[0]},${nearestPt[1]}`)
+  }
+
   /* ── Draw nearby tracks (clean + offense) with time-based opacity ── */
   useEffect(() => {
     const L = window.L
@@ -962,6 +979,8 @@ export function NoiseStudio() {
     for (const track of nearbyTracks) {
       // Skip tracks already rendered by the offense draw effect
       if (segmentsByTail[track.tail]) continue
+      const lastSeg = track.segments?.[track.segments.length - 1]
+      const lastPt = lastSeg?.points?.[lastSeg.points.length - 1]
       for (const seg of track.segments || []) {
         if (!seg.points || seg.points.length < 2) continue
         const latlngs = seg.points.map((p) => [p[0], p[1]])
@@ -971,22 +990,34 @@ export function NoiseStudio() {
         for (const p of seg.points) {
           if (typeof p[3] === 'number' && p[3] > segLastMs) segLastMs = p[3]
         }
-        // Fade: 1.0 at now → 0.05 at 2 hours ago. Live = full opacity.
         const age = segLastMs ? (now - segLastMs) / WINDOW_MS : 0.5
         const timeOpacity = Math.max(0.08, 1 - age)
 
+        // Check if this segment was already reported → render blue
+        const midPt = seg.points[Math.floor(seg.points.length / 2)]
+        const reported = isSegReported(track.tail, midPt)
+
         const isOffense = !!seg.klass
-        const color = isOffense ? (KLASS_COLORS[seg.klass] || '#aaa') : 'rgba(200,200,200,0.8)'
+        const color = reported ? '#38bdf8' : isOffense ? (KLASS_COLORS[seg.klass] || '#aaa') : 'rgba(200,200,200,0.8)'
         const weight = isOffense ? 5 : 3.5
-        const opacity = isOffense ? Math.max(0.3, timeOpacity) : timeOpacity
+        const opacity = reported ? 0.9 : isOffense ? Math.max(0.3, timeOpacity) : timeOpacity
 
         const line = L.polyline(latlngs, {
           color, weight, opacity,
           lineCap: 'round', lineJoin: 'round',
           className: 'flight-trace',
         }).addTo(map)
+        if (reported) {
+          const sr = sessionReports.find((r) =>
+            r.reportedSegments?.some((s) => s.tail === track.tail)
+          )
+          if (sr) {
+            line.bindTooltip(`Reported ${new Date(sr.createdAt).toLocaleDateString()}`, {
+              direction: 'top', className: 'user-pin-tooltip',
+            })
+          }
+        }
 
-        // Hit target for hover/click — works on mobile (tap) too
         const { showHover, hideHover, clickSelect } = makeHoverHandlers(track.tail, segLastMs || null, {
           klass: seg.klass, zone: seg.zone, points: seg.points, type: track.type || '',
         })
@@ -1003,6 +1034,21 @@ export function NoiseStudio() {
 
         line._segLastMs = segLastMs || 0
         nearbyTracesRef.current.push(line, hit)
+      }
+
+      // Aircraft photo icon at current position (last point of last segment)
+      if (lastPt && track.live) {
+        const photo = typePhotos?.[track.type]
+        if (photo) {
+          const icon = L.divIcon({
+            className: 'aircraft-photo-icon',
+            html: `<img src="${photo}" alt="${track.type}" style="width:28px;height:28px;border-radius:50%;border:2px solid rgba(255,255,255,0.6);object-fit:cover;box-shadow:0 2px 8px rgba(0,0,0,0.7);" />`,
+            iconSize: [28, 28],
+            iconAnchor: [14, 14],
+          })
+          const marker = L.marker([lastPt[0], lastPt[1]], { icon, interactive: false }).addTo(map)
+          nearbyTracesRef.current.push(marker)
+        }
       }
     }
     // Snake-draw animation for nearby tracks
@@ -1306,6 +1352,11 @@ export function NoiseStudio() {
     }
 
     await Promise.all([fullPromise, complaintPromise])
+    // Clear selection after reporting
+    setReportSegments([])
+    for (const p of selectedOverlaysRef.current) p.remove()
+    selectedOverlaysRef.current = []
+
     // Track locally so anonymous users see their count increase immediately.
     setSessionReports((prev) => [{
       id: fullId || `local-${Date.now()}`,
@@ -1334,6 +1385,8 @@ export function NoiseStudio() {
     selectedOverlaysRef.current = []
     setStep(1)
     setReportOpen(false)
+    // Clear orange overlays from the main map
+    if (crosshairRef.current) { crosshairRef.current.remove(); crosshairRef.current = null }
   }
 
   // Location is the only hard requirement. Audio/video capture and aircraft
