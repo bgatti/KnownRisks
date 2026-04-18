@@ -210,6 +210,7 @@ function Nav({ route }) {
 }
 
 const KBDU = [40.0394, -105.2258]
+const KBDU_ELEV_FT = 5288
 // Front Range corridor center — geographic mean of KBDU/KLMO/KEIK/KBJC/KAPA/KGXY
 const CORRIDOR_CENTER = [40.0211, -105.0063]
 const CORRIDOR_RADIUS_NM = 36
@@ -448,6 +449,55 @@ const CLASS_COLOR = {
   red: '#dc2626',
   orange: '#f97316',
   yellow: '#facc15',
+  purple: '#a855f7',  // T&G during quiet hours (5 PM – 5 AM)
+}
+
+// Detect touch-and-go events during quiet hours (17:00–05:00 local / MST).
+// Returns an array of {startIdx, endIdx} index ranges that should be
+// classified as 'purple'. Requires timestamped points (p[3] = t_sec)
+// and a t0 epoch on the track.
+const TZ_OFFSET_S = -7 * 3600 // MST
+function detectQuietHourTnG(points, t0, fieldElev) {
+  if (!points || points.length < 10 || t0 == null) return []
+  const LOW_AGL = 250, HIGH_AGL = 800, MAX_TNG_SEC = 90
+  const lowThresh = fieldElev + LOW_AGL
+  const highThresh = fieldElev + HIGH_AGL
+  const results = []
+  let inLow = false, lowStart = -1
+  for (let i = 0; i < points.length; i++) {
+    const alt = points[i][2]
+    if (alt < lowThresh && !inLow) { inLow = true; lowStart = i }
+    else if (alt > highThresh && inLow) {
+      let bottomIdx = lowStart
+      for (let j = lowStart; j < i; j++) {
+        if (points[j][2] < points[bottomIdx][2]) bottomIdx = j
+      }
+      let ascStart = -1
+      for (let j = bottomIdx; j < Math.min(i + 5, points.length - 3); j++) {
+        if (points[j+1][2] > points[j][2] && points[j+2][2] > points[j+1][2]) {
+          ascStart = j; break
+        }
+      }
+      if (ascStart >= 0) {
+        const hasTs = points[bottomIdx].length > 3 && points[ascStart].length > 3
+        const gapSec = hasTs ? points[ascStart][3] - points[bottomIdx][3] : null
+        const gapOk = gapSec != null ? gapSec <= MAX_TNG_SEC : (ascStart - bottomIdx) <= 30
+        if (gapOk) {
+          // Check if the bottom is during quiet hours (5 PM – 5 AM MST)
+          const bottomTs = points[bottomIdx].length > 3 ? points[bottomIdx][3] : null
+          if (bottomTs != null) {
+            const localS = (t0 + bottomTs + TZ_OFFSET_S)
+            const hour = Math.floor((((localS % 86400) + 86400) % 86400) / 3600)
+            if (hour >= 17 || hour < 5) {
+              results.push({ startIdx: lowStart, endIdx: i })
+            }
+          }
+        }
+      }
+      inLow = false
+    }
+  }
+  return results
 }
 
 // Color for clean (non-violation) portions of a track, based on what
@@ -472,15 +522,24 @@ function trackCleanColor(excursionPct) {
 // Split a track into runs of identical classification so we can draw each run
 // as one Polyline. Returns [{klass, points, avgAlt}, ...]. Adjacent runs share
 // a vertex to keep the line visually continuous.
-function bandTrack(points) {
+function bandTrack(points, t0, fieldElev) {
+  // Standard zone+altitude classification
   const tags = points.map((p) => classifyPoint(p[0], p[1], p[2], NOISE_ZONES))
+  // Overlay quiet-hour T&G as 'purple' — overrides whatever zone class
+  // those points had, since a T&G during quiet hours is its own offense.
+  const tngRanges = detectQuietHourTnG(points, t0, fieldElev || KBDU_ELEV_FT)
+  for (const r of tngRanges) {
+    for (let i = r.startIdx; i <= Math.min(r.endIdx, tags.length - 1); i++) {
+      tags[i] = 'purple'
+    }
+  }
   const runs = []
   let i = 0
   while (i < points.length - 1) {
     const k = tags[i]
     let j = i
     while (j < points.length - 1 && tags[j + 1] === k) j++
-    const slice = points.slice(i, j + 2) // include the next point for continuity
+    const slice = points.slice(i, j + 2)
     const avgAlt = slice.reduce((s, p) => s + p[2], 0) / slice.length
     runs.push({ klass: k, points: slice, avgAlt })
     i = j + 1
@@ -1111,7 +1170,7 @@ function MapPage() {
         for (const a of liveAircraft) {
           const pts = (a.points || []).filter(p => nmFromKBDU(p[0], p[1]) <= MAP_RADIUS_NM)
           if (pts.length < 2) continue
-          const runs = bandTrack(pts)
+          const runs = bandTrack(pts, null, null)
           out.push({
             ...a, _src: 'live', points: pts, rawPoints: a.points, runs,
             isLocal: nmFromKBDU(pts[0][0], pts[0][1]) <= LOCAL_RADIUS_NM,
@@ -1180,7 +1239,13 @@ function MapPage() {
           ? rawPoints.filter((p) => nmFromKBDU(p[0], p[1]) <= MAP_RADIUS_NM)
           : rawPoints
         if (withinRing.length < 2) continue
-        const runs = bandTrack(withinRing)
+        // Find nearest airport field elev for T&G detection
+        const lowestPt = rawPoints.reduce((a, b) => b[2] < a[2] ? b : a, rawPoints[0])
+        const nearAp = AIRPORTS.reduce((best, ap) => {
+          const d = Math.hypot((lowestPt[0]-ap.lat)*69, (lowestPt[1]-ap.lon)*53)
+          return d < best.d ? { d, elev: AIRPORT_ELEVATIONS[ap.code] || 5288 } : best
+        }, { d: Infinity, elev: 5288 })
+        const runs = bandTrack(withinRing, t.t0, nearAp.elev)
         const rawFirst = rawPoints[0] || withinRing[0]
         const isLocal = nmFromKBDU(rawFirst[0], rawFirst[1]) <= LOCAL_RADIUS_NM
         // Per-track "based at" guess. Check the first point of the day first;
@@ -1332,7 +1397,7 @@ function MapPage() {
       // apply remaining client-side filters (origin, live toggle, tod, dir).
       if (!enabled[t._src]) return false
       if (!useServerApi) {
-        if (onlyViolations && !t.runs.some((r) => r.klass === 'orange' || r.klass === 'red')) return false
+        if (onlyViolations && !t.runs.some((r) => r.klass === 'orange' || r.klass === 'red' || r.klass === 'purple')) return false
         if (yearFilter === null) {
           if (t._src !== 'live') return false
         } else if (yearFilter !== 'all' && t.year !== yearFilter) {
@@ -1558,7 +1623,7 @@ function MapPage() {
           const midLon = (a[1] + b[1]) / 2
           if (nmFromKBDU(midLat, midLon) > VIOLATION_RADIUS_NM) continue
           agg.total++
-          if (r.klass === 'red') {
+          if (r.klass === 'red' || r.klass === 'purple') {
             agg.red++
             agg.redFt += distFt(a[0], a[1], b[0], b[1])
           } else if (r.klass === 'orange') agg.orange++
@@ -1654,7 +1719,7 @@ function MapPage() {
       if (!set.has(tail)) continue
       const pts = t.rawPoints && t.rawPoints.length > 1 ? t.rawPoints : t.points
       if (pts.length < 2) continue
-      out.push({ ...t, overlayPoints: pts, overlayRuns: bandTrack(pts) })
+      out.push({ ...t, overlayPoints: pts, overlayRuns: bandTrack(pts, t.t0, null) })
     }
     return out
   }, [banded, selectedTails])

@@ -815,44 +815,63 @@ export function NoiseStudio() {
     }
   }, [reportSegments])
 
-  /* ── Draw a saved report's track when viewing from My Reports ──── */
+  /* ── View a saved report: show only the reported segments ────────── */
   useEffect(() => {
     const L = window.L
     const map = mapRef.current
-    // Always clear prior report-track overlays
     for (const p of reportTracesRef.current) p.remove()
     reportTracesRef.current = []
-    if (!L || !map || !viewingReport?.tracks) return
-    const bounds = L.latLngBounds([])
-    for (const track of viewingReport.tracks) {
-      for (const seg of track.segments || []) {
-        if (!seg.points || seg.points.length < 2) continue
-        const latlngs = seg.points.map((p) => [p[0], p[1]])
-        const color = KLASS_COLORS[seg.klass] || '#fff'
-        const weight = seg.klass === 'red' ? 4.5 : seg.klass === 'orange' ? 4 : 3.5
-        const line = L.polyline(latlngs, {
-          color, weight, opacity: 1, lineCap: 'round', lineJoin: 'round',
-          className: 'flight-trace',
-        }).addTo(map)
-        reportTracesRef.current.push(line)
-        latlngs.forEach((ll) => bounds.extend(ll))
+    if (!L || !map) return
+
+    // When viewing a report: dim all existing traces to 25%, draw
+    // the reported segments at full orange, click map to clear.
+    const segs = viewingReport?.reportedSegments || viewingReport?.reportedSegment
+      ? [].concat(viewingReport.reportedSegments || viewingReport.reportedSegment || [])
+      : null
+    if (!segs?.length) {
+      // Restore opacity on all existing traces
+      for (const p of [...tracesRef.current, ...nearbyTracesRef.current]) {
+        if (p._path) p._path.style.opacity = ''
       }
+      return
     }
-    // Also plot the report's user location if present
-    if (viewingReport.location?.lat) {
-      const marker = L.circleMarker(
-        [viewingReport.location.lat, viewingReport.location.lng || viewingReport.location.lon],
-        { radius: 6, color: '#fafafa', weight: 2, fillColor: '#38bdf8', fillOpacity: 0.9, interactive: false }
-      ).addTo(map)
-      reportTracesRef.current.push(marker)
-      bounds.extend(marker.getLatLng())
+
+    // Dim everything
+    for (const p of [...tracesRef.current, ...nearbyTracesRef.current]) {
+      if (p._path) p._path.style.opacity = '0.15'
+    }
+
+    // Draw reported segments in bright orange on the selected-segments pane
+    if (!map.getPane('selectedSegments')) {
+      map.createPane('selectedSegments')
+      map.getPane('selectedSegments').style.zIndex = 650
+    }
+    const bounds = L.latLngBounds([])
+    for (const seg of segs) {
+      if (!seg.points?.length || seg.points.length < 2) continue
+      const latlngs = seg.points.map((p) => [p[0], p[1]])
+      const glow = L.polyline(latlngs, {
+        color: '#ff8c00', weight: 14, opacity: 0.3,
+        lineCap: 'round', lineJoin: 'round',
+        pane: 'selectedSegments', interactive: false,
+      }).addTo(map)
+      const line = L.polyline(latlngs, {
+        color: '#ff8c00', weight: 7, opacity: 1,
+        lineCap: 'round', lineJoin: 'round',
+        pane: 'selectedSegments', interactive: false,
+      }).addTo(map)
+      reportTracesRef.current.push(glow, line)
+      latlngs.forEach((ll) => bounds.extend(ll))
     }
     if (bounds.isValid()) {
-      if (rawCoords) bounds.extend([rawCoords.lat, rawCoords.lng])
-      map.flyToBounds(bounds.pad(0.2), { duration: 1, maxZoom: 14 })
+      map.flyToBounds(bounds.pad(0.25), { duration: 1, maxZoom: 14 })
     }
-    if (areaRef.current) areaRef.current.bringToFront()
-  }, [viewingReport, rawCoords])
+
+    // Click anywhere on the map to clear the viewed report
+    const clearView = () => setViewingReport(null)
+    map.once('click', clearView)
+    reportTracesRef.current.push({ remove: () => map.off('click', clearView) })
+  }, [viewingReport])
 
   /* ── Reverse-geocode to locality (any browser-precision coords) ── */
   useEffect(() => {

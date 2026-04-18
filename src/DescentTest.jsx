@@ -115,35 +115,51 @@ function classifyTrack(points) {
   else if (!firstLow && !lastLow) result.phase = 'overflight'
   else result.phase = 'pattern'
 
-  // Touch-and-go detection: a descent segment whose low point is followed
-  // by an ascent segment starting within 240 seconds (p90 of observed
-  // T&G timing). Uses timestamps (p[3]) when available; falls back to
-  // index proximity (< 60 points ≈ ~120 s at 2 s/sample).
+  // Touch-and-go detection. For each period below lowThresh, find:
+  //   - bottomIdx: the lowest altitude point (descent bottom)
+  //   - ascentIdx: the first point after bottom where 3 consecutive
+  //     points are rising (the moment the aircraft is climbing again)
+  //   - gapSec: time from bottom to ascent start (median ~7s, p90 ~53s)
+  // A T&G = bottom + ascent within 90 seconds (generous p90 window).
   result.touchAndGos = []
-  const MAX_TNG_SEC = 240
-  const MAX_TNG_IDX = 60
-  for (const desc of result.descentSegments) {
-    for (const asc of result.ascentSegments) {
-      if (asc.startIdx < desc.endIdx) continue // ascent must come after descent
-      const hasTs = points[desc.endIdx].length > 3 && points[asc.startIdx].length > 3
-      let gap
-      if (hasTs) {
-        gap = points[asc.startIdx][3] - points[desc.endIdx][3]
-        if (gap < 0 || gap > MAX_TNG_SEC) continue
-      } else {
-        gap = asc.startIdx - desc.endIdx
-        if (gap < 0 || gap > MAX_TNG_IDX) continue
+  const MAX_TNG_SEC = 90
+  const MAX_TNG_IDX = 30
+  {
+    let inLow = false, lowStart = -1
+    for (let i = 0; i < points.length; i++) {
+      const alt = points[i][2]
+      if (alt < lowThresh && !inLow) {
+        inLow = true; lowStart = i
+      } else if (alt > highThresh && inLow) {
+        // Find the bottom (minimum alt) in this low period
+        let bottomIdx = lowStart
+        for (let j = lowStart; j < i; j++) {
+          if (points[j][2] < points[bottomIdx][2]) bottomIdx = j
+        }
+        // Find ascent start: first point after bottom where next 3 are rising
+        let ascStart = -1
+        for (let j = bottomIdx; j < Math.min(i + 5, points.length - 3); j++) {
+          if (points[j+1][2] > points[j][2] && points[j+2][2] > points[j+1][2]) {
+            ascStart = j; break
+          }
+        }
+        if (ascStart >= 0) {
+          const hasTs = points[bottomIdx].length > 3 && points[ascStart].length > 3
+          const gapSec = hasTs ? points[ascStart][3] - points[bottomIdx][3] : null
+          const gapOk = gapSec != null ? gapSec <= MAX_TNG_SEC : (ascStart - bottomIdx) <= MAX_TNG_IDX
+          if (gapOk) {
+            result.touchAndGos.push({
+              startIdx: lowStart,
+              bottomIdx,
+              ascentIdx: ascStart,
+              endIdx: i,
+              gapSec,
+              bottomAgl: points[bottomIdx][2] - elev,
+            })
+          }
+        }
+        inLow = false
       }
-      result.touchAndGos.push({
-        descentIdx: result.descentSegments.indexOf(desc),
-        ascentIdx: result.ascentSegments.indexOf(asc),
-        startIdx: desc.startIdx,
-        endIdx: asc.endIdx,
-        gapSec: hasTs ? gap : null,
-        gapPts: asc.startIdx - desc.endIdx,
-        bottomAlt: Math.min(...points.slice(desc.endIdx, asc.startIdx + 1).map(p => p[2])),
-      })
-      break // each descent matches at most one ascent
     }
   }
 
@@ -353,9 +369,9 @@ export default function DescentTest() {
                     >
                       <Tooltip sticky>
                         <div className="text-[10px]">
-                          <span className="text-amber-400 font-semibold">Touch & Go #{ti + 1}</span>
-                          {tng.gapSec != null && <span> · {tng.gapSec}s on ground</span>}
-                          {' · bottom '}{Math.round(tng.bottomAlt - t.fieldElev)} AGL
+                          <span className="text-amber-400 font-semibold">T&G #{ti + 1}</span>
+                          {tng.gapSec != null && <span> · {tng.gapSec}s bottom-to-climb</span>}
+                          {' · '}{Math.round(tng.bottomAgl)} ft AGL
                           {' · '}{segPts.length} pts
                         </div>
                       </Tooltip>
