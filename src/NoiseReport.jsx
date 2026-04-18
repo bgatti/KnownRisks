@@ -505,7 +505,7 @@ export function NoiseStudio() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [identity?.kind, identity?.handle, identity?.email])
 
-  /* ── Pre-fetch Wikipedia thumbnails for each unique aircraft type ── */
+  /* ── Fetch Wikipedia thumbnails sequentially (not parallel, to save memory) ── */
   useEffect(() => {
     if (!activeList.length) return
     const ctrl = new AbortController()
@@ -513,15 +513,12 @@ export function NoiseStudio() {
       .filter((t) => t !== 'Unknown' && !(t in typePhotos))
     if (!types.length) return
     ;(async () => {
-      const entries = await Promise.all(
-        types.map(async (t) => [t, await fetchAircraftPhoto(t, { signal: ctrl.signal })])
-      )
-      if (ctrl.signal.aborted) return
-      setTypePhotos((prev) => {
-        const next = { ...prev }
-        for (const [t, url] of entries) next[t] = url
-        return next
-      })
+      for (const t of types) {
+        if (ctrl.signal.aborted) return
+        const url = await fetchAircraftPhoto(t, { signal: ctrl.signal })
+        if (ctrl.signal.aborted) return
+        setTypePhotos((prev) => ({ ...prev, [t]: url }))
+      }
     })()
     return () => ctrl.abort()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -722,22 +719,19 @@ export function NoiseStudio() {
     }
   }, [segmentsByTail, selectedTail, reportOpen, rawCoords])
 
-  /* ── Auto-request on mount, skipping if already denied ──────────── */
+  /* ── Auto-request location after a delay so the map renders first ── */
   useEffect(() => {
-    let cancelled = false
-    ;(async () => {
+    const timer = setTimeout(async () => {
       let state = 'prompt'
       try {
         if (navigator.permissions?.query) {
           const r = await navigator.permissions.query({ name: 'geolocation' })
           state = r.state
         }
-      } catch { /* Safari etc. — just try */ }
-      if (cancelled) return
-      if (state === 'denied') return
-      requestLocation()
-    })()
-    return () => { cancelled = true }
+      } catch {}
+      if (state !== 'denied') requestLocation()
+    }, 2000) // 2s delay — let map + active list settle first
+    return () => clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -765,7 +759,7 @@ export function NoiseStudio() {
         setLocationError(err.code === 1 ? 'Permission denied' : 'Location unavailable')
         setLocating(false)
       },
-      { enableHighAccuracy: true, timeout: 30000, maximumAge: 60000 },
+      { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 },
     )
   }
 
