@@ -19,35 +19,42 @@ const TIME_RANGES = [
   { label: 'All', hours: null },
 ]
 
-// Quality tiers — ordered low→high. Score can be a number or {total, max, tier}.
+// Quality filter: complaint.score is 0–10
 const QUALITY_TIERS = [
-  { label: 'Any', minScore: 0 },
-  { label: '3+', minScore: 3, desc: 'Useful' },
-  { label: '5+', minScore: 5, desc: 'Good' },
-  { label: '8+', minScore: 8, desc: 'Strong' },
+  { label: 'Any',  min: 0 },
+  { label: '3+',   min: 3,  desc: 'Useful — cross-street' },
+  { label: '5+',   min: 5,  desc: 'Good — precise location' },
+  { label: '8+',   min: 8,  desc: 'Strong — audio/video + precise' },
 ]
 
-// Proximity radius options (nautical miles from KBDU)
+// Proximity filter: complaint.distanceMiles (reporter-to-aircraft, Fibonacci-rounded)
+// These thresholds align with the Fibonacci rounding buckets.
 const PROXIMITY_OPTIONS = [
-  { label: '2 nm', nm: 2 },
-  { label: '4 nm', nm: 4 },
-  { label: '6 nm', nm: 6 },
-  { label: '10 nm', nm: 10 },
-  { label: 'Any', nm: null },
+  { label: '0.3 mi', maxMi: 0.3 },
+  { label: '0.8 mi', maxMi: 0.8 },
+  { label: '1.3 mi', maxMi: 1.3 },
+  { label: '3.4 mi', maxMi: 3.4 },
+  { label: 'Any',    maxMi: null },
+]
+
+// Evidence / credibility filter
+const MEDIA_OPTIONS = [
+  { label: 'Any',   value: null },
+  { label: 'Audio', value: 'audio' },
+  { label: 'Video', value: 'video' },
 ]
 
 const AIRPORT_SUBSET = ['KBDU', 'KBJC', 'KLMO', 'KEIK', 'KFNL']
 
 // ─── Heatmap renderer ────────────────────────────────────────────────────────
-// Client-side canvas heatmap: Gaussian splat for each complaint/report point.
-// Produces a PNG overlay positioned on the map bounds.
+// Client-side canvas heatmap: Gaussian splat for each complaint point.
+// Weight = complaint score, so high-quality reports produce hotter spots.
 
 const HEATMAP_HALF_KM = 12
 const HEATMAP_CELL_M = 80
-const SPLAT_RADIUS_M = 600 // Gaussian sigma for each complaint dot
+const SPLAT_RADIUS_M = 600
 
 function computeComplaintHeatmap(points, weights) {
-  // points: [[lat, lon], ...], weights: [number, ...]
   if (!points.length) return null
 
   const lat0 = KBDU[0]
@@ -58,7 +65,7 @@ function computeComplaintHeatmap(points, weights) {
   const n = Math.max(32, Math.round((2 * HEATMAP_HALF_KM * 1000) / HEATMAP_CELL_M))
   const grid = new Float64Array(n * n)
   const halfIdx = (n - 1) / 2
-  const sigma = SPLAT_RADIUS_M / HEATMAP_CELL_M // in cells
+  const sigma = SPLAT_RADIUS_M / HEATMAP_CELL_M
   const sigma2 = sigma * sigma
   const rCells = Math.ceil(sigma * 3)
 
@@ -84,14 +91,12 @@ function computeComplaintHeatmap(points, weights) {
     }
   }
 
-  // Find max
   let maxVal = 0
   for (let i = 0; i < grid.length; i++) {
     if (grid[i] > maxVal) maxVal = grid[i]
   }
   if (maxVal <= 0) return null
 
-  // Render to canvas
   const canvas = document.createElement('canvas')
   canvas.width = n
   canvas.height = n
@@ -99,14 +104,13 @@ function computeComplaintHeatmap(points, weights) {
   const img = ctx.createImageData(n, n)
 
   for (let row = 0; row < n; row++) {
-    const srcRow = n - 1 - row // flip north-up
+    const srcRow = n - 1 - row
     for (let col = 0; col < n; col++) {
       const v = grid[srcRow * n + col]
       const idx = (row * n + col) * 4
       if (v <= 0) { img.data[idx + 3] = 0; continue }
 
       const t = Math.min(1, v / maxVal)
-      // Blue → Cyan → Yellow → Red ramp
       let r, g, b
       if (t < 0.25) {
         const s = t / 0.25
@@ -144,7 +148,6 @@ function computeComplaintHeatmap(points, weights) {
     url: canvas.toDataURL('image/png'),
     bounds: [[lat0 - dLat, lon0 - dLon], [lat0 + dLat, lon0 + dLon]],
     maxVal,
-    pointCount: points.length,
   }
 }
 
@@ -183,34 +186,41 @@ function loadLeaflet() {
   })
 }
 
+// Extract flight position from a complaint (new fields) or noise report (fallbacks).
 function extractLatLon(item) {
-  if (item.lat && item.lon) return [item.lat, item.lon]
-  if (item.lat && item.lng) return [item.lat, item.lng]
+  // New complaint fields: lat/lon = flight segment position
+  if (item.lat != null && item.lon != null) return [item.lat, item.lon]
+  if (item.lat != null && item.lng != null) return [item.lat, item.lng]
+  // Noise report: nearestFlightPoint
   const nfp = item.nearestFlightPoint
-  if (nfp && nfp.lat && (nfp.lon || nfp.lng)) return [nfp.lat, nfp.lon || nfp.lng]
+  if (nfp && nfp.lat != null && (nfp.lon != null || nfp.lng != null))
+    return [nfp.lat, nfp.lon ?? nfp.lng]
+  // Noise report: reporter location (fallback for old data)
   const loc = item.location
-  if (loc && loc.lat && (loc.lon || loc.lng)) return [loc.lat, loc.lon || loc.lng]
+  if (loc && loc.lat != null && (loc.lon != null || loc.lng != null))
+    return [loc.lat, loc.lon ?? loc.lng]
   return null
 }
 
-// Score from a complaint or noise report (normalize to a number)
-function getScore(item) {
-  if (item.score != null) {
-    if (typeof item.score === 'number') return item.score
-    if (typeof item.score === 'object' && item.score.total != null) return item.score.total
+// Resolve complaint score to a 0–10 int.
+// New field: complaint.score (int 0–10) — use directly.
+// Old complaints: parse "Score N/10" from notes, or infer from klass.
+function resolveScore(item) {
+  // New field (int 0–10)
+  if (typeof item.score === 'number') return item.score
+  // Noise report score object {total, max, tier}
+  if (item.score && typeof item.score === 'object' && item.score.total != null)
+    return item.score.total
+  // Legacy: parse notes "Score 8/10 (Strong)"
+  if (typeof item.notes === 'string') {
+    const m = item.notes.match(/Score\s+(\d+)\/10/)
+    if (m) return parseInt(m[1], 10)
   }
-  // Complaints: infer from klass
-  if (item.klass === 'red') return 8
+  // Fallback: klass severity as proxy
+  if (item.klass === 'red') return 7
   if (item.klass === 'orange') return 5
   if (item.klass === 'yellow') return 3
-  return 1 // minimum — exists but no quality signal
-}
-
-// Distance in nautical miles between two lat/lon points
-function distNm(lat1, lon1, lat2, lon2) {
-  const dLat = (lat1 - lat2) * 60
-  const dLon = (lon1 - lon2) * 60 * Math.cos(((lat1 + lat2) / 2) * Math.PI / 180)
-  return Math.hypot(dLat, dLon)
+  return 1
 }
 
 function timeAgo(dateStr) {
@@ -222,11 +232,9 @@ function timeAgo(dateStr) {
   return `${hrs}h ${mins % 60}m ago`
 }
 
-// ─── Unified filter ──────────────────────────────────────────────────────────
-// Merges complaints + noise reports into a single list of { pos, weight, score, distNm, ... }
-// then applies time / quality / proximity filters.
+// ─── Filter pipeline ─────────────────────────────────────────────────────────
 
-function buildFilteredItems(complaints, noiseReports, timeRange, qualityTier, proximityNm) {
+function buildFilteredItems(complaints, noiseReports, timeRange, qualityTier, proximityOpt, mediaFilter) {
   const now = Date.now()
   const cutoff = timeRange.hours ? now - timeRange.hours * 3600_000 : 0
 
@@ -237,18 +245,36 @@ function buildFilteredItems(complaints, noiseReports, timeRange, qualityTier, pr
     if (!pos) continue
     const t = new Date(c.createdAt).getTime()
     if (t < cutoff) continue
-    const score = getScore(c)
-    if (score < qualityTier.minScore) continue
-    const d = distNm(pos[0], pos[1], KBDU[0], KBDU[1])
-    if (proximityNm != null && d > proximityNm) continue
-    items.push({ pos, weight: 1, score, dist: d, source: c, type: 'complaint' })
+
+    const score = resolveScore(c)
+    if (score < qualityTier.min) continue
+
+    // Proximity: complaint.distanceMiles = reporter-to-aircraft distance
+    if (proximityOpt.maxMi != null) {
+      if (c.distanceMiles != null && c.distanceMiles > proximityOpt.maxMi) continue
+      // Old complaints without distanceMiles: let them through (can't filter)
+    }
+
+    // Media credibility filter
+    if (mediaFilter.value != null) {
+      if ((c.mediaKind || null) !== mediaFilter.value) continue
+    }
+
+    // Weight = score / 10 so a score-10 report is 1.0 and score-1 is 0.1
+    items.push({ pos, weight: Math.max(0.1, score / 10), score, source: c, type: 'complaint' })
   }
 
   for (const r of noiseReports) {
     const t = new Date(r.receivedAt || r.submittedAt).getTime()
     if (t < cutoff) continue
-    const score = getScore(r)
-    if (score < qualityTier.minScore) continue
+    const score = resolveScore(r)
+    if (score < qualityTier.min) continue
+
+    // Media filter for noise reports
+    if (mediaFilter.value != null) {
+      const mk = r.media?.audio ? 'audio' : r.media?.video ? 'video' : null
+      if (mk !== mediaFilter.value) continue
+    }
 
     // Segments spread across path
     const segs = r.reportedSegments || []
@@ -256,12 +282,10 @@ function buildFilteredItems(complaints, noiseReports, timeRange, qualityTier, pr
     for (const seg of segs) {
       const pts = seg.points || []
       if (pts.length === 0) continue
-      const w = 1 / Math.max(pts.length, 1)
+      const w = Math.max(0.1, score / 10) / Math.max(pts.length, 1)
       for (const p of pts) {
-        if (!p[0] || !p[1]) continue
-        const d = distNm(p[0], p[1], KBDU[0], KBDU[1])
-        if (proximityNm != null && d > proximityNm) continue
-        items.push({ pos: [p[0], p[1]], weight: w, score, dist: d, source: r, type: 'report-seg' })
+        if (p[0] == null || p[1] == null) continue
+        items.push({ pos: [p[0], p[1]], weight: w, score, source: r, type: 'report-seg' })
         usedSegments = true
       }
     }
@@ -269,9 +293,7 @@ function buildFilteredItems(complaints, noiseReports, timeRange, qualityTier, pr
     if (!usedSegments) {
       const pos = extractLatLon(r)
       if (!pos) continue
-      const d = distNm(pos[0], pos[1], KBDU[0], KBDU[1])
-      if (proximityNm != null && d > proximityNm) continue
-      items.push({ pos, weight: 1, score, dist: d, source: r, type: 'report' })
+      items.push({ pos, weight: Math.max(0.1, score / 10), score, source: r, type: 'report' })
     }
   }
 
@@ -287,7 +309,7 @@ function buildLiveMarkers(complaints, noiseReports) {
     const pos = extractLatLon(c)
     if (!pos) continue
     if (new Date(c.createdAt).getTime() < cutoff) continue
-    markers.push({ ...c, lat: pos[0], lon: pos[1] })
+    markers.push({ ...c, lat: pos[0], lon: pos[1], _score: resolveScore(c) })
   }
 
   for (const r of noiseReports) {
@@ -301,9 +323,9 @@ function buildLiveMarkers(complaints, noiseReports) {
       klass: r.excursion?.worst || (typeof r.score === 'object' ? r.score?.tier?.toLowerCase() : null) || 'yellow',
       zone: r.excursion?.zone || r.location?.display || 'Unknown',
       tail: r.excursion?.tail || '?',
-      notes: typeof r.score === 'object' && r.score
-        ? `Score ${r.score.total}/${r.score.max} (${r.score.tier})`
-        : typeof r.score === 'number' ? `Score ${r.score}/10` : '',
+      type: r.excursion?.type || null,
+      _score: resolveScore(r),
+      mediaKind: r.media?.audio ? 'audio' : r.media?.video ? 'video' : null,
       id: r.id,
     })
   }
@@ -326,9 +348,10 @@ export default function NoiseHeatmap() {
   const [noiseReports, setNoiseReports] = useState([])
   const [activeExcursions, setActiveExcursions] = useState([])
 
-  const [timeRange, setTimeRange] = useState(TIME_RANGES[1]) // 7d default
-  const [qualityTier, setQualityTier] = useState(QUALITY_TIERS[0]) // Any
-  const [proximityOpt, setProximityOpt] = useState(PROXIMITY_OPTIONS[4]) // Any
+  const [timeRange, setTimeRange] = useState(TIME_RANGES[1])
+  const [qualityTier, setQualityTier] = useState(QUALITY_TIERS[0])
+  const [proximityOpt, setProximityOpt] = useState(PROXIMITY_OPTIONS[4])
+  const [mediaFilter, setMediaFilter] = useState(MEDIA_OPTIONS[0])
   const [layers, setLayers] = useState({
     historic: true,
     live: true,
@@ -393,8 +416,8 @@ export default function NoiseHeatmap() {
 
   // ─── Filtered items (memoized) ─────────────────────────────────────────────
   const filteredItems = useMemo(
-    () => buildFilteredItems(complaints, noiseReports, timeRange, qualityTier, proximityOpt.nm),
-    [complaints, noiseReports, timeRange, qualityTier, proximityOpt],
+    () => buildFilteredItems(complaints, noiseReports, timeRange, qualityTier, proximityOpt, mediaFilter),
+    [complaints, noiseReports, timeRange, qualityTier, proximityOpt, mediaFilter],
   )
 
   // ─── Client-side heatmap overlay ───────────────────────────────────────────
@@ -469,11 +492,24 @@ export default function NoiseHeatmap() {
         radius: 6, color, weight: 2,
         fillColor: color, fillOpacity: opacity * 0.8, opacity,
       })
+
+      // Popup with new fields
+      const typeLine = c.type ? `<div>Type: <span style="color:#94a3b8">${c.type}</span></div>` : ''
+      const scoreLine = `<div>Score: <span style="color:#a78bfa">${c._score}/10</span></div>`
+      const distLine = c.distanceMiles != null
+        ? `<div>Distance: <span style="color:#34d399">${c.distanceMiles} mi</span></div>` : ''
+      const mediaLine = c.mediaKind
+        ? `<div>Evidence: <span style="color:#fbbf24">${c.mediaKind}</span></div>` : ''
+      const precLine = c.precision
+        ? `<div>Precision: <span style="color:#94a3b8">${c.precision}</span></div>` : ''
+      const notesLine = c.notes
+        ? `<div style="margin-top:4px;color:#94a3b8;font-size:11px">${c.notes}</div>` : ''
+
       dot.bindPopup(`
-        <div style="font-family:monospace;font-size:12px;color:#e2e8f0;background:#1e293b;padding:8px 12px;border-radius:8px;min-width:180px;">
+        <div style="font-family:monospace;font-size:12px;color:#e2e8f0;background:#1e293b;padding:8px 12px;border-radius:8px;min-width:200px;">
           <div style="font-weight:600;color:${color};margin-bottom:4px;">${(c.klass || 'unknown').toUpperCase()} — ${c.zone || 'Unknown zone'}</div>
           <div>Tail: <span style="color:#38bdf8">${c.tail || '?'}</span></div>
-          ${c.notes ? `<div style="margin-top:4px;color:#94a3b8;font-size:11px">${c.notes}</div>` : ''}
+          ${typeLine}${scoreLine}${distLine}${mediaLine}${precLine}${notesLine}
           <div style="margin-top:4px;color:#64748b;font-size:11px">${timeAgo(c.createdAt)}</div>
         </div>
       `, { className: 'dark-popup', closeButton: false })
@@ -569,6 +605,10 @@ export default function NoiseHeatmap() {
     fontFamily: 'monospace', fontSize: 11, fontWeight: 600,
     cursor: 'pointer', transition: 'all 0.15s',
   }
+  const labelStyle = {
+    fontFamily: 'monospace', fontSize: 9, color: '#64748b',
+    marginBottom: 3, textTransform: 'uppercase', letterSpacing: 1,
+  }
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: '#0f172a' }}>
@@ -581,7 +621,7 @@ export default function NoiseHeatmap() {
         </div>
         {stats && !loading && (
           <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#64748b', marginTop: 2 }}>
-            {stats.filteredPoints} points shown &middot; {stats.complaints} complaints &middot; {stats.reports} reports
+            {stats.filteredPoints} pts &middot; {stats.complaints} complaints &middot; {stats.reports} reports
           </div>
         )}
         {loading && (
@@ -619,11 +659,11 @@ export default function NoiseHeatmap() {
       </div>
 
       {/* Filter bar — bottom left */}
-      <div style={{ position: 'absolute', bottom: 24, left: 16, zIndex: 1000, ...panelStyle, padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {/* Time range */}
+      <div style={{ position: 'absolute', bottom: 24, left: 16, zIndex: 1000, ...panelStyle, padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 'calc(100vw - 180px)' }}>
+        {/* Time */}
         <div>
-          <div style={{ fontFamily: 'monospace', fontSize: 9, color: '#64748b', marginBottom: 3, textTransform: 'uppercase', letterSpacing: 1 }}>Time</div>
-          <div style={{ display: 'flex', gap: 3 }}>
+          <div style={labelStyle}>Time</div>
+          <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
             {TIME_RANGES.map(tr => (
               <button key={tr.label} onClick={() => setTimeRange(tr)}
                 style={{ ...btnBase, background: timeRange.label === tr.label ? '#38bdf8' : 'transparent', color: timeRange.label === tr.label ? '#0f172a' : '#64748b' }}>
@@ -632,10 +672,10 @@ export default function NoiseHeatmap() {
             ))}
           </div>
         </div>
-        {/* Quality filter */}
+        {/* Quality (score) */}
         <div>
-          <div style={{ fontFamily: 'monospace', fontSize: 9, color: '#64748b', marginBottom: 3, textTransform: 'uppercase', letterSpacing: 1 }}>Quality</div>
-          <div style={{ display: 'flex', gap: 3 }}>
+          <div style={labelStyle}>Quality (score)</div>
+          <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
             {QUALITY_TIERS.map(qt => (
               <button key={qt.label} onClick={() => setQualityTier(qt)}
                 style={{ ...btnBase, background: qualityTier.label === qt.label ? '#a78bfa' : 'transparent', color: qualityTier.label === qt.label ? '#0f172a' : '#64748b' }}
@@ -645,14 +685,26 @@ export default function NoiseHeatmap() {
             ))}
           </div>
         </div>
-        {/* Proximity filter */}
+        {/* Proximity (reporter distance) */}
         <div>
-          <div style={{ fontFamily: 'monospace', fontSize: 9, color: '#64748b', marginBottom: 3, textTransform: 'uppercase', letterSpacing: 1 }}>Proximity</div>
-          <div style={{ display: 'flex', gap: 3 }}>
+          <div style={labelStyle}>Proximity (reporter &rarr; aircraft)</div>
+          <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
             {PROXIMITY_OPTIONS.map(po => (
               <button key={po.label} onClick={() => setProximityOpt(po)}
                 style={{ ...btnBase, background: proximityOpt.label === po.label ? '#34d399' : 'transparent', color: proximityOpt.label === po.label ? '#0f172a' : '#64748b' }}>
                 {po.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        {/* Evidence */}
+        <div>
+          <div style={labelStyle}>Evidence</div>
+          <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
+            {MEDIA_OPTIONS.map(mo => (
+              <button key={mo.label} onClick={() => setMediaFilter(mo)}
+                style={{ ...btnBase, background: mediaFilter.label === mo.label ? '#fbbf24' : 'transparent', color: mediaFilter.label === mo.label ? '#0f172a' : '#64748b' }}>
+                {mo.label}
               </button>
             ))}
           </div>
