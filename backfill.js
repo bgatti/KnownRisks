@@ -199,11 +199,13 @@ function classifyTrack(points, call, src, schoolMap) {
     }
   }
 
-  // Detect quiet-hour T&G (purple excursions)
-  // t0 = epoch seconds of the track date at midnight UTC
+  // Detect quiet-hour T&G (purple excursions) — KBDU only.
+  // Only KBDU has the voluntary quiet-hour noise abatement procedure.
   const t0 = m ? Math.floor(Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`) / 1000) : null
-  const fieldElev = AIRPORT_ELEVATIONS[base_airport] || AIRPORT_ELEVATIONS.KBDU
-  const tngRanges = detectQuietHourTnG(allPts, t0, fieldElev)
+  const isKbdu = base_airport === 'KBDU' || nearestAirport(allPts[0][0], allPts[0][1], 3) === 'KBDU'
+  const tngRanges = isKbdu
+    ? detectQuietHourTnG(allPts, t0, AIRPORT_ELEVATIONS.KBDU)
+    : []
 
   // Build a set of point indices that are in purple T&G ranges
   const purpleIdx = new Set()
