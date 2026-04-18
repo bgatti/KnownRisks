@@ -2309,7 +2309,6 @@ function MapPage() {
               ))}
               </div>
             </div>
-          )}
         </div>
           </>
         )}

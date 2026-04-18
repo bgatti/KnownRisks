@@ -1385,9 +1385,17 @@ export function NoiseStudio() {
         nearestPt: s.nearestPt, points: s.points,
       })),
     }, ...prev])
-    // Also refresh server-side lists (works when identity is set).
+    // Refresh server-side lists then transition to My Reports after a brief pause.
     loadMyComplaints()
     loadActive()
+
+    // After 1.5s, close the wizard and open the reports panel so the user
+    // sees their saved reports with the new one at the top.
+    setTimeout(() => {
+      setReportOpen(false)
+      setSubmitted(false)
+      setComplaintsPanelOpen(true)
+    }, 1500)
   }
   function resetReport() {
     setSubmitted(false)
@@ -1468,6 +1476,16 @@ export function NoiseStudio() {
         @keyframes wizardIn {
           from { transform: translateY(24px); opacity: 0; }
           to   { transform: translateY(0);    opacity: 1; }
+        }
+        .panel-slide-in { animation: panelSlideIn 350ms ease-out; }
+        .report-new { animation: reportNew 1.5s ease-out; }
+        @keyframes reportNew {
+          0%   { background: rgba(56,189,248,0.25); }
+          100% { background: transparent; }
+        }
+        @keyframes panelSlideIn {
+          from { transform: translateX(100%); }
+          to   { transform: translateX(0); }
         }
       `}</style>
 
@@ -2885,7 +2903,7 @@ function MyComplaintsPanel({ identity, complaints, reports, sessionReports, stat
   }, [complaints, activeList, locality])
 
   return (
-    <div className="absolute inset-y-0 right-0 z-[1150] w-full sm:w-96 bg-neutral-950/95 backdrop-blur-md border-l border-white/10 shadow-2xl flex flex-col">
+    <div className="panel-slide-in absolute inset-y-0 right-0 z-[1150] w-full sm:w-96 bg-neutral-950/95 backdrop-blur-md border-l border-white/10 shadow-2xl flex flex-col">
       <header className="px-5 py-4 border-b border-white/10 flex items-start justify-between">
         <div>
           <p className="text-[10px] uppercase tracking-[0.2em] text-neutral-500">History</p>
@@ -2988,10 +3006,11 @@ function MyComplaintsPanel({ identity, complaints, reports, sessionReports, stat
             )
           })}
           {/* Session-only reports (before identity is set) */}
-          {sessionReports.map((sr) => {
+          {sessionReports.map((sr, idx) => {
             const isViewing = viewingReport === sr
+            const isNewest = idx === 0 && Date.now() - Date.parse(sr.createdAt) < 10000
             return (
-              <li key={sr.id}>
+              <li key={sr.id} className={isNewest ? 'report-new' : ''}>
                 <button
                   onClick={() => onViewReport(isViewing ? null : sr)}
                   className={[
