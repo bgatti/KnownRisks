@@ -1,68 +1,144 @@
 import { useEffect, useMemo, useState } from 'react'
-import { MapContainer, TileLayer, Polyline, Circle, Tooltip } from 'react-leaflet'
+import { MapContainer, TileLayer, Polyline, CircleMarker, Tooltip } from 'react-leaflet'
 import { NOISE_ZONES } from './noiseZones'
 
+// ─── Airport field elevations (MSL ft) ──────────────────────────────────────
+const AIRPORTS = [
+  { code: 'KBDU', lat: 40.0394, lon: -105.2258, elev: 5288 },
+  { code: 'KBJC', lat: 39.9088, lon: -105.1172, elev: 5673 },
+  { code: 'KEIK', lat: 40.0098, lon: -105.0488, elev: 5130 },
+  { code: 'KLMO', lat: 40.1636, lon: -105.1636, elev: 5055 },
+  { code: 'KAPA', lat: 39.5701, lon: -104.8493, elev: 5885 },
+  { code: 'KGXY', lat: 40.4348, lon: -104.6331, elev: 4697 },
+]
 const KBDU = [40.0394, -105.2258]
-const KBDU_ELEV = 5288
 
-// Handpicked test tracks — one from each phase category.
+// Find the nearest airport to a lat/lon and return its field elevation.
+function nearestFieldElev(lat, lon) {
+  let best = AIRPORTS[0], bestD = Infinity
+  for (const ap of AIRPORTS) {
+    const d = Math.hypot((lat - ap.lat) * 69, (lon - ap.lon) * 53)
+    if (d < bestD) { bestD = d; best = ap }
+  }
+  return { elev: best.elev, code: best.code, distMi: bestD }
+}
+
+// ─── Test tracks — all from 2026, only load that file ───────────────────────
 const TEST_TRACKS = [
-  { label: 'Pattern C172',  src: 'globe/2026-04-10/a5844a' }, // N4547E, 33 descents
-  { label: 'Pattern C172b', src: 'globe/2026-04-10/a29d3e' }, // N268FM, 34 descents
-  { label: 'Arrival DA40',  src: 'globe/2026-04-08/a2ae46' }, // N272DS, 1 descent
-  { label: 'Departure C172',src: 'globe/2026-04-08/a4c3b4' }, // N406JA, starts low
-  { label: 'Overflight A320',src:'globe/2026-04-08/a533bd' }, // N434UA, never low
-  { label: 'Helo pattern',  src: 'globe/2026-04-08/ae0a71' }, // 86-24529 H60, 35 desc
+  { label: 'Pattern C172',   src: 'globe/2026-04-10/a5844a' }, // N4547E
+  { label: 'Pattern C172b',  src: 'globe/2026-04-10/a29d3e' }, // N268FM
+  { label: 'Arrival DA40',   src: 'globe/2026-04-08/a2ae46' }, // N272DS
+  { label: 'Departure C172', src: 'globe/2026-04-08/a4c3b4' }, // N406JA
+  { label: 'Overflight A320',src: 'globe/2026-04-08/a533bd' }, // N434UA
+  { label: 'Helo pattern',   src: 'globe/2026-04-08/ae0a71' }, // 86-24529 H60
 ]
 
-function classifyPhase(points, fieldElev = KBDU_ELEV) {
-  if (!points || points.length < 5) return { phase: null, descents: 0, descentSegments: [] }
-  const threshold = fieldElev + 300
-  let descents = 0
-  let wasAbove = false
-  const descentSegments = [] // [{startIdx, endIdx}] — each descent event
-  let descentStart = -1
-  for (let i = 0; i < points.length; i++) {
-    if (points[i][2] > threshold) {
-      if (descentStart >= 0) {
-        descentSegments.push({ startIdx: descentStart, endIdx: i })
-        descentStart = -1
+// ─── Phase + descent/ascent classifier ──────────────────────────────────────
+// Uses the nearest airport's field elevation for AGL, not the track's own min.
+// AGL_THRESHOLD = 300 ft — below this = "on the ground".
+const AGL_THRESHOLD = 300
+
+function classifyTrack(points) {
+  const result = {
+    phase: null, nearestAirport: null, fieldElev: 0,
+    descents: 0, ascents: 0,
+    descentSegments: [], ascentSegments: [],
+    aglMin: Infinity, aglMax: -Infinity,
+  }
+  if (!points || points.length < 5) return result
+
+  // Find nearest airport to the track's lowest point for field elevation.
+  let lowestPt = points[0], lowestAlt = points[0][2]
+  for (const p of points) { if (p[2] < lowestAlt) { lowestAlt = p[2]; lowestPt = p } }
+  const { elev, code } = nearestFieldElev(lowestPt[0], lowestPt[1])
+  result.fieldElev = elev
+  result.nearestAirport = code
+
+  // AGL stats
+  for (const p of points) {
+    const agl = p[2] - elev
+    if (agl < result.aglMin) result.aglMin = agl
+    if (agl > result.aglMax) result.aglMax = agl
+  }
+
+  // Descent detection: aircraft must drop from above 800 AGL to below
+  // 250 AGL. The segment spans from where it passes below 800 to where
+  // it bottoms out below 250. Shallow passes that stay above 250 are
+  // not flagged.
+  {
+    let wasHigh = false, descStart = -1
+    for (let i = 0; i < points.length; i++) {
+      const alt = points[i][2]
+      if (alt > highThresh) {
+        wasHigh = true
+        if (descStart >= 0) {
+          // Went back up without getting low enough — discard.
+          descStart = -1
+        }
+      } else if (wasHigh && descStart < 0) {
+        descStart = i // started descending through 800
       }
-      wasAbove = true
-    } else if (wasAbove) {
-      descents++
-      descentStart = i
-      wasAbove = false
+      if (wasHigh && descStart >= 0 && alt < lowThresh) {
+        result.descents++
+        result.descentSegments.push({ startIdx: descStart, endIdx: i })
+        wasHigh = false
+        descStart = -1
+      }
     }
   }
-  if (descentStart >= 0) descentSegments.push({ startIdx: descentStart, endIdx: points.length - 1 })
+
+  // Ascent detection: aircraft must go below 250 AGL, then climb above
+  // 800 AGL. The segment spans from the low point to where it passes 800.
+  // This filters out shallow excursions that never get truly low.
+  const LOW_AGL = 250
+  const HIGH_AGL = 800
+  const lowThresh = elev + LOW_AGL
+  const highThresh = elev + HIGH_AGL
+  let wentLow = false, ascentStart = -1
+  for (let i = 0; i < points.length; i++) {
+    const alt = points[i][2]
+    if (alt < lowThresh) {
+      wentLow = true
+      ascentStart = ascentStart < 0 ? i : ascentStart
+    } else if (wentLow && alt > highThresh) {
+      result.ascents++
+      result.ascentSegments.push({ startIdx: ascentStart, endIdx: i })
+      wentLow = false
+      ascentStart = -1
+    }
+  }
+
+  // Phase classification
   const firstLow = points[0][2] < threshold
   const lastLow = points[points.length - 1][2] < threshold
-  let phase = 'overflight'
-  if (firstLow && lastLow && descents >= 2) phase = 'pattern'
-  else if (firstLow && !lastLow) phase = 'departure'
-  else if (!firstLow && lastLow) phase = 'arrival'
-  else if (firstLow && lastLow) phase = 'pattern'
-  return { phase, descents, descentSegments, threshold }
+  if (firstLow && lastLow && result.descents >= 2) result.phase = 'pattern'
+  else if (firstLow && !lastLow) result.phase = 'departure'
+  else if (!firstLow && lastLow) result.phase = 'arrival'
+  else if (!firstLow && !lastLow) result.phase = 'overflight'
+  else result.phase = 'pattern'
+  return result
 }
 
 const PHASE_COLOR = {
-  pattern: '#f59e0b',    // amber
-  arrival: '#3b82f6',    // blue
-  departure: '#22c55e',  // green
-  overflight: '#6b7280', // gray
+  pattern: '#f59e0b',
+  arrival: '#3b82f6',
+  departure: '#22c55e',
+  overflight: '#6b7280',
 }
 
+// ─── Component ──────────────────────────────────────────────────────────────
 export default function DescentTest() {
   const [data, setData] = useState(null)
   const [selected, setSelected] = useState(new Set(TEST_TRACKS.map(t => t.src)))
+  const [showDescents, setShowDescents] = useState(true)
+  const [showAscents, setShowAscents] = useState(true)
 
+  // Only load 2026 — all test tracks are from that year.
   useEffect(() => {
-    Promise.all(
-      ['2023', '2024', '2025', '2026'].map(y =>
-        fetch(`/tracks_${y}.json`).then(r => r.ok ? r.json() : { tracks: [] }).catch(() => ({ tracks: [] }))
-      )
-    ).then(results => setData({ tracks: results.flatMap(d => d.tracks || []) }))
+    fetch('/tracks_2026.json')
+      .then(r => r.ok ? r.json() : { tracks: [] })
+      .then(d => setData(d))
+      .catch(() => setData({ tracks: [] }))
   }, [])
 
   const tracks = useMemo(() => {
@@ -70,118 +146,165 @@ export default function DescentTest() {
     return TEST_TRACKS.map(tt => {
       const t = data.tracks.find(x => x.src === tt.src)
       if (!t) return null
-      const cls = classifyPhase(t.points)
-      return { ...tt, track: t, ...cls }
+      return { ...tt, track: t, ...classifyTrack(t.points) }
     }).filter(Boolean)
   }, [data])
 
   return (
-    <div className="h-full flex">
-      <aside className="w-80 border-r border-white/10 p-3 overflow-y-auto space-y-3">
-        <h2 className="text-sm font-semibold text-white/80">Descent Detection Test</h2>
-        <div className="text-[9px] text-white/40 italic">
-          Threshold: field elev ({KBDU_ELEV} ft) + 300 ft = {KBDU_ELEV + 300} ft MSL.
-          A "descent" = aircraft drops below this after being above it.
+    <div className="h-full flex" style={{ background: '#0b1220', color: '#e5e7eb' }}>
+      <aside className="w-80 border-r border-white/10 p-3 overflow-y-auto space-y-3 text-sm">
+        <h2 className="text-sm font-semibold">Descent / Ascent Test</h2>
+
+        <div className="flex gap-2">
+          <label className="flex items-center gap-1 text-xs cursor-pointer">
+            <input type="checkbox" checked={showDescents} onChange={e => setShowDescents(e.target.checked)} />
+            <span className="text-red-400">Descents</span>
+          </label>
+          <label className="flex items-center gap-1 text-xs cursor-pointer">
+            <input type="checkbox" checked={showAscents} onChange={e => setShowAscents(e.target.checked)} />
+            <span className="text-green-400">Ascents</span>
+          </label>
         </div>
+
+        <div className="text-[9px] text-white/40 italic">
+          AGL threshold: {AGL_THRESHOLD} ft above nearest airport field elevation.
+          Red = descent below threshold. Green = ascent above threshold.
+        </div>
+
         {tracks.map(t => (
-          <div key={t.src} className="border border-white/10 rounded p-2">
+          <div key={t.src} className="border border-white/10 rounded p-2 space-y-1">
             <label className="flex items-center gap-2 cursor-pointer">
               <input
                 type="checkbox"
                 checked={selected.has(t.src)}
                 onChange={() => setSelected(s => {
-                  const n = new Set(s)
-                  if (n.has(t.src)) n.delete(t.src); else n.add(t.src)
-                  return n
+                  const n = new Set(s); n.has(t.src) ? n.delete(t.src) : n.add(t.src); return n
                 })}
               />
               <div>
-                <div className="text-xs font-semibold" style={{ color: PHASE_COLOR[t.phase] || '#fff' }}>
+                <span className="text-xs font-semibold" style={{ color: PHASE_COLOR[t.phase] }}>
                   {t.label}
-                </div>
-                <div className="text-[10px] text-white/60">
-                  {t.track.call} · {t.track.type} · {t.track.points.length} pts
-                </div>
+                </span>
+                <span className="text-[10px] text-white/50 ml-1">
+                  {t.track.call} · {t.track.type}
+                </span>
               </div>
             </label>
-            <div className="mt-1 flex gap-3 text-[10px]">
-              <span className="text-white/50">
+            <div className="flex gap-3 text-[10px] text-white/60">
+              <span>
                 phase: <span className="font-semibold" style={{ color: PHASE_COLOR[t.phase] }}>{t.phase}</span>
               </span>
-              <span className="text-white/50">
-                descents: <span className="font-mono text-amber-300">{t.descents}</span>
-              </span>
+              <span>near: {t.nearestAirport} ({t.fieldElev} ft)</span>
             </div>
-            <div className="text-[9px] text-white/40 mt-0.5">
-              alt: {Math.min(...t.track.points.map(p => p[2]))} – {Math.max(...t.track.points.map(p => p[2]))} ft ·
-              {' '}{t.descentSegments.length} descent segments
+            <div className="flex gap-3 text-[10px]">
+              <span className="text-red-400">{t.descents} descents</span>
+              <span className="text-green-400">{t.ascents} ascents</span>
+              <span className="text-white/40">{t.track.points.length} pts</span>
+            </div>
+            <div className="text-[9px] text-white/40">
+              AGL: {Math.round(t.aglMin)}–{Math.round(t.aglMax)} ft ·
+              MSL: {Math.min(...t.track.points.map(p => p[2]))}–{Math.max(...t.track.points.map(p => p[2]))} ft
             </div>
           </div>
         ))}
-        {!data && <div className="text-xs text-white/50 animate-pulse">Loading tracks...</div>}
+        {!data && <div className="text-xs text-white/50 animate-pulse">Loading 2026 tracks...</div>}
+        {data && tracks.length === 0 && <div className="text-xs text-red-400">No test tracks found in data</div>}
       </aside>
+
       <div className="flex-1 relative">
         <MapContainer center={KBDU} zoom={12} className="h-full w-full">
           <TileLayer
             attribution="&copy; OpenStreetMap"
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
-          {/* Threshold circle — 300 ft AGL ring is not geographic but we show
-              the field reference point */}
-          <Circle
-            center={KBDU}
-            radius={100}
-            pathOptions={{ color: '#ef4444', weight: 2, fill: true, fillOpacity: 0.3 }}
-          >
-            <Tooltip permanent direction="right" offset={[10, 0]}>
-              <span className="text-[10px]">KBDU {KBDU_ELEV} ft</span>
-            </Tooltip>
-          </Circle>
+
+          {/* Airport markers with field elevation */}
+          {AIRPORTS.map(ap => (
+            <CircleMarker
+              key={ap.code}
+              center={[ap.lat, ap.lon]}
+              radius={5}
+              pathOptions={{ color: '#22d3ee', weight: 1, fillOpacity: 0.5 }}
+            >
+              <Tooltip permanent direction="right" offset={[8, 0]}>
+                <span className="text-[9px] font-mono">{ap.code} {ap.elev}ft</span>
+              </Tooltip>
+            </CircleMarker>
+          ))}
 
           {/* Noise zones */}
           {NOISE_ZONES.map((z, i) => (
             <Polyline
               key={`zone-${i}`}
               positions={z.polygon}
-              pathOptions={{ color: '#7e22ce', weight: 1, opacity: 0.4, dashArray: '4 4' }}
+              pathOptions={{ color: '#7e22ce', weight: 1, opacity: 0.3, dashArray: '4 4' }}
             />
           ))}
 
-          {/* Track polylines — color by phase, descent segments highlighted */}
+          {/* Tracks */}
           {tracks.filter(t => selected.has(t.src)).map(t => {
             const pts = t.track.points
             const ll = pts.map(p => [p[0], p[1]])
-            const phaseColor = PHASE_COLOR[t.phase] || '#888'
+            const color = PHASE_COLOR[t.phase] || '#888'
             return (
-              <div key={t.src}>
-                {/* Full track in phase color */}
+              <span key={t.src}>
+                {/* Full track — thin, phase-colored */}
                 <Polyline
                   positions={ll}
-                  pathOptions={{ color: phaseColor, weight: 2, opacity: 0.5 }}
+                  pathOptions={{ color, weight: 2, opacity: 0.4 }}
                 >
                   <Tooltip sticky>
                     <div className="text-[10px]">
                       <div className="font-semibold">{t.track.call} · {t.track.type}</div>
-                      <div>phase: {t.phase} · {t.descents} descents</div>
+                      <div>{t.phase} · {t.descents}↓ {t.ascents}↑ · AGL {Math.round(t.aglMin)}–{Math.round(t.aglMax)}</div>
                     </div>
                   </Tooltip>
                 </Polyline>
-                {/* Descent segments in red, fat */}
-                {t.descentSegments.map((seg, si) => (
-                  <Polyline
-                    key={`desc-${si}`}
-                    positions={pts.slice(seg.startIdx, seg.endIdx + 1).map(p => [p[0], p[1]])}
-                    pathOptions={{ color: '#ef4444', weight: 5, opacity: 0.8 }}
-                  >
-                    <Tooltip sticky>
-                      <div className="text-[10px]">
-                        Descent #{si + 1} · {seg.endIdx - seg.startIdx} pts ·
-                        {' '}{pts[seg.startIdx][2]}→{pts[seg.endIdx][2]} ft
-                      </div>
-                    </Tooltip>
-                  </Polyline>
-                ))}
-              </div>
+
+                {/* Descent segments — red, fat */}
+                {showDescents && t.descentSegments.map((seg, si) => {
+                  const segPts = pts.slice(seg.startIdx, seg.endIdx + 1)
+                  const minAgl = Math.min(...segPts.map(p => p[2] - t.fieldElev))
+                  return (
+                    <Polyline
+                      key={`d-${si}`}
+                      positions={segPts.map(p => [p[0], p[1]])}
+                      pathOptions={{ color: '#ef4444', weight: 5, opacity: 0.8 }}
+                    >
+                      <Tooltip sticky>
+                        <div className="text-[10px]">
+                          <span className="text-red-400 font-semibold">Descent #{si + 1}</span>
+                          {' · '}{segPts.length} pts
+                          {' · '}{pts[seg.startIdx][2]}→{pts[seg.endIdx][2]} MSL
+                          {' · min AGL '}{Math.round(minAgl)} ft
+                        </div>
+                      </Tooltip>
+                    </Polyline>
+                  )
+                })}
+
+                {/* Ascent segments — green, fat */}
+                {showAscents && t.ascentSegments.map((seg, si) => {
+                  const segPts = pts.slice(seg.startIdx, seg.endIdx + 1)
+                  const maxAgl = Math.max(...segPts.map(p => p[2] - t.fieldElev))
+                  return (
+                    <Polyline
+                      key={`a-${si}`}
+                      positions={segPts.map(p => [p[0], p[1]])}
+                      pathOptions={{ color: '#22c55e', weight: 5, opacity: 0.7 }}
+                    >
+                      <Tooltip sticky>
+                        <div className="text-[10px]">
+                          <span className="text-green-400 font-semibold">Ascent #{si + 1}</span>
+                          {' · '}{segPts.length} pts
+                          {' · '}{pts[seg.startIdx][2]}→{pts[seg.endIdx][2]} MSL
+                          {' · max AGL '}{Math.round(maxAgl)} ft
+                        </div>
+                      </Tooltip>
+                    </Polyline>
+                  )
+                })}
+              </span>
             )
           })}
         </MapContainer>

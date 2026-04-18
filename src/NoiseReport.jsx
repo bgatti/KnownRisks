@@ -639,7 +639,7 @@ export function NoiseStudio() {
           // Invisible wider hit target per-segment
           const hit = L.polyline(latlngs, {
             color: '#ffffff',
-            weight: weight + 14,
+            weight: weight + 20,
             opacity: 0,
             lineCap: 'round',
             lineJoin: 'round',
@@ -852,23 +852,27 @@ export function NoiseStudio() {
     tryDraw()
   }, [rawCoords, reportOpen])
 
-  /* ── Fetch ALL nearby tracks when we have browser coords ─────────── */
+  /* ── Fetch ALL nearby tracks (initial + refresh every 30s) ────────── */
   useEffect(() => {
     if (!rawCoords || rawCoords.source === 'ip') { setNearbyTracks([]); return }
     const ctrl = new AbortController()
-    fetchNearbyTracks({
-      lat: rawCoords.lat,
-      lng: rawCoords.lng,
-      hours: 2,
-      limit: 50,
-      signal: ctrl.signal,
-    })
-      .then((data) => {
-        if (ctrl.signal.aborted) return
-        setNearbyTracks(data.tracks || [])
+    const load = () => {
+      fetchNearbyTracks({
+        lat: rawCoords.lat,
+        lng: rawCoords.lng,
+        hours: 2,
+        limit: 50,
+        signal: ctrl.signal,
       })
-      .catch(() => {})
-    return () => ctrl.abort()
+        .then((data) => {
+          if (ctrl.signal.aborted) return
+          setNearbyTracks(data.tracks || [])
+        })
+        .catch(() => {})
+    }
+    load()
+    const id = setInterval(load, 30000)
+    return () => { ctrl.abort(); clearInterval(id) }
   }, [rawCoords?.lat, rawCoords?.lng, rawCoords?.source])
 
   /* ── Draw nearby tracks (clean + offense) with time-based opacity ── */
@@ -916,7 +920,7 @@ export function NoiseStudio() {
         })
         const hit = L.polyline(latlngs, {
           color: '#ffffff',
-          weight: weight + 16,
+          weight: weight + 20,
           opacity: 0,
           lineCap: 'round', lineJoin: 'round',
           interactive: true,
