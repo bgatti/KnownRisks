@@ -1404,40 +1404,22 @@ export function NoiseStudio() {
 
       <div ref={containerRef} className="absolute inset-0" />
 
-      {/* DFAID back-link + airport picker — top-left overlay */}
-      <div className="absolute top-4 left-4 z-[1040] flex items-center gap-2 pointer-events-auto">
-        <a
-          href="/frnaa"
-          title="Back to Airport Impact District"
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-950/80 backdrop-blur-md border border-white/10 hover:border-sky-400/50 hover:bg-slate-950/90 transition-colors group"
+      {/* Top-right: identity + my reports */}
+      <div className="absolute top-2 right-2 md:top-4 md:right-4 z-[1040] flex items-center gap-1.5 pointer-events-auto">
+        <IdentityChip identity={identity} onEdit={() => setIdentityModalOpen(true)} />
+        <button
+          onClick={() => setComplaintsPanelOpen(true)}
+          className="relative flex items-center gap-1 rounded-md bg-black/60 backdrop-blur-md hover:bg-white/10 border border-white/10 px-2 py-1 text-[10px] text-neutral-300"
+          title="My reports"
         >
-          <div className="w-8 h-8 rounded-md bg-gradient-to-br from-emerald-500 to-sky-600 flex items-center justify-center text-white font-black text-[10px] shadow-lg">
-            AID
-          </div>
-          <div className="text-left leading-tight">
-            <div className="text-white text-[11px] font-bold group-hover:text-sky-300 transition-colors">Airport Impact</div>
-            <div className="text-slate-400 text-[9px] uppercase tracking-wider">← back to district</div>
-          </div>
-        </a>
-        <div className="px-3 py-2 rounded-lg bg-slate-950/80 backdrop-blur-md border border-white/10">
-          <div className="text-slate-500 text-[9px] uppercase tracking-wider font-semibold">Viewing</div>
-          <select
-            value={FALLBACK.airport?.icao || DEFAULT_AIRPORT}
-            onChange={(e) => {
-              const next = e.target.value
-              const url = new URL(window.location.href)
-              url.searchParams.set('airport', next)
-              window.location.href = url.toString()
-            }}
-            className="bg-transparent text-white font-bold text-xs outline-none cursor-pointer"
-          >
-            {Object.values(DFAID_AIRPORTS).map((a) => (
-              <option key={a.icao} value={a.icao} className="bg-slate-900">
-                {a.icao} · {a.name} — {a.city}
-              </option>
-            ))}
-          </select>
-        </div>
+          <IconHistory size={12} />
+          <span className="hidden md:inline">My reports</span>
+          {(myComplaints.length + sessionReports.length) > 0 && (
+            <span className="rounded-full bg-sky-400/80 text-[9px] text-white font-semibold px-1.5">
+              {myComplaints.length + sessionReports.length}
+            </span>
+          )}
+        </button>
       </div>
 
       {/* Hover pill over a flight track */}
@@ -1494,22 +1476,7 @@ export function NoiseStudio() {
           <div className="pointer-events-auto bg-black/60 backdrop-blur-md border border-white/10 rounded-lg px-2.5 py-1.5 md:px-4 md:py-2.5 shadow-2xl">
             <p className="text-[9px] md:text-[10px] uppercase tracking-[0.2em] text-neutral-500">Aircraft Noise</p>
             <h1 className="text-sm md:text-base font-semibold text-neutral-100">Noise Report</h1>
-            <div className="hidden md:flex mt-2 items-center gap-1.5">
-              <IdentityChip identity={identity} onEdit={() => setIdentityModalOpen(true)} />
-              <button
-                onClick={() => setComplaintsPanelOpen(true)}
-                className="relative flex items-center gap-1 rounded-md bg-white/5 hover:bg-white/10 border border-white/10 px-2 py-1 text-[10px] text-neutral-300"
-                title="My complaints"
-              >
-                <IconHistory size={12} />
-                My reports
-                {(myComplaints.length + sessionReports.length) > 0 && (
-                  <span className="ml-0.5 rounded-full bg-sky-400/80 text-[9px] text-white font-semibold px-1.5">
-                    {myComplaints.length + sessionReports.length}
-                  </span>
-                )}
-              </button>
-            </div>
+            {/* Identity + My reports moved to top-right */}
           </div>
           {/* LocationCard hidden — location auto-requests silently on load.
               Precision defaults to precise. No user interaction needed. */}
@@ -1569,6 +1536,19 @@ export function NoiseStudio() {
             }
             <IconArrowRight size={14} />
           </button>
+          {reportSegments.length > 0 && (
+            <button
+              onClick={() => {
+                setReportSegments([])
+                for (const p of selectedOverlaysRef.current) p.remove()
+                selectedOverlaysRef.current = []
+              }}
+              className="pointer-events-auto rounded-full bg-black/70 backdrop-blur-md border border-white/15 text-neutral-300 hover:text-white text-[11px] px-3 py-2"
+            >
+              <IconX size={12} className="inline mr-1" />
+              Clear
+            </button>
+          )}
         </div>
       )}
 
