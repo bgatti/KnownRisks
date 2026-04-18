@@ -290,14 +290,30 @@ const IMPACT_ZERO_ALT_FT = 8000 // MSL — above this, an aircraft contributes n
 //   hasDescents: boolean — any descent below 300 ft AGL of the track's min alt
 //   descentCount: number — how many distinct descents below the threshold
 //   phases: 'departure' | 'arrival' | 'pattern' | 'overflight' | null
+// Field elevations for the Front Range airports (MSL feet).
+const AIRPORT_ELEVATIONS = {
+  KBDU: 5288, KBJC: 5673, KEIK: 5130, KLMO: 5055, KAPA: 5885, KGXY: 4697,
+}
+
 function classifyTrackPhases(points) {
   const result = { depDir: null, hasDescents: false, descentCount: 0, phase: null }
   if (!points || points.length < 10) return result
 
-  // Find the track's floor altitude (proxy for field elevation).
-  let minAlt = Infinity
-  for (const p of points) if (p[2] < minAlt) minAlt = p[2]
-  const DESCENT_AGL = 300 // ft above track-floor = "near the ground"
+  // Use the nearest airport's field elevation so overflights at 8000 ft
+  // don't falsely register as "descents." Find the nearest airport to the
+  // track's lowest point and use its published field elevation.
+  let minAlt = Infinity, minPt = points[0]
+  for (const p of points) { if (p[2] < minAlt) { minAlt = p[2]; minPt = p } }
+  let bestElev = 5288 // default KBDU
+  let bestDist = Infinity
+  for (const [code, elev] of Object.entries(AIRPORT_ELEVATIONS)) {
+    const ap = NEARBY_AIRPORTS.find(a => a.code === code)
+    if (!ap) continue
+    const d = Math.hypot((minPt[0] - ap.lat) * 60, (minPt[1] - ap.lon) * 45)
+    if (d < bestDist) { bestDist = d; bestElev = elev }
+  }
+  const DESCENT_AGL = 300 // ft above field elevation = "near the ground"
+  const fieldElev = bestElev
 
   // Scan for departure direction (first sustained climb ≥200 ft)
   for (let i = 0; i < points.length - 5; i++) {
@@ -672,7 +688,14 @@ function MapPage() {
   const [noiseStats, setNoiseStats] = useState(null) // { perTail, cube, years, bases, schools }
   const [serverTracks, setServerTracks] = useState(null) // { tracks, total }
   const [serverLoading, setServerLoading] = useState(false)
-  const useServerApi = true // toggle for DB-backed mode
+  // DB-backed mode: auto-detect by checking if the API responds.
+  // On local dev (vite), there's no /api/noise backend → falls back to files.
+  const [useServerApi, setUseServerApi] = useState(false)
+  useEffect(() => {
+    fetch('/api/noise/stats').then(r => {
+      if (r.ok) setUseServerApi(true)
+    }).catch(() => {})
+  }, [])
   const [schoolsByTail, setSchoolsByTail] = useState(new Map())
   const [compose, setCompose] = useState(null) // { to, subject, body, school, tail }
 

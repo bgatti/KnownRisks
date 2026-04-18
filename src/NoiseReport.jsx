@@ -297,6 +297,9 @@ export function NoiseStudio() {
   // Nearby tracks (all overflights, not just offenses)
   const [nearbyTracks, setNearbyTracks] = useState([])
 
+  // The segment the user hovered/tapped before opening the report wizard
+  const [hoveredSegment, setHoveredSegment] = useState(null)
+
   // Wizard
   const [reportOpen, setReportOpen] = useState(false)
   const [step, setStep] = useState(1)
@@ -496,15 +499,42 @@ export function NoiseStudio() {
   }, [activeList])
 
   /* ── Shared hover handler factory (used by offense + nearby draws) ─ */
-  const makeHoverHandlers = (tail, lastSeenMs) => {
+  const crosshairRef = useRef(null)
+  const makeHoverHandlers = (tail, lastSeenMs, segInfo) => {
+    // segInfo: { klass, zone, points, type }
     const showHover = (e) => {
       if (hoverHideRef.current) { clearTimeout(hoverHideRef.current); hoverHideRef.current = null }
       const oe = e.originalEvent || e
-      setHoverCard({ tail, x: oe.clientX, y: oe.clientY, lastSeenMs })
+      // Find the nearest point in the segment to the clicked map location
+      let nearestPt = segInfo?.points?.[0] || null
+      if (segInfo?.points && e.latlng) {
+        let bestD = Infinity
+        for (const p of segInfo.points) {
+          const d = Math.abs(p[0] - e.latlng.lat) + Math.abs(p[1] - e.latlng.lng)
+          if (d < bestD) { bestD = d; nearestPt = p }
+        }
+      }
+      setHoverCard({ tail, x: oe.clientX, y: oe.clientY, lastSeenMs, ...segInfo, nearestPt })
+      // Draw crosshair at nearest point
+      if (crosshairRef.current) { crosshairRef.current.remove(); crosshairRef.current = null }
+      if (nearestPt && window.L && mapRef.current) {
+        crosshairRef.current = window.L.circleMarker([nearestPt[0], nearestPt[1]], {
+          radius: 8,
+          color: segInfo?.klass ? (KLASS_COLORS[segInfo.klass] || '#fb923c') : '#fb923c',
+          weight: 3,
+          fillColor: '#000',
+          fillOpacity: 0.5,
+          interactive: false,
+          className: 'crosshair-marker',
+        }).addTo(mapRef.current)
+      }
     }
     const hideHover = () => {
       if (hoverHideRef.current) clearTimeout(hoverHideRef.current)
-      hoverHideRef.current = setTimeout(() => setHoverCard(null), 220)
+      hoverHideRef.current = setTimeout(() => {
+        setHoverCard(null)
+        if (crosshairRef.current) { crosshairRef.current.remove(); crosshairRef.current = null }
+      }, 220)
     }
     return { showHover, hideHover }
   }
@@ -537,7 +567,10 @@ export function NoiseStudio() {
           for (const p of seg.points) {
             if (typeof p[3] === 'number' && p[3] > segLastMs) segLastMs = p[3]
           }
-          const { showHover, hideHover } = makeHoverHandlers(tail, segLastMs || null)
+          const type = (activeList.find((a) => a.tail === tail))?.type || data.type || ''
+          const { showHover, hideHover } = makeHoverHandlers(tail, segLastMs || null, {
+            klass: seg.klass, zone: seg.zone, points: seg.points, type,
+          })
           const color = KLASS_COLORS[seg.klass] || 'rgba(200,200,200,0.7)'
           const baseWeight = seg.klass === 'red' ? 6 : seg.klass === 'orange' ? 5.5 : seg.klass === 'yellow' ? 5 : 3.5
           const weight = selectedTail === tail ? baseWeight + 1.5 : baseWeight
@@ -790,7 +823,9 @@ export function NoiseStudio() {
         }).addTo(map)
 
         // Hit target for hover/click — works on mobile (tap) too
-        const { showHover, hideHover } = makeHoverHandlers(track.tail, segLastMs || null)
+        const { showHover, hideHover } = makeHoverHandlers(track.tail, segLastMs || null, {
+          klass: seg.klass, zone: seg.zone, points: seg.points, type: track.type || '',
+        })
         const hit = L.polyline(latlngs, {
           color: '#ffffff',
           weight: weight + 16,
@@ -1017,6 +1052,13 @@ export function NoiseStudio() {
           }
         : null,
       nearestFlightPoint: nearestSegPoint,
+      reportedSegment: hoveredSegment ? {
+        klass: hoveredSegment.klass,
+        zone: hoveredSegment.zone,
+        type: hoveredSegment.type,
+        nearestPt: hoveredSegment.nearestPt,
+        points: hoveredSegment.points,
+      } : null,
       score: { total: score.total, max: score.max, tier, breakdown: score.breakdown },
       media: {
         audio: audioBlob ? { bytes: audioBlob.size, type: audioBlob.type } : null,
@@ -1163,6 +1205,9 @@ export function NoiseStudio() {
                   drop-shadow(0 5px 9px rgba(0,0,0,0.65));
           cursor: pointer;
         }
+        .crosshair-marker {
+          filter: drop-shadow(0 0 6px rgba(251,146,60,0.8));
+        }
         .leaflet-overlay-pane svg path.area-ring { animation: areaRingBreathe 3.8s ease-in-out infinite; }
         @keyframes areaRingBreathe {
           0%,100% { stroke-opacity: 0.4; stroke-width: 1.25; }
@@ -1219,54 +1264,62 @@ export function NoiseStudio() {
       </div>
 
       {/* Hover pill over a flight track */}
-      {hoverCard && (
-        <div
-          className="absolute z-[1050] pointer-events-auto"
-          style={{
-            left: hoverCard.x,
-            top: hoverCard.y,
-            transform: 'translate(-50%, calc(-100% - 14px))',
-          }}
-          onMouseEnter={() => {
-            if (hoverHideRef.current) { clearTimeout(hoverHideRef.current); hoverHideRef.current = null }
-          }}
-          onMouseLeave={() => {
-            hoverHideRef.current = setTimeout(() => setHoverCard(null), 160)
-          }}
-        >
-          <button
-            onClick={() => {
-              const match = activeList.find((a) => a.tail === hoverCard.tail)
-              if (match) setSelectedExcursion(match)
-              setHoverCard(null)
-              openReport('excursion')
-            }}
-            className="group flex items-center gap-2 rounded-full bg-gradient-to-r from-rose-500 to-amber-500 text-white text-xs font-semibold pl-3 pr-4 py-2 shadow-[0_8px_24px_rgba(244,63,94,0.55)] border border-white/15 whitespace-nowrap"
-          >
-            <IconAlertTriangle size={14} />
-            Report this Noise Excursion
-            {(() => {
-              const match = activeList.find((a) => a.tail === hoverCard.tail)
-              const ago = hoverCard.lastSeenMs ? formatAgo(hoverCard.lastSeenMs) : null
-              return (
-                <span className="text-[10px] text-white/80">
-                  {match && `· ${match.type}`}
-                  {ago && ` · ${ago}`}
-                </span>
-              )
-            })()}
-          </button>
+      {hoverCard && (() => {
+        const isExcursion = !!hoverCard.klass
+        const ago = hoverCard.lastSeenMs ? formatAgo(hoverCard.lastSeenMs) : null
+        const pillBg = isExcursion
+          ? 'bg-gradient-to-r from-rose-500 to-amber-500 shadow-[0_8px_24px_rgba(244,63,94,0.55)]'
+          : 'bg-gradient-to-r from-orange-400 to-amber-400 shadow-[0_8px_24px_rgba(251,146,60,0.55)]'
+        const arrowColor = isExcursion ? 'rgb(251,146,60)' : 'rgb(251,191,36)'
+        return (
           <div
-            className="absolute left-1/2 -translate-x-1/2 w-0 h-0"
+            className="absolute z-[1050] pointer-events-auto"
             style={{
-              top: '100%',
-              borderLeft: '6px solid transparent',
-              borderRight: '6px solid transparent',
-              borderTop: '6px solid rgb(251,146,60)',
+              left: hoverCard.x,
+              top: hoverCard.y,
+              transform: 'translate(-50%, calc(-100% - 14px))',
             }}
-          />
-        </div>
-      )}
+            onMouseEnter={() => {
+              if (hoverHideRef.current) { clearTimeout(hoverHideRef.current); hoverHideRef.current = null }
+            }}
+            onMouseLeave={() => {
+              hoverHideRef.current = setTimeout(() => {
+                setHoverCard(null)
+                if (crosshairRef.current) { crosshairRef.current.remove(); crosshairRef.current = null }
+              }, 160)
+            }}
+          >
+            <button
+              onClick={() => {
+                const match = activeList.find((a) => a.tail === hoverCard.tail)
+                if (match) setSelectedExcursion(match)
+                // Store the hovered segment for the report wizard mini-map
+                setHoveredSegment(hoverCard)
+                setHoverCard(null)
+                if (crosshairRef.current) { crosshairRef.current.remove(); crosshairRef.current = null }
+                openReport('excursion')
+              }}
+              className={`group flex items-center gap-2 rounded-full text-white text-xs font-semibold pl-3 pr-4 py-2 border border-white/15 whitespace-nowrap ${pillBg}`}
+            >
+              <IconAlertTriangle size={14} />
+              {isExcursion ? 'Report Noise Excursion' : 'Report this Flight'}
+              <span className="text-[10px] text-white/80">
+                {hoverCard.type && `· ${hoverCard.type}`}
+                {ago && ` · ${ago}`}
+              </span>
+            </button>
+            <div
+              className="absolute left-1/2 -translate-x-1/2 w-0 h-0"
+              style={{
+                top: '100%',
+                borderLeft: '6px solid transparent',
+                borderRight: '6px solid transparent',
+                borderTop: `6px solid ${arrowColor}`,
+              }}
+            />
+          </div>
+        )
+      })()}
 
       {/* Top header */}
       <header className="absolute top-0 left-0 right-0 z-[1000] p-2 md:p-4 pointer-events-none">
@@ -1406,6 +1459,8 @@ export function NoiseStudio() {
                       videoUrl={videoUrl}
                       selectedExcursion={selectedExcursion}
                       reportMode={reportMode}
+                      hoveredSegment={hoveredSegment}
+                      rawCoords={rawCoords}
                     />
                   )}
                 </>
@@ -1925,9 +1980,13 @@ function IdentifyStep({ activeList, activeStatus, typePhotos, selected, onSelect
   )
 }
 
-function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, videoUrl, selectedExcursion, reportMode }) {
+function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, videoUrl, selectedExcursion, reportMode, hoveredSegment, rawCoords }) {
   return (
     <>
+      {/* Mini-map showing the reported segment */}
+      {hoveredSegment?.points?.length > 1 && (
+        <SegmentMiniMap segment={hoveredSegment} userCoords={rawCoords} />
+      )}
       <Card title="Report Score" subtitle="Higher scores are prioritised for follow-up.">
         <div className="flex items-center gap-4">
           <div className="relative w-24 h-24 flex-shrink-0">
@@ -2287,6 +2346,57 @@ function CircularCaptureButton({
         </svg>
       )}
     </button>
+  )
+}
+
+function SegmentMiniMap({ segment, userCoords }) {
+  const ref = useRef(null)
+  const mapRef2 = useRef(null)
+  useEffect(() => {
+    const L = window.L
+    if (!L || !ref.current || mapRef2.current) return
+    const pts = segment.points.map((p) => [p[0], p[1]])
+    const bounds = L.latLngBounds(pts)
+    if (userCoords) bounds.extend([userCoords.lat, userCoords.lng])
+    const map = L.map(ref.current, {
+      center: bounds.getCenter(),
+      zoom: 13,
+      zoomControl: false,
+      attributionControl: false,
+      dragging: false,
+      scrollWheelZoom: false,
+      doubleClickZoom: false,
+      touchZoom: false,
+    })
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', { maxZoom: 17 }).addTo(map)
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png', { maxZoom: 17 }).addTo(map)
+    const color = segment.klass ? (KLASS_COLORS[segment.klass] || '#fb923c') : '#fb923c'
+    L.polyline(pts, { color, weight: 5, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }).addTo(map)
+    // Crosshair at nearest point
+    if (segment.nearestPt) {
+      L.circleMarker([segment.nearestPt[0], segment.nearestPt[1]], {
+        radius: 7, color, weight: 3, fillColor: '#000', fillOpacity: 0.5, interactive: false,
+      }).addTo(map)
+    }
+    // User location dot
+    if (userCoords) {
+      L.circleMarker([userCoords.lat, userCoords.lng], {
+        radius: 4, color: '#38bdf8', weight: 2, fillColor: '#38bdf8', fillOpacity: 0.8, interactive: false,
+      }).addTo(map)
+    }
+    map.fitBounds(bounds.pad(0.3))
+    mapRef2.current = map
+    return () => { map.remove(); mapRef2.current = null }
+  }, [segment, userCoords])
+
+  const label = segment.klass
+    ? `${segment.klass.toUpperCase()} excursion${segment.zone ? ' · ' + segment.zone : ''}`
+    : `Flight segment${segment.type ? ' · ' + segment.type : ''}`
+
+  return (
+    <Card title="Reported Segment" subtitle={label}>
+      <div ref={ref} className="w-full h-40 rounded-lg overflow-hidden border border-white/10" style={{ background: '#0a0a0a' }} />
+    </Card>
   )
 }
 
