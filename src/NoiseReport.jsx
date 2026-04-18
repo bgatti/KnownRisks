@@ -21,6 +21,7 @@ import {
 import {
   fetchActiveExcursions,
   fetchOffenseSegments,
+  fetchNearbyTracks,
   fetchMyComplaints,
   fetchMyReports,
   postComplaint,
@@ -272,6 +273,7 @@ export function NoiseStudio() {
   const mapRef = useRef(null)
   const areaRef = useRef(null)
   const tracesRef = useRef([])
+  const nearbyTracesRef = useRef([])
 
   // Location
   const [rawCoords, setRawCoords] = useState(null)
@@ -289,8 +291,11 @@ export function NoiseStudio() {
   const [segmentsByTail, setSegmentsByTail] = useState({}) // { [tail]: segmentsResponse }
 
   // Trace hover → floating "Report this excursion" pill
-  const [hoverCard, setHoverCard] = useState(null) // { tail, x, y }
+  const [hoverCard, setHoverCard] = useState(null) // { tail, x, y, lastSeenMs }
   const hoverHideRef = useRef(null)
+
+  // Nearby tracks (all overflights, not just offenses)
+  const [nearbyTracks, setNearbyTracks] = useState([])
 
   // Wizard
   const [reportOpen, setReportOpen] = useState(false)
@@ -691,36 +696,81 @@ export function NoiseStudio() {
     return () => ctrl.abort()
   }, [rawCoords, precision, crossStreet])
 
-  /* ── Draw location area ring on map ──────────────────────────────── */
+  // 4 NM audibility radius for GA aircraft at pattern altitude (~7408 meters)
+  const AUDIBLE_RADIUS_M = 4 * 1852
+
+  /* ── Draw audibility circle on map ──────────────────────────────── */
   useEffect(() => {
-    const L = window.L
-    const map = mapRef.current
-    if (!L || !map) return
     const tryDraw = () => {
       if (!window.L || !mapRef.current) { requestAnimationFrame(tryDraw); return }
       if (areaRef.current) { areaRef.current.remove(); areaRef.current = null }
       if (!rawCoords) return
-      // IP-based seed = large city-scale ring. Precise share = per-precision ring.
-      const opt = PRECISION_OPTIONS.find((o) => o.key === precision)
-      const radius = rawCoords.source === 'ip' ? 10000 : (opt?.radius ?? 300)
       areaRef.current = window.L.circle([rawCoords.lat, rawCoords.lng], {
-        radius,
+        radius: AUDIBLE_RADIUS_M,
         color: '#fafafa',
         weight: 2,
         opacity: 0.75,
         fillColor: '#ffffff',
-        fillOpacity: 0.13,
+        fillOpacity: 0.08,
         className: 'area-ring',
         interactive: false,
       }).addTo(mapRef.current)
       areaRef.current.bringToFront()
       if (!reportOpen) {
-        const zoom = rawCoords.source === 'ip' ? 11 : radius > 800 ? 13 : 15
-        mapRef.current.flyTo([rawCoords.lat, rawCoords.lng], zoom, { duration: 1 })
+        // Zoom to fit the audibility circle (IP or browser)
+        mapRef.current.flyTo([rawCoords.lat, rawCoords.lng], 11, { duration: 1 })
       }
     }
     tryDraw()
-  }, [rawCoords, precision, reportOpen])
+  }, [rawCoords, reportOpen])
+
+  /* ── Fetch ALL nearby tracks when we have browser coords ─────────── */
+  useEffect(() => {
+    if (!rawCoords || rawCoords.source === 'ip') { setNearbyTracks([]); return }
+    const ctrl = new AbortController()
+    fetchNearbyTracks({
+      lat: rawCoords.lat,
+      lng: rawCoords.lng,
+      hours: 2,
+      limit: 50,
+      signal: ctrl.signal,
+    })
+      .then((data) => {
+        if (ctrl.signal.aborted) return
+        setNearbyTracks(data.tracks || [])
+      })
+      .catch(() => {})
+    return () => ctrl.abort()
+  }, [rawCoords?.lat, rawCoords?.lng, rawCoords?.source])
+
+  /* ── Draw nearby (clean) tracks as subtle lines on the map ───────── */
+  useEffect(() => {
+    const L = window.L
+    const map = mapRef.current
+    if (!L || !map) return
+    for (const p of nearbyTracesRef.current) p.remove()
+    nearbyTracesRef.current = []
+    if (!nearbyTracks.length) return
+    for (const track of nearbyTracks) {
+      // Skip tracks that are already rendered by the offense draw effect
+      if (segmentsByTail[track.tail]) continue
+      for (const seg of track.segments || []) {
+        if (!seg.points || seg.points.length < 2) continue
+        const latlngs = seg.points.map((p) => [p[0], p[1]])
+        const color = seg.klass ? (KLASS_COLORS[seg.klass] || '#aaa') : 'rgba(255,255,255,0.3)'
+        const weight = seg.klass ? 3 : 1.5
+        const opacity = seg.klass ? 0.85 : 0.45
+        const line = L.polyline(latlngs, {
+          color, weight, opacity,
+          lineCap: 'round', lineJoin: 'round',
+          className: seg.klass ? 'flight-trace' : '',
+          interactive: false,
+        }).addTo(map)
+        nearbyTracesRef.current.push(line)
+      }
+    }
+    if (areaRef.current) areaRef.current.bringToFront()
+  }, [nearbyTracks, segmentsByTail])
 
   /* ── Displayed location text ─────────────────────────────────────── */
   const displayedLocation = useMemo(() => {
@@ -1108,9 +1158,28 @@ export function NoiseStudio() {
           </div>
           <div className="text-left leading-tight">
             <div className="text-white text-[11px] font-bold group-hover:text-sky-300 transition-colors">Airport Impact</div>
+            <div className="text-slate-400 text-[9px] uppercase tracking-wider">← back to district</div>
           </div>
         </a>
-        {/* Airport selector removed — the report page covers all airports */}
+        <div className="px-3 py-2 rounded-lg bg-slate-950/80 backdrop-blur-md border border-white/10">
+          <div className="text-slate-500 text-[9px] uppercase tracking-wider font-semibold">Viewing</div>
+          <select
+            value={FALLBACK.airport?.icao || DEFAULT_AIRPORT}
+            onChange={(e) => {
+              const next = e.target.value
+              const url = new URL(window.location.href)
+              url.searchParams.set('airport', next)
+              window.location.href = url.toString()
+            }}
+            className="bg-transparent text-white font-bold text-xs outline-none cursor-pointer"
+          >
+            {Object.values(DFAID_AIRPORTS).map((a) => (
+              <option key={a.icao} value={a.icao} className="bg-slate-900">
+                {a.icao} · {a.name} — {a.city}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {/* Hover pill over a flight track */}
@@ -1218,7 +1287,7 @@ export function NoiseStudio() {
 
       {/* Active excursions panel — floating tiles on mobile, sidebar on desktop */}
       <aside className="absolute z-[1000] pointer-events-auto
-        bottom-[4.5rem] left-2 max-w-[50vw] md:max-w-none md:bottom-auto md:top-24 md:left-4 md:right-auto md:w-56 md:max-h-[55vh]">
+        bottom-14 left-2 md:bottom-auto md:top-24 md:left-4 md:right-auto md:w-72 md:max-h-[60vh]">
         <ExcursionList
           activeList={activeList}
           activeStatus={activeStatus}
@@ -1231,7 +1300,7 @@ export function NoiseStudio() {
 
       {/* Bottom Report button — sits above the mobile excursion strip */}
       {!reportOpen && (
-        <div className="absolute bottom-4 md:bottom-8 left-0 right-0 z-[1000] flex justify-center pointer-events-none pb-[env(safe-area-inset-bottom)]">
+        <div className="absolute bottom-[3.75rem] md:bottom-8 left-0 right-0 z-[1000] flex justify-center pointer-events-none pb-[env(safe-area-inset-bottom)]">
           <button
             onClick={() => openReport(activeList.length ? 'excursion' : 'general')}
             className="pointer-events-auto group relative flex items-center gap-1.5 md:gap-3 rounded-full bg-gradient-to-r from-rose-500 to-amber-500 px-3.5 md:px-7 py-2 md:py-4 text-[11px] md:text-base font-semibold text-white shadow-[0_10px_40px_rgba(244,63,94,0.45)] hover:shadow-[0_10px_50px_rgba(244,63,94,0.65)] transition-all hover:scale-[1.02]"
@@ -1529,8 +1598,13 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
 
       {/* ─ Desktop: vertical sidebar list ─ */}
       <div className="hidden md:flex md:flex-col md:overflow-hidden bg-black/60 backdrop-blur-md border border-white/10 rounded-lg shadow-2xl">
-        <div className="px-2 py-1.5 border-b border-white/10">
-          <p className="text-[9px] uppercase tracking-[0.15em] text-neutral-500">Excursions</p>
+        <div className="px-3 py-2.5 border-b border-white/10">
+          <p className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">Active Excursions</p>
+          <p className="text-[11px] text-neutral-400">
+            {activeStatus === 'loading' && 'Loading…'}
+            {activeStatus === 'error' && <span className="text-rose-300">Feed unavailable</span>}
+            {activeStatus === 'ok' && `${activeList.length} aircraft · 2h`}
+          </p>
         </div>
         <ul className="overflow-y-auto">
           {activeStatus === 'ok' && items.length === 0 && (
@@ -1541,11 +1615,11 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
               <button
                 onClick={g.onClick}
                 className={[
-                  'w-full text-left px-2 py-1.5 flex items-center gap-2 transition-colors',
+                  'w-full text-left px-3 py-2.5 flex items-center gap-2.5 transition-colors',
                   g.anyActive ? 'bg-white/10' : 'hover:bg-white/5',
                 ].join(' ')}
               >
-                <div className="relative h-8 w-10 flex-shrink-0 rounded overflow-hidden bg-black/40 border border-white/10">
+                <div className="relative h-10 w-14 flex-shrink-0 rounded overflow-hidden bg-black/40 border border-white/10">
                   {typePhotos?.[g.type] ? (
                     <img src={typePhotos[g.type]} alt="" loading="lazy" className="absolute inset-0 w-full h-full object-cover" />
                   ) : (
@@ -1558,7 +1632,7 @@ function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, d
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center justify-between gap-2">
-                    <div className="text-xs font-medium text-neutral-100 truncate">{g.type}</div>
+                    <div className="text-sm font-medium text-neutral-100 truncate">{g.type}</div>
                     {g.nearestMeters != null && (
                       <div className="text-[11px] font-mono text-neutral-200 flex-shrink-0">
                         {formatMiles(g.nearestMeters)}
