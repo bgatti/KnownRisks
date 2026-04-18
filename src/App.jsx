@@ -890,7 +890,6 @@ function MapPage() {
   const [todAnimate, setTodAnimate] = useState(false)
   const [todAnimIdx, setTodAnimIdx] = useState(0)
   const [todCache, setTodCache] = useState(null)
-  const [dirFilter, setDirFilter] = useState('all') // 'all' | 'east' | 'west' | 'descents' | 'pattern' | 'arrival' | 'departure'
   const [originFilter, setOriginFilter] = useState('all') // 'all' | 'local' | 'transient'
   const [selectedTails, setSelectedTails] = useState([])
   const isSelected = (tail) => selectedTails.includes(tail)
@@ -1443,17 +1442,6 @@ function MapPage() {
       }
       if (originFilter === 'local' && !t.isLocal) return false
       if (originFilter === 'transient' && t.isLocal) return false
-      // Direction / phase filter.
-      if (dirFilter !== 'all') {
-        if (dirFilter === 'east' || dirFilter === 'west') {
-          if (t.depDir && t.depDir !== dirFilter) return false
-        } else if (dirFilter === 'descents') {
-          if (!t.hasDescents) return false
-        } else {
-          // phase filter: 'pattern', 'arrival', 'departure', 'overflight'
-          if (t.phase !== dirFilter) return false
-        }
-      }
       // Time-of-day filter: skip tracks that have no points in the window.
       // Tracks without timestamps pass through (they can't be filtered).
       if (todFilter && t.t0 != null) {
@@ -2289,29 +2277,6 @@ function MapPage() {
               <span className="w-6 text-[10px] tabular-nums text-right text-white/50">{impactOpacity.toFixed(1)}</span>
             </div>
           )}
-          <div className="flex items-center gap-1 flex-wrap">
-            {[
-              { id: 'all', label: 'All' },
-              { id: 'descents', label: 'Descents' },
-              { id: 'pattern', label: 'Pattern' },
-              { id: 'arrival', label: 'Arrival' },
-              { id: 'departure', label: 'Departure' },
-              { id: 'east', label: 'East' },
-              { id: 'west', label: 'West' },
-            ].map((d) => (
-              <button
-                key={d.id}
-                onClick={() => setDirFilter(d.id)}
-                className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors ${
-                  dirFilter === d.id
-                    ? 'border-cyan-400 text-cyan-200 bg-cyan-500/20'
-                    : 'border-white/20 text-white/50 hover:border-white/40 hover:text-white/70'
-                }`}
-              >
-                {d.label}
-              </button>
-            ))}
-          </div>
           <div className="flex items-center gap-1.5">
             <button
               onClick={() => { setTodFilter((v) => { if (v) setTodAnimate(false); return !v }); }}

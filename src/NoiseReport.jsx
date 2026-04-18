@@ -912,15 +912,16 @@ export function NoiseStudio() {
 
   /* ── Fetch ALL nearby tracks (initial + refresh every 30s) ────────── */
   useEffect(() => {
-    if (!rawCoords) { setNearbyTracks([]); return }
+    // Fetch all recent tracks regardless of coords (no server-side radius filter)
     const ctrl = new AbortController()
     const load = () => {
-      console.log('[noise-report] fetching nearby tracks at', rawCoords.lat, rawCoords.lng, 'source:', rawCoords.source)
+      // Don't pass lat/lon — the server's 4-mile radius filter is too
+      // tight when the user is several miles from the airport. Fetch all
+      // tracks in the time window and let client-side distance sort handle it.
+      console.log('[noise-report] fetching nearby tracks, coords:', rawCoords.lat, rawCoords.lng)
       fetchNearbyTracks({
-        lat: rawCoords.lat,
-        lng: rawCoords.lng,
         hours: 2,
-        limit: 15,
+        limit: 20,
         signal: ctrl.signal,
       })
         .then((data) => {
@@ -942,7 +943,8 @@ export function NoiseStudio() {
     }
     load()
     return () => { ctrl.abort() }
-  }, [rawCoords?.lat, rawCoords?.lng, rawCoords?.source])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []) // run once on mount — no coords dependency
 
   // Build a set of keys for segments already reported (from sessionReports).
   // Used to render those segments in blue + tooltip.
