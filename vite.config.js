@@ -2000,7 +2000,7 @@ function noiseApiPlugin() {
         }
       })
 
-      // GET /api/noise/tracks?year=X&base=X&school=X&violations_only=1&limit=500&offset=0
+      // GET /api/noise/tracks?year=X&base=X&school=X&violations_only=1&tng_only=1&limit=500&offset=0
       // Returns pre-banded tracks for map rendering. Each track includes
       // bands (colored polyline segments) — the client just renders them.
       // Payload: ~200-500KB for 500 tracks vs 60MB for all.
@@ -2009,12 +2009,14 @@ function noiseApiPlugin() {
         try {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const violationsOnly = u.searchParams.get('violations_only') === '1'
+          const tngOnly = u.searchParams.get('tng_only') === '1'
           const limit = Math.min(2000, Math.max(1, parseInt(u.searchParams.get('limit') || '500')))
           const offset = Math.max(0, parseInt(u.searchParams.get('offset') || '0'))
 
           const { where: baseWhere, params } = buildFilters(u, ['bands IS NOT NULL'])
           const extraConds = []
-          if (violationsOnly) extraConds.push('worst_class IS NOT NULL')
+          if (tngOnly) extraConds.push('seg_purple > 0')
+          else if (violationsOnly) extraConds.push('worst_class IS NOT NULL')
           const where = extraConds.length ? `${baseWhere} AND ${extraConds.join(' AND ')}` : baseWhere
 
           // Count total matching

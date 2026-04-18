@@ -830,6 +830,7 @@ function MapPage() {
     }
   }, [showHeatmap])
   const [onlyViolations, setOnlyViolations] = useState(false)
+  const [onlyTnG, setOnlyTnG] = useState(false)
   const [realImpact, setRealImpact] = useState(true)
   const [impactOpacity, setImpactOpacity] = useState(1.0)
   const [showPopDensity, setShowPopDensity] = useState(false)
@@ -939,7 +940,8 @@ function MapPage() {
     if (schoolFilter !== 'all') params.set('school', schoolFilter)
     if (purposeFilter !== 'all') params.set('purpose', purposeFilter)
     if (todFilter) { params.set('tod_start', todStart); params.set('tod_end', todEnd) }
-    if (onlyViolations) params.set('violations_only', '1')
+    if (onlyTnG) params.set('tng_only', '1')
+    else if (onlyViolations) params.set('violations_only', '1')
     params.set('limit', '500')
     params.set('_t', Date.now()) // cache bust
     fetch(`/api/noise/tracks?${params}`)
@@ -953,7 +955,7 @@ function MapPage() {
         console.error('[noise-api] tracks error:', e)
         setServerLoading(false)
       })
-  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter, onlyViolations, todFilter, todStart, todEnd, todAnimate])
+  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter, onlyViolations, onlyTnG, todFilter, todStart, todEnd, todAnimate])
 
   // --- Fallback: load all tracks from file for local dev ---
   useEffect(() => {
@@ -2182,7 +2184,8 @@ function MapPage() {
               { label: 'Heatmap', active: realImpact, toggle: () => setRealImpact((v) => !v) },
               { label: 'Population', active: showPopDensity, toggle: () => setShowPopDensity((v) => !v) },
               { label: 'Impact', active: showImpact, toggle: () => setShowImpact((v) => !v) },
-              { label: 'Violators', active: onlyViolations, toggle: () => setOnlyViolations((v) => !v) },
+              { label: 'Violators', active: onlyViolations, toggle: () => { setOnlyViolations((v) => !v); setOnlyTnG(false) } },
+              { label: 'T&G', active: onlyTnG, toggle: () => { setOnlyTnG((v) => !v); setOnlyViolations(false) } },
             ].map((b) => (
               <button
                 key={b.label}
@@ -2452,7 +2455,8 @@ function MapPage() {
               { label: 'Paths', active: showPaths, toggle: () => setShowPaths(v => !v) },
               { label: 'Zones', active: showZones, toggle: () => setShowZones(v => !v) },
               { label: 'Heatmap', active: realImpact, toggle: () => setRealImpact(v => !v) },
-              { label: 'Violators', active: onlyViolations, toggle: () => setOnlyViolations(v => !v) },
+              { label: 'Violators', active: onlyViolations, toggle: () => { setOnlyViolations(v => !v); setOnlyTnG(false) } },
+              { label: 'T&G', active: onlyTnG, toggle: () => { setOnlyTnG(v => !v); setOnlyViolations(false) } },
             ].map(b => (
               <button key={b.label} onClick={b.toggle}
                 className={`text-[10px] px-2 py-0.5 rounded-full border ${

@@ -476,10 +476,7 @@ export function NoiseStudio() {
   useEffect(() => {
     const ctrl = new AbortController()
     loadActive(ctrl.signal)
-    // Refresh every 30 s so report counts / notification state reflect
-    // submissions made by this tab or any other.
-    const id = setInterval(() => loadActive(ctrl.signal), 30000)
-    return () => { ctrl.abort(); clearInterval(id) }
+    return () => { ctrl.abort() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -943,8 +940,7 @@ export function NoiseStudio() {
         .catch(() => {})
     }
     load()
-    const id = setInterval(load, 30000)
-    return () => { ctrl.abort(); clearInterval(id) }
+    return () => { ctrl.abort() }
   }, [rawCoords?.lat, rawCoords?.lng, rawCoords?.source])
 
   // Build a set of keys for segments already reported (from sessionReports).
@@ -1772,12 +1768,7 @@ function LocationCard({ rawCoords, precision, setPrecision, displayedLocation, r
 }
 
 function ExcursionList({ activeList, activeStatus, selectedTail, onSelectTail, distanceByTail, typePhotos }) {
-  // Tick every 30s so "N mins ago" stays fresh without chasing the feed.
-  const [, setClock] = useState(0)
-  useEffect(() => {
-    const id = setInterval(() => setClock((c) => c + 1), 30000)
-    return () => clearInterval(id)
-  }, [])
+  // "N mins ago" updates on data refresh, no interval needed.
 
   const groups = useMemo(() => {
     const m = new Map()
