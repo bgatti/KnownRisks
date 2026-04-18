@@ -918,10 +918,10 @@ export function NoiseStudio() {
 
   /* ── Fetch ALL nearby tracks (initial + refresh every 30s) ────────── */
   useEffect(() => {
-    if (!rawCoords || rawCoords.source === 'ip') { setNearbyTracks([]); return }
+    if (!rawCoords) { setNearbyTracks([]); return }
     const ctrl = new AbortController()
     const load = () => {
-      console.log('[noise-report] fetching nearby tracks…')
+      console.log('[noise-report] fetching nearby tracks at', rawCoords.lat, rawCoords.lng, 'source:', rawCoords.source)
       fetchNearbyTracks({
         lat: rawCoords.lat,
         lng: rawCoords.lng,

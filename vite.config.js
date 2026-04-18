@@ -2101,14 +2101,23 @@ export default defineConfig({
     noiseReportsApiPlugin(),
     pilotApiPlugin(),
     !db.useDb && liveCapturePlugin(),
+    // On Railway, strip the @vite/client HMR script from HTML to prevent
+    // reload loops (the dev server WebSocket is unreachable via the proxy).
+    process.env.RAILWAY_ENVIRONMENT && {
+      name: 'strip-hmr-client',
+      transformIndexHtml(html) {
+        return html.replace(/<script[^>]*\/@vite\/client[^>]*><\/script>\s*/g, '')
+      },
+    },
   ].filter(Boolean),
   server: {
     port: parseInt(process.env.PORT || '5174'),
     allowedHosts: true,
     open: process.env.RAILWAY_ENVIRONMENT ? false : '/',
-    // Disable HMR on Railway — the WebSocket URL doesn't match the public
-    // domain, causing a connect → fail → reload loop (white screen flash).
+    // Disable HMR + warm-up on Railway — the WebSocket URL doesn't match
+    // the public domain, causing connect → fail → reload loops.
     hmr: process.env.RAILWAY_ENVIRONMENT ? false : undefined,
+    warmup: process.env.RAILWAY_ENVIRONMENT ? { clientFiles: [] } : undefined,
     headers: {
       'Cache-Control': 'no-store, no-cache, must-revalidate',
       'Pragma': 'no-cache',
