@@ -799,8 +799,9 @@ function MapPage() {
     if (schoolFilter !== 'all') params.set('school', schoolFilter)
     if (purposeFilter !== 'all') params.set('purpose', purposeFilter)
     if (todFilter) { params.set('tod_start', todStart); params.set('tod_end', todEnd) }
+    params.set('_t', Date.now()) // cache bust
     fetch(`/api/noise/stats?${params}`)
-      .then(r => r.ok ? r.json() : r.json().then(d => Promise.reject(d.error || r.status)))
+      .then(r => { if (!r.ok) throw new Error(`stats ${r.status}`); return r.json() })
       .then(data => {
         console.log('[noise-api] stats loaded:', data.perTail?.length, 'tails')
         setNoiseStats(data)
@@ -822,8 +823,9 @@ function MapPage() {
     if (todFilter) { params.set('tod_start', todStart); params.set('tod_end', todEnd) }
     if (onlyViolations) params.set('violations_only', '1')
     params.set('limit', '500')
+    params.set('_t', Date.now()) // cache bust
     fetch(`/api/noise/tracks?${params}`)
-      .then(r => r.ok ? r.json() : r.json().then(d => Promise.reject(d.error || r.status)))
+      .then(r => { if (!r.ok) throw new Error(`tracks ${r.status}`); return r.json() })
       .then(data => {
         console.log(`[noise-api] tracks loaded: ${data.tracks?.length}/${data.total}`)
         setServerTracks(data)
