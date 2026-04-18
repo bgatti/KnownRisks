@@ -2034,10 +2034,10 @@ function noiseApiPlugin() {
             FROM tracks
             WHERE ${where}
             ORDER BY
-              CASE WHEN seg_purple > 0 THEN 0
+              ${violationsOnly ? `CASE WHEN seg_purple > 0 THEN 0
                    WHEN worst_class = 'red' THEN 1
                    WHEN worst_class = 'orange' THEN 2
-                   ELSE 3 END,
+                   ELSE 3 END,` : ''}
               rand_key
             LIMIT $${pIdx + 1} OFFSET $${pIdx + 2}
           `
@@ -2104,6 +2104,9 @@ export default defineConfig({
     port: parseInt(process.env.PORT || '5174'),
     allowedHosts: true,
     open: process.env.RAILWAY_ENVIRONMENT ? false : '/',
+    // Disable HMR on Railway — the WebSocket URL doesn't match the public
+    // domain, causing a connect → fail → reload loop (white screen flash).
+    hmr: process.env.RAILWAY_ENVIRONMENT ? false : undefined,
     headers: {
       'Cache-Control': 'no-store, no-cache, must-revalidate',
       'Pragma': 'no-cache',
