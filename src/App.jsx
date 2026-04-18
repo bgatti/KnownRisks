@@ -313,79 +313,6 @@ function nearestAirport(lat, lon, maxNm = 3) {
 }
 const IMPACT_ZERO_ALT_FT = 8000 // MSL — above this, an aircraft contributes no impact
 
-// Classify a track's flight phases. Returns an object with:
-//   depDir: 'east' | 'west' | null — departure direction from initial climb
-//   hasDescents: boolean — any descent below 300 ft AGL of the track's min alt
-//   descentCount: number — how many distinct descents below the threshold
-//   phases: 'departure' | 'arrival' | 'pattern' | 'overflight' | null
-// Field elevations for the Front Range airports (MSL feet).
-const AIRPORT_ELEVATIONS = {
-  KBDU: 5288, KBJC: 5673, KEIK: 5130, KLMO: 5055, KAPA: 5885, KGXY: 4697,
-}
-
-function classifyTrackPhases(points) {
-  const result = { depDir: null, hasDescents: false, descentCount: 0, phase: null }
-  if (!points || points.length < 10) return result
-
-  // Use the nearest airport's field elevation so overflights at 8000 ft
-  // don't falsely register as "descents." Find the nearest airport to the
-  // track's lowest point and use its published field elevation.
-  let minAlt = Infinity, minPt = points[0]
-  for (const p of points) { if (p[2] < minAlt) { minAlt = p[2]; minPt = p } }
-  let bestElev = 5288 // default KBDU
-  let bestDist = Infinity
-  for (const [code, elev] of Object.entries(AIRPORT_ELEVATIONS)) {
-    const ap = AIRPORTS.find(a => a.code === code)
-    if (!ap) continue
-    const d = Math.hypot((minPt[0] - ap.lat) * 60, (minPt[1] - ap.lon) * 45)
-    if (d < bestDist) { bestDist = d; bestElev = elev }
-  }
-  const DESCENT_AGL = 300 // ft above field elevation = "near the ground"
-  const fieldElev = bestElev
-
-  // Scan for departure direction (first sustained climb ≥200 ft)
-  for (let i = 0; i < points.length - 5; i++) {
-    let climbing = true
-    for (let j = i + 1; j <= i + 5; j++) {
-      if (points[j][2] < points[j - 1][2] - 25) { climbing = false; break }
-    }
-    if (!climbing) continue
-    let end = i + 5
-    while (end < points.length - 1 && points[end + 1][2] >= points[end][2] - 25) end++
-    const altGain = points[end][2] - points[i][2]
-    if (altGain < 200) continue
-    result.depDir = points[end][1] - points[i][1] > 0 ? 'east' : 'west'
-    break
-  }
-
-  // Detect descents: any time the aircraft drops below minAlt + DESCENT_AGL
-  // after previously being above it. Each crossing = one descent event
-  // (touch-and-go, landing, low approach).
-  const threshold = fieldElev + DESCENT_AGL
-  let wasAbove = false
-  for (const p of points) {
-    if (p[2] > threshold) {
-      wasAbove = true
-    } else if (wasAbove) {
-      result.descentCount++
-      result.hasDescents = true
-      wasAbove = false
-    }
-  }
-
-  // Phase classification heuristic:
-  const firstAlt = points[0][2]
-  const lastAlt = points[points.length - 1][2]
-  const firstLow = firstAlt < threshold
-  const lastLow = lastAlt < threshold
-  if (firstLow && lastLow && result.descentCount >= 2) result.phase = 'pattern'
-  else if (firstLow && !lastLow) result.phase = 'departure'
-  else if (!firstLow && lastLow) result.phase = 'arrival'
-  else if (!firstLow && !lastLow) result.phase = 'overflight'
-  else result.phase = 'pattern' // both low, single descent = short pattern
-
-  return result
-}
 
 // Great-circle-ish distance in nautical miles using local flat projection.
 // 1° lat = 60 nm; cos-weight lon so this works across the KBDU area fine.
@@ -1185,7 +1112,6 @@ function MapPage() {
           firstBase: t.base,
           lastBase: null,
           worst: t.worst,
-          depDir: null, hasDescents: false, descentCount: 0, phase: null,
           pctRed, pctOrange, pctYellow, excursionPct,
           totalFt,
           _cleanColor,
@@ -1288,7 +1214,6 @@ function MapPage() {
           rawPoints,
           runs,
           isLocal,
-          ...classifyTrackPhases(rawPoints),
           year: t.year || null,
           base: baseAirport,
           firstBase,
@@ -1461,7 +1386,7 @@ function MapPage() {
       }
       return true
     })
-  }, [banded, enabled, onlyViolations, originFilter, yearFilter, baseFilter, tailToBaseInfo, schoolFilter, schoolsByTail, todFilter, todStart, todEnd, dirFilter])
+  }, [banded, enabled, onlyViolations, originFilter, yearFilter, baseFilter, tailToBaseInfo, schoolFilter, schoolsByTail, todFilter, todStart, todEnd])
 
   // Impact overlay: one Circle per track point, radius ~ AGL (meters) and
   // opacity proportional to climb/level/descend weight with a squared altitude

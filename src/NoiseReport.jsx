@@ -918,7 +918,7 @@ export function NoiseStudio() {
       // Don't pass lat/lon — the server's 4-mile radius filter is too
       // tight when the user is several miles from the airport. Fetch all
       // tracks in the time window and let client-side distance sort handle it.
-      console.log('[noise-report] fetching nearby tracks, coords:', rawCoords.lat, rawCoords.lng)
+      console.log('[noise-report] fetching nearby tracks, coords:', rawCoords?.lat, rawCoords?.lng)
       fetchNearbyTracks({
         hours: 2,
         limit: 20,
