@@ -495,6 +495,20 @@ export function NoiseStudio() {
     return () => ctrl.abort()
   }, [activeList])
 
+  /* ── Shared hover handler factory (used by offense + nearby draws) ─ */
+  const makeHoverHandlers = (tail, lastSeenMs) => {
+    const showHover = (e) => {
+      if (hoverHideRef.current) { clearTimeout(hoverHideRef.current); hoverHideRef.current = null }
+      const oe = e.originalEvent || e
+      setHoverCard({ tail, x: oe.clientX, y: oe.clientY, lastSeenMs })
+    }
+    const hideHover = () => {
+      if (hoverHideRef.current) clearTimeout(hoverHideRef.current)
+      hoverHideRef.current = setTimeout(() => setHoverCard(null), 220)
+    }
+    return { showHover, hideHover }
+  }
+
   /* ── Draw polylines for every active tail ───────────────────────── */
   const didInitialFitRef = useRef(false)
   useEffect(() => {
@@ -506,18 +520,7 @@ export function NoiseStudio() {
     const tails = Object.keys(segmentsByTail)
     if (!tails.length) return
 
-    const makeHoverHandlers = (tail, lastSeenMs) => {
-      const showHover = (e) => {
-        if (hoverHideRef.current) { clearTimeout(hoverHideRef.current); hoverHideRef.current = null }
-        const oe = e.originalEvent
-        setHoverCard({ tail, x: oe.clientX, y: oe.clientY, lastSeenMs })
-      }
-      const hideHover = () => {
-        if (hoverHideRef.current) clearTimeout(hoverHideRef.current)
-        hoverHideRef.current = setTimeout(() => setHoverCard(null), 220)
-      }
-      return { showHover, hideHover }
-    }
+
 
     const bounds = L.latLngBounds([])
     for (const tail of tails) {
@@ -535,10 +538,14 @@ export function NoiseStudio() {
             if (typeof p[3] === 'number' && p[3] > segLastMs) segLastMs = p[3]
           }
           const { showHover, hideHover } = makeHoverHandlers(tail, segLastMs || null)
-          const color = KLASS_COLORS[seg.klass] || 'rgba(200,200,200,0.55)'
-          const baseWeight = seg.klass === 'red' ? 4 : seg.klass === 'orange' ? 3.5 : seg.klass === 'yellow' ? 3 : 2
-          const weight = selectedTail === tail ? baseWeight + 1 : baseWeight
-          const opacity = isDim ? 0.35 : 0.98
+          const color = KLASS_COLORS[seg.klass] || 'rgba(200,200,200,0.7)'
+          const baseWeight = seg.klass === 'red' ? 6 : seg.klass === 'orange' ? 5.5 : seg.klass === 'yellow' ? 5 : 3.5
+          const weight = selectedTail === tail ? baseWeight + 1.5 : baseWeight
+          // Time-based fade: live = full, 2 hours old = faint
+          const WINDOW_MS = 2 * 60 * 60 * 1000
+          const age = segLastMs ? (Date.now() - segLastMs) / WINDOW_MS : 0
+          const timeOpacity = Math.max(0.15, 1 - age * 0.85)
+          const opacity = isDim ? 0.25 : timeOpacity
           const line = L.polyline(latlngs, {
             color,
             weight,
@@ -717,8 +724,8 @@ export function NoiseStudio() {
       }).addTo(mapRef.current)
       areaRef.current.bringToFront()
       if (!reportOpen) {
-        // Zoom to fit the audibility circle (IP or browser)
-        mapRef.current.flyTo([rawCoords.lat, rawCoords.lng], 11, { duration: 1 })
+        // Zoom to fit the audibility circle
+        mapRef.current.flyToBounds(areaRef.current.getBounds().pad(0.05), { duration: 1 })
       }
     }
     tryDraw()
@@ -743,7 +750,7 @@ export function NoiseStudio() {
     return () => ctrl.abort()
   }, [rawCoords?.lat, rawCoords?.lng, rawCoords?.source])
 
-  /* ── Draw nearby (clean) tracks as subtle lines on the map ───────── */
+  /* ── Draw nearby tracks (clean + offense) with time-based opacity ── */
   useEffect(() => {
     const L = window.L
     const map = mapRef.current
@@ -751,22 +758,51 @@ export function NoiseStudio() {
     for (const p of nearbyTracesRef.current) p.remove()
     nearbyTracesRef.current = []
     if (!nearbyTracks.length) return
+
+    const now = Date.now()
+    const WINDOW_MS = 2 * 60 * 60 * 1000 // 2 hours
+
     for (const track of nearbyTracks) {
-      // Skip tracks that are already rendered by the offense draw effect
+      // Skip tracks already rendered by the offense draw effect
       if (segmentsByTail[track.tail]) continue
       for (const seg of track.segments || []) {
         if (!seg.points || seg.points.length < 2) continue
         const latlngs = seg.points.map((p) => [p[0], p[1]])
-        const color = seg.klass ? (KLASS_COLORS[seg.klass] || '#aaa') : 'rgba(255,255,255,0.3)'
-        const weight = seg.klass ? 3 : 1.5
-        const opacity = seg.klass ? 0.85 : 0.45
+
+        // Most recent timestamp in this segment → drives opacity
+        let segLastMs = 0
+        for (const p of seg.points) {
+          if (typeof p[3] === 'number' && p[3] > segLastMs) segLastMs = p[3]
+        }
+        // Fade: 1.0 at now → 0.05 at 2 hours ago. Live = full opacity.
+        const age = segLastMs ? (now - segLastMs) / WINDOW_MS : 0.5
+        const timeOpacity = Math.max(0.08, 1 - age)
+
+        const isOffense = !!seg.klass
+        const color = isOffense ? (KLASS_COLORS[seg.klass] || '#aaa') : 'rgba(200,200,200,0.8)'
+        const weight = isOffense ? 5 : 3.5
+        const opacity = isOffense ? Math.max(0.3, timeOpacity) : timeOpacity
+
         const line = L.polyline(latlngs, {
           color, weight, opacity,
           lineCap: 'round', lineJoin: 'round',
-          className: seg.klass ? 'flight-trace' : '',
-          interactive: false,
+          className: 'flight-trace',
         }).addTo(map)
-        nearbyTracesRef.current.push(line)
+
+        // Hit target for hover/click — works on mobile (tap) too
+        const { showHover, hideHover } = makeHoverHandlers(track.tail, segLastMs || null)
+        const hit = L.polyline(latlngs, {
+          color: '#ffffff',
+          weight: weight + 16,
+          opacity: 0,
+          lineCap: 'round', lineJoin: 'round',
+          interactive: true,
+        }).addTo(map)
+        hit.on('mouseover', showHover)
+        hit.on('mouseout', hideHover)
+        hit.on('click', showHover)
+
+        nearbyTracesRef.current.push(line, hit)
       }
     }
     if (areaRef.current) areaRef.current.bringToFront()

@@ -285,30 +285,62 @@ function nearestAirport(lat, lon, maxNm = 3) {
 }
 const IMPACT_ZERO_ALT_FT = 8000 // MSL — above this, an aircraft contributes no impact
 
-// Classify a track's departure direction by looking at the initial climb.
-// Find the first sustained altitude gain (≥200 ft over ≥5 consecutive
-// points), then check if the net horizontal displacement during that climb
-// is more eastbound or westbound.
-// Returns 'east', 'west', or null (no clear climb found).
-function classifyDepartureDirection(points) {
-  if (!points || points.length < 10) return null
-  // Scan for the start of the first climb: a run of ≥5 points where
-  // each point is at or above the previous altitude.
+// Classify a track's flight phases. Returns an object with:
+//   depDir: 'east' | 'west' | null — departure direction from initial climb
+//   hasDescents: boolean — any descent below 300 ft AGL of the track's min alt
+//   descentCount: number — how many distinct descents below the threshold
+//   phases: 'departure' | 'arrival' | 'pattern' | 'overflight' | null
+function classifyTrackPhases(points) {
+  const result = { depDir: null, hasDescents: false, descentCount: 0, phase: null }
+  if (!points || points.length < 10) return result
+
+  // Find the track's floor altitude (proxy for field elevation).
+  let minAlt = Infinity
+  for (const p of points) if (p[2] < minAlt) minAlt = p[2]
+  const DESCENT_AGL = 300 // ft above track-floor = "near the ground"
+
+  // Scan for departure direction (first sustained climb ≥200 ft)
   for (let i = 0; i < points.length - 5; i++) {
     let climbing = true
     for (let j = i + 1; j <= i + 5; j++) {
       if (points[j][2] < points[j - 1][2] - 25) { climbing = false; break }
     }
     if (!climbing) continue
-    // Found start of climb at i. Extend until altitude stops rising.
     let end = i + 5
     while (end < points.length - 1 && points[end + 1][2] >= points[end][2] - 25) end++
     const altGain = points[end][2] - points[i][2]
-    if (altGain < 200) continue // too shallow — keep scanning
-    const dLon = points[end][1] - points[i][1]
-    return dLon > 0 ? 'east' : 'west'
+    if (altGain < 200) continue
+    result.depDir = points[end][1] - points[i][1] > 0 ? 'east' : 'west'
+    break
   }
-  return null
+
+  // Detect descents: any time the aircraft drops below minAlt + DESCENT_AGL
+  // after previously being above it. Each crossing = one descent event
+  // (touch-and-go, landing, low approach).
+  const threshold = minAlt + DESCENT_AGL
+  let wasAbove = false
+  for (const p of points) {
+    if (p[2] > threshold) {
+      wasAbove = true
+    } else if (wasAbove) {
+      result.descentCount++
+      result.hasDescents = true
+      wasAbove = false
+    }
+  }
+
+  // Phase classification heuristic:
+  const firstAlt = points[0][2]
+  const lastAlt = points[points.length - 1][2]
+  const firstLow = firstAlt - minAlt < DESCENT_AGL
+  const lastLow = lastAlt - minAlt < DESCENT_AGL
+  if (firstLow && lastLow && result.descentCount >= 2) result.phase = 'pattern'
+  else if (firstLow && !lastLow) result.phase = 'departure'
+  else if (!firstLow && lastLow) result.phase = 'arrival'
+  else if (!firstLow && !lastLow) result.phase = 'overflight'
+  else result.phase = 'pattern' // both low, single descent = short pattern
+
+  return result
 }
 
 // Great-circle-ish distance in nautical miles using local flat projection.
@@ -746,7 +778,7 @@ function MapPage() {
   const [todAnimate, setTodAnimate] = useState(false)
   const [todAnimIdx, setTodAnimIdx] = useState(0)
   const [todCache, setTodCache] = useState(null)
-  const [dirFilter, setDirFilter] = useState('all') // 'all' | 'east' | 'west'
+  const [dirFilter, setDirFilter] = useState('all') // 'all' | 'east' | 'west' | 'descents' | 'pattern' | 'arrival' | 'departure'
   const [originFilter, setOriginFilter] = useState('all') // 'all' | 'local' | 'transient'
   const [selectedTails, setSelectedTails] = useState([])
   const isSelected = (tail) => selectedTails.includes(tail)
@@ -1041,7 +1073,7 @@ function MapPage() {
           firstBase: t.base,
           lastBase: null,
           worst: t.worst,
-          depDir: null,
+          depDir: null, hasDescents: false, descentCount: 0, phase: null,
           pctRed, pctOrange, pctYellow, excursionPct,
           totalFt,
           _cleanColor,
@@ -1138,7 +1170,7 @@ function MapPage() {
           rawPoints,
           runs,
           isLocal,
-          depDir: classifyDepartureDirection(rawPoints),
+          ...classifyTrackPhases(rawPoints),
           year: t.year || null,
           base: baseAirport,
           firstBase,
@@ -1292,9 +1324,16 @@ function MapPage() {
       }
       if (originFilter === 'local' && !t.isLocal) return false
       if (originFilter === 'transient' && t.isLocal) return false
-      // Direction filter: east/west departure direction.
+      // Direction / phase filter.
       if (dirFilter !== 'all') {
-        if (t.depDir && t.depDir !== dirFilter) return false
+        if (dirFilter === 'east' || dirFilter === 'west') {
+          if (t.depDir && t.depDir !== dirFilter) return false
+        } else if (dirFilter === 'descents') {
+          if (!t.hasDescents) return false
+        } else {
+          // phase filter: 'pattern', 'arrival', 'departure', 'overflight'
+          if (t.phase !== dirFilter) return false
+        }
       }
       // Time-of-day filter: skip tracks that have no points in the window.
       // Tracks without timestamps pass through (they can't be filtered).
@@ -2130,18 +2169,26 @@ function MapPage() {
               <span className="w-6 text-[10px] tabular-nums text-right text-white/50">{impactOpacity.toFixed(1)}</span>
             </div>
           )}
-          <div className="flex items-center gap-1">
-            {['all', 'east', 'west'].map((d) => (
+          <div className="flex items-center gap-1 flex-wrap">
+            {[
+              { id: 'all', label: 'All' },
+              { id: 'descents', label: 'Descents' },
+              { id: 'pattern', label: 'Pattern' },
+              { id: 'arrival', label: 'Arrival' },
+              { id: 'departure', label: 'Departure' },
+              { id: 'east', label: 'East' },
+              { id: 'west', label: 'West' },
+            ].map((d) => (
               <button
-                key={d}
-                onClick={() => setDirFilter(d)}
-                className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${
-                  dirFilter === d
+                key={d.id}
+                onClick={() => setDirFilter(d.id)}
+                className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors ${
+                  dirFilter === d.id
                     ? 'border-cyan-400 text-cyan-200 bg-cyan-500/20'
                     : 'border-white/20 text-white/50 hover:border-white/40 hover:text-white/70'
                 }`}
               >
-                {d === 'all' ? 'All dirs' : d === 'east' ? 'East dep' : 'West dep'}
+                {d.label}
               </button>
             ))}
           </div>
