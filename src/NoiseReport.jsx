@@ -527,26 +527,18 @@ export function NoiseStudio() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeList])
 
-  /* ── Segments for every active tail (bulk) ──────────────────────── */
+  /* ── segmentsByTail: derived from nearbyTracks (no extra fetches) ─ */
   useEffect(() => {
-    if (!activeList.length) { setSegmentsByTail({}); return }
-    const ctrl = new AbortController()
-    ;(async () => {
-      const tails = activeList.map((a) => a.tail)
-      const results = await Promise.all(
-        tails.map((t) =>
-          fetchOffenseSegments({ tail: t, hours: 2, signal: ctrl.signal })
-            .then((d) => [t, d])
-            .catch(() => [t, null]),
-        ),
-      )
-      if (ctrl.signal.aborted) return
-      const map = {}
-      for (const [t, d] of results) if (d) map[t] = d
-      setSegmentsByTail(map)
-    })()
-    return () => ctrl.abort()
-  }, [activeList])
+    // Build segmentsByTail from nearbyTracks so the offense draw effect
+    // can highlight tails that are in the active list. No per-tail API
+    // calls — the nearby endpoint already returns everything we need.
+    const map = {}
+    for (const track of nearbyTracks) {
+      const inActive = activeList.some((a) => a.tail === track.tail)
+      if (inActive) map[track.tail] = track
+    }
+    setSegmentsByTail(map)
+  }, [nearbyTracks, activeList])
 
   /* ── Shared hover handler factory (used by offense + nearby draws) ─ */
   const crosshairRef = useRef(null)
@@ -978,6 +970,7 @@ export function NoiseStudio() {
   /* ── Draw nearby tracks (clean + offense) with time-based opacity ── */
   useEffect(() => {
     console.log('[noise-report] draw nearby effect, tracks:', nearbyTracks.length)
+    try {
     const L = window.L
     const map = mapRef.current
     if (!L || !map) return
@@ -1070,6 +1063,10 @@ export function NoiseStudio() {
       snakeDraw(nearbyQueue[i], 900, i * 150)
     }
     if (areaRef.current) areaRef.current.bringToFront()
+    } catch (err) {
+      console.error('[noise-report] draw crash:', err)
+      try { localStorage.setItem('noise-report-crash', `${new Date().toISOString()} ${err.message}\n${err.stack}`) } catch {}
+    }
   }, [nearbyTracks, segmentsByTail])
 
   /* ── Displayed location text ─────────────────────────────────────── */
