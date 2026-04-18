@@ -17,7 +17,58 @@ import { nearestAirport, nmFrom, KBDU, LOCAL_RADIUS_NM } from './src/airports.js
 
 const VIOLATION_RADIUS_NM = 6
 const MAP_RADIUS_NM = 6
-const SEVERITY = { yellow: 1, orange: 2, red: 3 }
+const SEVERITY = { yellow: 1, orange: 2, red: 3, purple: 4 }
+
+// Airport elevations for AGL calculation (MSL ft)
+const AIRPORT_ELEVATIONS = {
+  KBDU: 5288, KBJC: 5673, KEIK: 5130, KLMO: 5055,
+  KAPA: 5885, KGXY: 4697, KFNL: 5016, KBKF: 5663, KFTG: 5512,
+}
+const TZ_OFFSET_S = -7 * 3600 // MST
+
+// Detect touch-and-go during quiet hours (5 PM – 5 AM MST).
+// Returns array of {startIdx, endIdx} ranges to mark as 'purple'.
+function detectQuietHourTnG(points, t0, fieldElev) {
+  if (!points || points.length < 10 || t0 == null) return []
+  const LOW_AGL = 250, HIGH_AGL = 800, MAX_TNG_SEC = 90
+  const lowThresh = fieldElev + LOW_AGL
+  const highThresh = fieldElev + HIGH_AGL
+  const results = []
+  let inLow = false, lowStart = -1
+  for (let i = 0; i < points.length; i++) {
+    const alt = points[i][2]
+    if (alt < lowThresh && !inLow) { inLow = true; lowStart = i }
+    else if (alt > highThresh && inLow) {
+      let bottomIdx = lowStart
+      for (let j = lowStart; j < i; j++) {
+        if (points[j][2] < points[bottomIdx][2]) bottomIdx = j
+      }
+      let ascStart = -1
+      for (let j = bottomIdx; j < Math.min(i + 5, points.length - 3); j++) {
+        if (points[j+1]?.[2] > points[j][2] && points[j+2]?.[2] > points[j+1][2]) {
+          ascStart = j; break
+        }
+      }
+      if (ascStart >= 0) {
+        const hasTs = points[bottomIdx].length > 3 && points[ascStart].length > 3
+        const gapSec = hasTs ? points[ascStart][3] - points[bottomIdx][3] : null
+        const gapOk = gapSec != null ? gapSec <= MAX_TNG_SEC : (ascStart - bottomIdx) <= 30
+        if (gapOk) {
+          const bottomTs = points[bottomIdx].length > 3 ? points[bottomIdx][3] : null
+          if (bottomTs != null) {
+            const localS = (t0 + bottomTs + TZ_OFFSET_S)
+            const hour = Math.floor((((localS % 86400) + 86400) % 86400) / 3600)
+            if (hour >= 17 || hour < 5) {
+              results.push({ startIdx: lowStart, endIdx: i })
+            }
+          }
+        }
+      }
+      inLow = false
+    }
+  }
+  return results
+}
 
 const connStr = process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL
 if (!connStr) { console.error('Set DATABASE_URL'); process.exit(1) }
@@ -43,6 +94,8 @@ async function migrate() {
     ['len_red_ft', 'REAL DEFAULT 0'],
     ['len_orange_ft', 'REAL DEFAULT 0'],
     ['len_yellow_ft', 'REAL DEFAULT 0'],
+    ['seg_purple', 'INT DEFAULT 0'],
+    ['len_purple_ft', 'REAL DEFAULT 0'],
     ['in_ring', 'BOOLEAN DEFAULT false'],
     ['school', 'TEXT'],
     ['bands', 'JSONB'],
@@ -146,18 +199,45 @@ function classifyTrack(points, call, src, schoolMap) {
     }
   }
 
+  // Detect quiet-hour T&G (purple excursions)
+  // t0 = epoch seconds of the track date at midnight UTC
+  const t0 = m ? Math.floor(Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`) / 1000) : null
+  const fieldElev = AIRPORT_ELEVATIONS[base_airport] || AIRPORT_ELEVATIONS.KBDU
+  const tngRanges = detectQuietHourTnG(allPts, t0, fieldElev)
+
+  // Build a set of point indices that are in purple T&G ranges
+  const purpleIdx = new Set()
+  for (const r of tngRanges) {
+    for (let i = r.startIdx; i <= r.endIdx && i < allPts.length; i++) purpleIdx.add(i)
+  }
+
+  // Compute purple segment stats
+  let seg_purple = 0, len_purple_ft = 0
+  for (let i = 1; i < allPts.length; i++) {
+    if (purpleIdx.has(i) || purpleIdx.has(i - 1)) {
+      seg_purple++
+      len_purple_ft += distFt(allPts[i-1][0], allPts[i-1][1], allPts[i][0], allPts[i][1])
+    }
+  }
+
+  // Update worst_class if purple is present
+  if (seg_purple > 0 && (!worst_class || SEVERITY.purple > SEVERITY[worst_class])) {
+    worst_class = 'purple'
+  }
+
   // Build banded runs for map rendering (using ALL points, not just <7500)
+  // Purple T&G ranges override the zone classification
   const ringPts = points || []
   const bands = []
   if (ringPts.length >= 2) {
     let cur = null
-    for (const p of ringPts) {
-      const klass = classifyPoint(p[0], p[1], p[2], NOISE_ZONES)
+    for (let i = 0; i < ringPts.length; i++) {
+      const p = ringPts[i]
+      const klass = purpleIdx.has(i) ? 'purple' : classifyPoint(p[0], p[1], p[2], NOISE_ZONES)
       if (cur && cur.k === klass) {
         cur.p.push([p[0], p[1], p[2]])
       } else {
         if (cur) {
-          // Bridge: share the transition point
           cur.p.push([p[0], p[1], p[2]])
           bands.push(cur)
         }
@@ -169,8 +249,8 @@ function classifyTrack(points, call, src, schoolMap) {
 
   return {
     year, date, base_airport, origin, worst_class,
-    seg_total, seg_red, seg_orange, seg_yellow,
-    len_total_ft, len_red_ft, len_orange_ft, len_yellow_ft,
+    seg_total, seg_red, seg_orange, seg_yellow, seg_purple,
+    len_total_ft, len_red_ft, len_orange_ft, len_yellow_ft, len_purple_ft,
     in_ring,
     school: schoolMap.get(call) || null,
     bands: bands.map(b => ({ klass: b.k, points: b.p })),
@@ -209,14 +289,14 @@ async function main() {
         await client.query(`
           UPDATE tracks SET
             year=$2, date=$3, base_airport=$4, origin=$5, worst_class=$6,
-            seg_total=$7, seg_red=$8, seg_orange=$9, seg_yellow=$10,
-            len_total_ft=$11, len_red_ft=$12, len_orange_ft=$13, len_yellow_ft=$14,
-            in_ring=$15, school=$16, bands=$17
+            seg_total=$7, seg_red=$8, seg_orange=$9, seg_yellow=$10, seg_purple=$11,
+            len_total_ft=$12, len_red_ft=$13, len_orange_ft=$14, len_yellow_ft=$15, len_purple_ft=$16,
+            in_ring=$17, school=$18, bands=$19
           WHERE id=$1
         `, [
           id, stats.year, stats.date, stats.base_airport, stats.origin, stats.worst_class,
-          stats.seg_total, stats.seg_red, stats.seg_orange, stats.seg_yellow,
-          stats.len_total_ft, stats.len_red_ft, stats.len_orange_ft, stats.len_yellow_ft,
+          stats.seg_total, stats.seg_red, stats.seg_orange, stats.seg_yellow, stats.seg_purple,
+          stats.len_total_ft, stats.len_red_ft, stats.len_orange_ft, stats.len_yellow_ft, stats.len_purple_ft,
           stats.in_ring, stats.school, JSON.stringify(stats.bands),
         ])
       }

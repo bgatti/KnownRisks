@@ -1913,9 +1913,11 @@ function noiseApiPlugin() {
             SELECT call AS tail, type, desc_text AS desc, school, base_airport AS base, purpose,
                    SUM(seg_total)::int AS total, SUM(seg_red)::int AS red,
                    SUM(seg_orange)::int AS orange, SUM(seg_yellow)::int AS yellow,
+                   SUM(seg_purple)::int AS purple,
                    SUM(len_total_ft)::real AS total_ft, SUM(len_red_ft)::real AS red_ft,
                    SUM(len_orange_ft)::real AS orange_ft, SUM(len_yellow_ft)::real AS yellow_ft,
-                   MAX(CASE worst_class WHEN 'red' THEN 3 WHEN 'orange' THEN 2 WHEN 'yellow' THEN 1 ELSE 0 END) AS worst_rank,
+                   SUM(len_purple_ft)::real AS purple_ft,
+                   MAX(CASE worst_class WHEN 'purple' THEN 4 WHEN 'red' THEN 3 WHEN 'orange' THEN 2 WHEN 'yellow' THEN 1 ELSE 0 END) AS worst_rank,
                    COUNT(*)::int AS track_count
             FROM tracks
             WHERE ${where}
@@ -1925,7 +1927,7 @@ function noiseApiPlugin() {
             LIMIT 200
           `
           const tailRes = await db.queryDb(tailSql, params)
-          const worstMap = { 3: 'red', 2: 'orange', 1: 'yellow' }
+          const worstMap = { 4: 'purple', 3: 'red', 2: 'orange', 1: 'yellow' }
           const perTail = tailRes.rows.map(r => ({
             ...r, worst: worstMap[r.worst_rank] || null,
           }))
@@ -1953,7 +1955,8 @@ function noiseApiPlugin() {
                    SUM(len_total_ft)::real AS total_ft,
                    SUM(len_yellow_ft)::real AS yellow_ft,
                    SUM(len_orange_ft)::real AS orange_ft,
-                   SUM(len_red_ft)::real AS red_ft
+                   SUM(len_red_ft)::real AS red_ft,
+                   SUM(len_purple_ft)::real AS purple_ft
             FROM tracks
             WHERE ${where} AND date IS NOT NULL
             GROUP BY date ORDER BY date
@@ -1966,10 +1969,11 @@ function noiseApiPlugin() {
             yellowFt: r.yellow_ft,
             orangeFt: r.orange_ft,
             redFt: r.red_ft,
-            // Percentages for easy consumption
+            purpleFt: r.purple_ft,
             yellowPct: r.total_ft > 0 ? r.yellow_ft / r.total_ft * 100 : 0,
             orangePct: r.total_ft > 0 ? r.orange_ft / r.total_ft * 100 : 0,
             redPct: r.total_ft > 0 ? r.red_ft / r.total_ft * 100 : 0,
+            purplePct: r.total_ft > 0 ? r.purple_ft / r.total_ft * 100 : 0,
           }))
 
           // Available filters

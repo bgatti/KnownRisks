@@ -2657,7 +2657,8 @@ function MapPage() {
               y: t > 0 ? (b.yellowFt / t) * 100 : 0,
               o: t > 0 ? (b.orangeFt / t) * 100 : 0,
               r: t > 0 ? (b.redFt / t) * 100 : 0,
-              sum: t > 0 ? ((b.yellowFt + b.orangeFt + b.redFt) / t) * 100 : 0,
+              p: t > 0 ? ((b.purpleFt || 0) / t) * 100 : 0,
+              sum: t > 0 ? ((b.yellowFt + b.orangeFt + b.redFt + (b.purpleFt || 0)) / t) * 100 : 0,
             }
           })
           const maxSum = Math.max(0.5, ...bars.map((b) => b.sum))
@@ -2679,6 +2680,7 @@ function MapPage() {
             const intercept = (sy - slope * sx) / n
             return { y0: intercept, y1: intercept + slope * (n - 1) }
           }
+          const trendP = linReg(bars.map(b => b.p))
           const trendR = linReg(bars.map(b => b.r))
           const trendO = linReg(bars.map(b => b.o))
           const trendY = linReg(bars.map(b => b.y))
@@ -2715,33 +2717,38 @@ function MapPage() {
               <svg width={W} height={H} className="block">
                 {bars.map((b, i) => {
                   const x = padL + i * bw
+                  const hP = (b.p / maxSum) * chartH
                   const hR = (b.r / maxSum) * chartH
                   const hO = (b.o / maxSum) * chartH
                   const hY = (b.y / maxSum) * chartH
-                  const yR = padT + chartH - hR
+                  const yP = padT + chartH - hP
+                  const yR = yP - hR
                   const yO = yR - hO
                   const yY = yO - hY
                   const colW = Math.max(2, bw - 1.5)
                   return (
                     <g key={b.date}>
+                      <rect x={x} y={yP} width={colW} height={hP} fill="#a855f7" />
                       <rect x={x} y={yR} width={colW} height={hR} fill="#dc2626" />
                       <rect x={x} y={yO} width={colW} height={hO} fill="#f97316" />
                       <rect x={x} y={yY} width={colW} height={hY} fill="#facc15" />
                       <title>
                         {b.date} ({b.flights} flights)
-                        {'\n'}yellow: {b.y.toFixed(2)}%
-                        {'\n'}orange: {b.o.toFixed(2)}%
+                        {'\n'}purple (quiet T&G): {b.p.toFixed(2)}%
                         {'\n'}red: {b.r.toFixed(2)}%
+                        {'\n'}orange: {b.o.toFixed(2)}%
+                        {'\n'}yellow: {b.y.toFixed(2)}%
                         {'\n'}total: {b.sum.toFixed(2)}%
                       </title>
                     </g>
                   )
                 })}
                 {/* Trend lines */}
-                {/* Trend lines: yellow bottom, red on top */}
+                {/* Trend lines: yellow bottom, purple on top */}
                 {trendLine(trendY, '#facc15', 'ty')}
                 {trendLine(trendO, '#f97316', 'to')}
                 {trendLine(trendR, '#dc2626', 'tr')}
+                {trendLine(trendP, '#a855f7', 'tp')}
                 {/* X-axis labels */}
                 {Array.from(new Set([0, Math.floor(bars.length / 2), bars.length - 1]))
                   .filter((i) => i >= 0 && i < bars.length)
