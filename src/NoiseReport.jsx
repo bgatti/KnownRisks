@@ -1052,16 +1052,7 @@ export function NoiseStudio() {
       submittedAt: new Date().toISOString(),
       reporter,
       identity: identity ? { kind: identity.kind, label: identity.email || identity.handle } : null,
-      location: rawCoords
-        ? {
-            lat: rawCoords.lat,
-            lng: rawCoords.lng,
-            accuracy: rawCoords.accuracy,
-            source: rawCoords.source,
-            precision,
-            display: displayedLocation?.text,
-          }
-        : null,
+      // No reporter location stored — only the offending flight segment position.
       nearestFlightPoint: nearestSegPoint,
       reportedSegments: reportSegments.length ? reportSegments.map((s) => ({
         tail: s.tail,
@@ -1126,13 +1117,12 @@ export function NoiseStudio() {
         `Score ${score.total}/${score.max} (${tier})`,
         audioBlob && 'audio captured',
         videoBlob && 'video captured',
-        displayedLocation && `loc: ${displayedLocation.text}`,
+        nearestSegPoint && `flight pos: ${nearestSegPoint.lat.toFixed(4)},${nearestSegPoint.lng.toFixed(4)}`,
       ].filter(Boolean).join(' · ')
 
-      // Use the nearest flight-track point as the complaint's GPS location
-      // so the noise office sees where the aircraft was, not where the user is.
-      const reportLat = nearestSegPoint?.lat ?? rawCoords?.lat
-      const reportLon = nearestSegPoint?.lng ?? rawCoords?.lng
+      // Only the flight-track point — never the reporter's position.
+      const reportLat = nearestSegPoint?.lat
+      const reportLon = nearestSegPoint?.lng
 
       complaintPromise = postComplaint({
         tail: selectedExcursion.tail,
@@ -1314,7 +1304,7 @@ export function NoiseStudio() {
               className={`group flex items-center gap-2 rounded-full text-white text-xs font-semibold pl-3 pr-4 py-2 border border-white/15 whitespace-nowrap ${pillBg}`}
             >
               <IconAlertTriangle size={14} />
-              {isExcursion ? 'Report Noise Excursion' : 'Report this Flight'}
+              {isExcursion ? 'Select Excursion' : 'Select Flight Segment'}
               <span className="text-[10px] text-white/80">
                 {hoverCard.type && `· ${hoverCard.type}`}
                 {ago && ` · ${ago}`}
@@ -1407,12 +1397,10 @@ export function NoiseStudio() {
             className="pointer-events-auto group relative flex items-center gap-1.5 md:gap-3 rounded-full bg-gradient-to-r from-rose-500 to-amber-500 px-3.5 md:px-7 py-2 md:py-4 text-[11px] md:text-base font-semibold text-white shadow-[0_10px_40px_rgba(244,63,94,0.45)] hover:shadow-[0_10px_50px_rgba(244,63,94,0.65)] transition-all hover:scale-[1.02]"
           >
             <IconAlertTriangle size={14} />
-            Report Noise
-            {reportSegments.length > 0 && (
-              <span className="rounded-full bg-white/25 text-[10px] px-1.5 py-0.5 font-bold">
-                {reportSegments.length}
-              </span>
-            )}
+            {reportSegments.length > 0
+              ? <>Report {reportSegments.length} Selected Segment{reportSegments.length > 1 ? 's' : ''}</>
+              : 'Report Flight Noise'
+            }
             <IconArrowRight size={14} />
           </button>
         </div>
@@ -1478,7 +1466,6 @@ export function NoiseStudio() {
                       reportMode={reportMode}
                       reportSegments={reportSegments}
                       onRemoveSegment={removeReportSegment}
-                      rawCoords={rawCoords}
                     />
                   )}
                 </>
@@ -1998,7 +1985,7 @@ function IdentifyStep({ activeList, activeStatus, typePhotos, selected, onSelect
   )
 }
 
-function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, videoUrl, selectedExcursion, reportMode, reportSegments, onRemoveSegment, rawCoords }) {
+function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, videoUrl, selectedExcursion, reportMode, reportSegments, onRemoveSegment }) {
   return (
     <>
       {/* Mini-map showing reported segments */}
@@ -2007,7 +1994,7 @@ function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, video
           title={`Reported Segment${reportSegments.length > 1 ? 's' : ''}`}
           subtitle={`${reportSegments.length} flight segment${reportSegments.length > 1 ? 's' : ''} selected — tap × to remove`}
         >
-          <SegmentsMiniMap segments={reportSegments} userCoords={rawCoords} />
+          <SegmentsMiniMap segments={reportSegments} />
           <ul className="mt-2 space-y-1">
             {reportSegments.map((seg, i) => {
               const isExc = !!seg.klass
@@ -2397,7 +2384,7 @@ function CircularCaptureButton({
   )
 }
 
-function SegmentsMiniMap({ segments, userCoords }) {
+function SegmentsMiniMap({ segments }) {
   const ref = useRef(null)
   const mapRef2 = useRef(null)
   useEffect(() => {
@@ -2427,16 +2414,10 @@ function SegmentsMiniMap({ segments, userCoords }) {
       }
       pts.forEach((p) => bounds.extend(p))
     }
-    if (userCoords) {
-      L.circleMarker([userCoords.lat, userCoords.lng], {
-        radius: 4, color: '#38bdf8', weight: 2, fillColor: '#38bdf8', fillOpacity: 0.8, interactive: false,
-      }).addTo(map)
-      bounds.extend([userCoords.lat, userCoords.lng])
-    }
     if (bounds.isValid()) map.fitBounds(bounds.pad(0.15), { maxZoom: 14 })
     mapRef2.current = map
     return () => { map.remove(); mapRef2.current = null }
-  }, [segments, userCoords])
+  }, [segments])
 
   return (
     <div ref={ref} className="w-full h-40 rounded-lg overflow-hidden border border-white/10" style={{ background: '#0a0a0a' }} />
