@@ -307,7 +307,7 @@ function classifyTrackPhases(points) {
   let bestElev = 5288 // default KBDU
   let bestDist = Infinity
   for (const [code, elev] of Object.entries(AIRPORT_ELEVATIONS)) {
-    const ap = NEARBY_AIRPORTS.find(a => a.code === code)
+    const ap = AIRPORTS.find(a => a.code === code)
     if (!ap) continue
     const d = Math.hypot((minPt[0] - ap.lat) * 60, (minPt[1] - ap.lon) * 45)
     if (d < bestDist) { bestDist = d; bestElev = elev }
@@ -333,7 +333,7 @@ function classifyTrackPhases(points) {
   // Detect descents: any time the aircraft drops below minAlt + DESCENT_AGL
   // after previously being above it. Each crossing = one descent event
   // (touch-and-go, landing, low approach).
-  const threshold = minAlt + DESCENT_AGL
+  const threshold = fieldElev + DESCENT_AGL
   let wasAbove = false
   for (const p of points) {
     if (p[2] > threshold) {
@@ -348,8 +348,8 @@ function classifyTrackPhases(points) {
   // Phase classification heuristic:
   const firstAlt = points[0][2]
   const lastAlt = points[points.length - 1][2]
-  const firstLow = firstAlt - minAlt < DESCENT_AGL
-  const lastLow = lastAlt - minAlt < DESCENT_AGL
+  const firstLow = firstAlt < threshold
+  const lastLow = lastAlt < threshold
   if (firstLow && lastLow && result.descentCount >= 2) result.phase = 'pattern'
   else if (firstLow && !lastLow) result.phase = 'departure'
   else if (!firstLow && lastLow) result.phase = 'arrival'

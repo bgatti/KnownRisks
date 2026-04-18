@@ -414,11 +414,30 @@ function offensesApiPlugin() {
             const filtered = center
               ? segments.filter((s) => s.points.some((p) => withinRadius(p[0], p[1])))
               : segments
-            if (filtered.length) tracksOut.push({
-              tail: t.call || t.reg || tail || '?',
-              type: t.type || '',
-              src: t.src, date, live: isLive, segments: filtered,
-            })
+            if (filtered.length) {
+              // Detect descents: count times the track drops below field elev + 300 ft
+              const fieldElev = 5288 // KBDU default; good enough for classification
+              const descThreshold = fieldElev + 300
+              let descents = 0, wasHigh = false
+              for (const p of t.points) {
+                if (p[2] > descThreshold) wasHigh = true
+                else if (wasHigh) { descents++; wasHigh = false }
+              }
+              const firstLow = t.points[0] && t.points[0][2] < descThreshold
+              const lastLow = t.points[t.points.length - 1] && t.points[t.points.length - 1][2] < descThreshold
+              let phase = 'overflight'
+              if (firstLow && lastLow && descents >= 2) phase = 'pattern'
+              else if (firstLow && !lastLow) phase = 'departure'
+              else if (!firstLow && lastLow) phase = 'arrival'
+              else if (firstLow && lastLow) phase = 'pattern'
+              tracksOut.push({
+                tail: t.call || t.reg || tail || '?',
+                type: t.type || '',
+                src: t.src, date, live: isLive,
+                phase, descents, hasDescents: descents > 0,
+                segments: filtered,
+              })
+            }
           }
           const payload = {
             query: tail || 'all',
