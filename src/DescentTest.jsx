@@ -35,9 +35,7 @@ const TEST_TRACKS = [
 
 // ─── Phase + descent/ascent classifier ──────────────────────────────────────
 // Uses the nearest airport's field elevation for AGL, not the track's own min.
-// AGL_THRESHOLD = 300 ft — below this = "on the ground".
-const AGL_THRESHOLD = 300
-
+// Descent: 800 AGL → below 250 AGL. Ascent: below 250 AGL → above 800 AGL.
 function classifyTrack(points) {
   const result = {
     phase: null, nearestAirport: null, fieldElev: 0,
@@ -53,6 +51,10 @@ function classifyTrack(points) {
   const { elev, code } = nearestFieldElev(lowestPt[0], lowestPt[1])
   result.fieldElev = elev
   result.nearestAirport = code
+  const LOW_AGL = 250    // must get below this to count
+  const HIGH_AGL = 800   // must come from / reach above this
+  const lowThresh = elev + LOW_AGL
+  const highThresh = elev + HIGH_AGL
 
   // AGL stats
   for (const p of points) {
@@ -90,10 +92,6 @@ function classifyTrack(points) {
   // Ascent detection: aircraft must go below 250 AGL, then climb above
   // 800 AGL. The segment spans from the low point to where it passes 800.
   // This filters out shallow excursions that never get truly low.
-  const LOW_AGL = 250
-  const HIGH_AGL = 800
-  const lowThresh = elev + LOW_AGL
-  const highThresh = elev + HIGH_AGL
   let wentLow = false, ascentStart = -1
   for (let i = 0; i < points.length; i++) {
     const alt = points[i][2]
@@ -108,9 +106,9 @@ function classifyTrack(points) {
     }
   }
 
-  // Phase classification
-  const firstLow = points[0][2] < threshold
-  const lastLow = points[points.length - 1][2] < threshold
+  // Phase classification — "low" = below 250 AGL of nearest airport
+  const firstLow = points[0][2] < lowThresh
+  const lastLow = points[points.length - 1][2] < lowThresh
   if (firstLow && lastLow && result.descents >= 2) result.phase = 'pattern'
   else if (firstLow && !lastLow) result.phase = 'departure'
   else if (!firstLow && lastLow) result.phase = 'arrival'
@@ -167,8 +165,9 @@ export default function DescentTest() {
         </div>
 
         <div className="text-[9px] text-white/40 italic">
-          AGL threshold: {AGL_THRESHOLD} ft above nearest airport field elevation.
-          Red = descent below threshold. Green = ascent above threshold.
+          Descent: above 800 AGL down to below 250 AGL.
+          Ascent: below 250 AGL up to above 800 AGL.
+          AGL = altitude above nearest airport field elevation.
         </div>
 
         {tracks.map(t => (

@@ -588,6 +588,29 @@ export function NoiseStudio() {
     return { showHover, hideHover, clickSelect }
   }
 
+  /**
+   * Snake-draw animation: reveal a Leaflet polyline progressively from
+   * start to end using SVG stroke-dashoffset. `durationMs` is the total
+   * draw time; `delayMs` is the staggered start.
+   */
+  const snakeDraw = (line, durationMs, delayMs) => {
+    const el = line._path || line.getElement?.()
+    if (!el) return
+    // Need the path to be in the DOM so getTotalLength works.
+    requestAnimationFrame(() => {
+      const len = el.getTotalLength()
+      if (!len) return
+      el.style.strokeDasharray = `${len}`
+      el.style.strokeDashoffset = `${len}`
+      el.style.transition = 'none'
+      // Force reflow then start animation
+      // eslint-disable-next-line no-unused-expressions
+      el.getBoundingClientRect()
+      el.style.transition = `stroke-dashoffset ${durationMs}ms ease-out ${delayMs}ms`
+      el.style.strokeDashoffset = '0'
+    })
+  }
+
   /* ── Draw polylines for every active tail ───────────────────────── */
   const didInitialFitRef = useRef(false)
   useEffect(() => {
@@ -636,6 +659,7 @@ export function NoiseStudio() {
             lineJoin: 'round',
             className: 'flight-trace',
           }).addTo(map)
+          line._segLastMs = segLastMs || 0 // tag for animation sort
           // Invisible wider hit target per-segment
           const hit = L.polyline(latlngs, {
             color: '#ffffff',
@@ -656,6 +680,18 @@ export function NoiseStudio() {
           }
         }
       }
+    }
+
+    // Snake-draw animation: sort all drawn lines newest-first, stagger.
+    const animQueue = []
+    for (const p of tracesRef.current) {
+      if (p._segLastMs != null) animQueue.push(p)
+    }
+    animQueue.sort((a, b) => (b._segLastMs || 0) - (a._segLastMs || 0))
+    const DRAW_MS = 900  // each segment draws over 900ms
+    const STAGGER = 150  // 150ms between each segment start
+    for (let i = 0; i < animQueue.length; i++) {
+      snakeDraw(animQueue[i], DRAW_MS, i * STAGGER)
     }
 
     // Keep the user's location ring on top of the traces so it's never
@@ -927,10 +963,17 @@ export function NoiseStudio() {
         }).addTo(map)
         hit.on('mouseover', showHover)
         hit.on('mouseout', hideHover)
-        hit.on('click', showHover)
+        hit.on('click', clickSelect)
 
+        line._segLastMs = segLastMs || 0
         nearbyTracesRef.current.push(line, hit)
       }
+    }
+    // Snake-draw animation for nearby tracks
+    const nearbyQueue = nearbyTracesRef.current.filter((p) => p._segLastMs != null)
+    nearbyQueue.sort((a, b) => (b._segLastMs || 0) - (a._segLastMs || 0))
+    for (let i = 0; i < nearbyQueue.length; i++) {
+      snakeDraw(nearbyQueue[i], 900, i * 150)
     }
     if (areaRef.current) areaRef.current.bringToFront()
   }, [nearbyTracks, segmentsByTail])
