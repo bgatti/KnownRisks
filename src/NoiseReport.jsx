@@ -569,7 +569,23 @@ export function NoiseStudio() {
         if (crosshairRef.current) { crosshairRef.current.remove(); crosshairRef.current = null }
       }, 220)
     }
-    return { showHover, hideHover }
+    const clickSelect = (e) => {
+      // Find nearest point to the click location
+      let nearestPt = segInfo?.points?.[0] || null
+      if (segInfo?.points && e.latlng) {
+        let bestD = Infinity
+        for (const p of segInfo.points) {
+          const d = Math.abs(p[0] - e.latlng.lat) + Math.abs(p[1] - e.latlng.lng)
+          if (d < bestD) { bestD = d; nearestPt = p }
+        }
+      }
+      const match = activeList.find((a) => a.tail === tail)
+      if (match) setSelectedExcursion(match)
+      addReportSegment({ tail, lastSeenMs, ...segInfo, nearestPt })
+      setHoverCard(null)
+      if (crosshairRef.current) { crosshairRef.current.remove(); crosshairRef.current = null }
+    }
+    return { showHover, hideHover, clickSelect }
   }
 
   /* ── Draw polylines for every active tail ───────────────────────── */
@@ -601,7 +617,7 @@ export function NoiseStudio() {
             if (typeof p[3] === 'number' && p[3] > segLastMs) segLastMs = p[3]
           }
           const type = (activeList.find((a) => a.tail === tail))?.type || data.type || ''
-          const { showHover, hideHover } = makeHoverHandlers(tail, segLastMs || null, {
+          const { showHover, hideHover, clickSelect } = makeHoverHandlers(tail, segLastMs || null, {
             klass: seg.klass, zone: seg.zone, points: seg.points, type,
           })
           const color = KLASS_COLORS[seg.klass] || 'rgba(200,200,200,0.7)'
@@ -631,7 +647,7 @@ export function NoiseStudio() {
           }).addTo(map)
           hit.on('mouseover', showHover)
           hit.on('mouseout', hideHover)
-          hit.on('click', showHover)
+          hit.on('click', clickSelect)
           tracesRef.current.push(line, hit)
           // Only contribute to fit bounds when this tail is the focus or
           // when nothing is focused (initial/all-shown state).
@@ -895,7 +911,7 @@ export function NoiseStudio() {
         }).addTo(map)
 
         // Hit target for hover/click — works on mobile (tap) too
-        const { showHover, hideHover } = makeHoverHandlers(track.tail, segLastMs || null, {
+        const { showHover, hideHover, clickSelect } = makeHoverHandlers(track.tail, segLastMs || null, {
           klass: seg.klass, zone: seg.zone, points: seg.points, type: track.type || '',
         })
         const hit = L.polyline(latlngs, {
@@ -1355,24 +1371,15 @@ export function NoiseStudio() {
               }, 160)
             }}
           >
-            <button
-              onClick={() => {
-                const match = activeList.find((a) => a.tail === hoverCard.tail)
-                if (match) setSelectedExcursion(match)
-                addReportSegment({ ...hoverCard, tail: hoverCard.tail })
-                setHoverCard(null)
-                if (crosshairRef.current) { crosshairRef.current.remove(); crosshairRef.current = null }
-                // Just select — don't open the wizard. User clicks the bottom Report button when ready.
-              }}
-              className={`group flex items-center gap-2 rounded-full text-white text-xs font-semibold pl-3 pr-4 py-2 border border-white/15 whitespace-nowrap ${pillBg}`}
+            <div
+              className={`flex items-center gap-2 rounded-full text-white text-xs font-medium pl-3 pr-4 py-2 border border-white/15 whitespace-nowrap pointer-events-none ${pillBg}`}
             >
-              <IconAlertTriangle size={14} />
-              Select
+              Tap to select
               <span className="text-[10px] text-white/80">
                 {hoverCard.type && `· ${hoverCard.type}`}
                 {ago && ` · ${ago}`}
               </span>
-            </button>
+            </div>
             <div
               className="absolute left-1/2 -translate-x-1/2 w-0 h-0"
               style={{

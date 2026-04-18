@@ -2058,16 +2058,17 @@ function externalDataPlugin() {
   return {
     name: 'external-data',
     configureServer(server) {
-      server.middlewares.use((req, res, next) => {
+      let fsModule = null
+      server.middlewares.use(async (req, res, next) => {
         const m = req.url.match(/^\/(tracks_\d{4}\.json)$/)
         if (!m) return next()
-        const fs = require('fs')
+        if (!fsModule) fsModule = (await import('fs')).default
         const filePath = DATA_DIR + '\\' + m[1]
         try {
-          const stat = fs.statSync(filePath)
+          const stat = fsModule.statSync(filePath)
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Content-Length', stat.size)
-          fs.createReadStream(filePath).pipe(res)
+          fsModule.createReadStream(filePath).pipe(res)
         } catch (e) {
           res.statusCode = 404
           res.end('{"tracks":[]}')
