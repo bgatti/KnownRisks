@@ -39,7 +39,7 @@ const TEST_TRACKS = [
 function classifyTrack(points) {
   const result = {
     phase: null, nearestAirport: null, fieldElev: 0,
-    descents: 0, ascents: 0,
+    descents: 0, ascents: 0, touchAndGos: [],
     descentSegments: [], ascentSegments: [],
     aglMin: Infinity, aglMax: -Infinity,
   }
@@ -114,6 +114,39 @@ function classifyTrack(points) {
   else if (!firstLow && lastLow) result.phase = 'arrival'
   else if (!firstLow && !lastLow) result.phase = 'overflight'
   else result.phase = 'pattern'
+
+  // Touch-and-go detection: a descent segment whose low point is followed
+  // by an ascent segment starting within 240 seconds (p90 of observed
+  // T&G timing). Uses timestamps (p[3]) when available; falls back to
+  // index proximity (< 60 points ≈ ~120 s at 2 s/sample).
+  result.touchAndGos = []
+  const MAX_TNG_SEC = 240
+  const MAX_TNG_IDX = 60
+  for (const desc of result.descentSegments) {
+    for (const asc of result.ascentSegments) {
+      if (asc.startIdx < desc.endIdx) continue // ascent must come after descent
+      const hasTs = points[desc.endIdx].length > 3 && points[asc.startIdx].length > 3
+      let gap
+      if (hasTs) {
+        gap = points[asc.startIdx][3] - points[desc.endIdx][3]
+        if (gap < 0 || gap > MAX_TNG_SEC) continue
+      } else {
+        gap = asc.startIdx - desc.endIdx
+        if (gap < 0 || gap > MAX_TNG_IDX) continue
+      }
+      result.touchAndGos.push({
+        descentIdx: result.descentSegments.indexOf(desc),
+        ascentIdx: result.ascentSegments.indexOf(asc),
+        startIdx: desc.startIdx,
+        endIdx: asc.endIdx,
+        gapSec: hasTs ? gap : null,
+        gapPts: asc.startIdx - desc.endIdx,
+        bottomAlt: Math.min(...points.slice(desc.endIdx, asc.startIdx + 1).map(p => p[2])),
+      })
+      break // each descent matches at most one ascent
+    }
+  }
+
   return result
 }
 
@@ -130,6 +163,7 @@ export default function DescentTest() {
   const [selected, setSelected] = useState(new Set(TEST_TRACKS.map(t => t.src)))
   const [showDescents, setShowDescents] = useState(true)
   const [showAscents, setShowAscents] = useState(true)
+  const [showTnG, setShowTnG] = useState(true)
 
   // Only load 2026 — all test tracks are from that year.
   useEffect(() => {
@@ -161,6 +195,10 @@ export default function DescentTest() {
           <label className="flex items-center gap-1 text-xs cursor-pointer">
             <input type="checkbox" checked={showAscents} onChange={e => setShowAscents(e.target.checked)} />
             <span className="text-green-400">Ascents</span>
+          </label>
+          <label className="flex items-center gap-1 text-xs cursor-pointer">
+            <input type="checkbox" checked={showTnG} onChange={e => setShowTnG(e.target.checked)} />
+            <span className="text-amber-400">Touch & Go</span>
           </label>
         </div>
 
@@ -196,8 +234,9 @@ export default function DescentTest() {
               <span>near: {t.nearestAirport} ({t.fieldElev} ft)</span>
             </div>
             <div className="flex gap-3 text-[10px]">
-              <span className="text-red-400">{t.descents} descents</span>
-              <span className="text-green-400">{t.ascents} ascents</span>
+              <span className="text-red-400">{t.descents} desc</span>
+              <span className="text-green-400">{t.ascents} asc</span>
+              <span className="text-amber-400">{t.touchAndGos.length} T&G</span>
               <span className="text-white/40">{t.track.points.length} pts</span>
             </div>
             <div className="text-[9px] text-white/40">
@@ -298,6 +337,26 @@ export default function DescentTest() {
                           {' · '}{segPts.length} pts
                           {' · '}{pts[seg.startIdx][2]}→{pts[seg.endIdx][2]} MSL
                           {' · max AGL '}{Math.round(maxAgl)} ft
+                        </div>
+                      </Tooltip>
+                    </Polyline>
+                  )
+                })}
+              {/* Touch-and-go segments — amber, fattest */}
+                {showTnG && t.touchAndGos.map((tng, ti) => {
+                  const segPts = pts.slice(tng.startIdx, tng.endIdx + 1)
+                  return (
+                    <Polyline
+                      key={`tng-${ti}`}
+                      positions={segPts.map(p => [p[0], p[1]])}
+                      pathOptions={{ color: '#f59e0b', weight: 7, opacity: 0.7 }}
+                    >
+                      <Tooltip sticky>
+                        <div className="text-[10px]">
+                          <span className="text-amber-400 font-semibold">Touch & Go #{ti + 1}</span>
+                          {tng.gapSec != null && <span> · {tng.gapSec}s on ground</span>}
+                          {' · bottom '}{Math.round(tng.bottomAlt - t.fieldElev)} AGL
+                          {' · '}{segPts.length} pts
                         </div>
                       </Tooltip>
                     </Polyline>

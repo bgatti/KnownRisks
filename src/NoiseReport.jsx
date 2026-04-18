@@ -148,10 +148,26 @@ function fibMiles(meters) {
   return best
 }
 
-/** Clip a points array to only include points within `radiusM` of `center`. */
+/**
+ * Clip a points array to the single contiguous run around `center` within
+ * `radiusM`. If a flight passes through the area twice, only the segment
+ * containing the nearest point is returned — never disjoint pieces.
+ */
 function clipSegmentNearPoint(points, center, radiusM) {
-  if (!points || !center) return points || []
-  return points.filter((p) => haversine(center[0], center[1], p[0], p[1]) <= radiusM)
+  if (!points || !center || !points.length) return points || []
+  // Find the index of the nearest point to center
+  let nearIdx = 0
+  let bestD = Infinity
+  for (let i = 0; i < points.length; i++) {
+    const d = haversine(center[0], center[1], points[i][0], points[i][1])
+    if (d < bestD) { bestD = d; nearIdx = i }
+  }
+  // Expand outward from nearIdx while points are within radius
+  let lo = nearIdx
+  let hi = nearIdx
+  while (lo > 0 && haversine(center[0], center[1], points[lo - 1][0], points[lo - 1][1]) <= radiusM) lo--
+  while (hi < points.length - 1 && haversine(center[0], center[1], points[hi + 1][0], points[hi + 1][1]) <= radiusM) hi++
+  return points.slice(lo, hi + 1)
 }
 
 function formatMiles(meters) {
@@ -2171,7 +2187,7 @@ function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, video
       </Card>
       <Card title="Summary">
         <dl className="space-y-2 text-xs">
-          <Row label="Location" value={displayedLocation?.text || 'Not set'} sub={displayedLocation?.detail} />
+          <Row label="Segments" value={`${reportSegments?.length || 0} flight segment${(reportSegments?.length || 0) === 1 ? '' : 's'} selected`} />
           <Row label="Audio" value={audioUrl ? '5-second clip captured' : 'None'} />
           <Row label="Video" value={videoUrl ? 'Clip captured' : 'None'} />
           <Row
