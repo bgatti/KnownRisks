@@ -199,11 +199,14 @@ function classifyTrack(points, call, src, schoolMap) {
     }
   }
 
-  // Detect quiet-hour T&G (purple excursions) — KBDU only.
-  // Only KBDU has the voluntary quiet-hour noise abatement procedure.
+  // Detect quiet-hour T&G (purple excursions).
+  // Applies to ANY aircraft performing T&G within 4nm of KBDU during
+  // quiet hours (5 PM – 5 AM MST). KBDU is the only airport with this
+  // voluntary noise abatement procedure.
   const t0 = m ? Math.floor(Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`) / 1000) : null
-  const isKbdu = base_airport === 'KBDU' || nearestAirport(allPts[0][0], allPts[0][1], 3) === 'KBDU'
-  const tngRanges = isKbdu
+  // Check if any points are within 4nm of KBDU
+  const nearKbdu = allPts.some(p => nmFrom(p[0], p[1], KBDU[0], KBDU[1]) <= 4)
+  const tngRanges = nearKbdu
     ? detectQuietHourTnG(allPts, t0, AIRPORT_ELEVATIONS.KBDU)
     : []
 
