@@ -176,17 +176,56 @@ function offensesApiPlugin() {
   // mtime-based cache for the big tracks file. Re-read only when the file
   // on disk changes; avoids re-parsing 200 MB on every API hit.
   const fileCache = { tracks: null, schools: null, live: null }
+  const TRACKS_DIR = 'C:\\tmp\\noise_data'
+  const TRACK_YEARS = ['2023', '2024', '2025', '2026']
   const FILE_PATHS = {
-    tracks: 'public/tracks_yearly.json',
     schools: 'public/flight_schools_fleets.json',
     live: 'public/tracks_live.json',
   }
+  const buildIndex = (data) => {
+    const byTail = new Map()
+    for (const t of data.tracks || []) {
+      const k = (t.call || '').trim()
+      if (!k) continue
+      let arr = byTail.get(k)
+      if (!arr) { arr = []; byTail.set(k, arr) }
+      arr.push(t)
+    }
+    data._byTail = byTail
+    return data
+  }
   const loadCached = async (fs, path, key) => {
-    // When DATABASE_URL is set, read from Postgres instead of files
     if (db.useDb) {
       if (key === 'tracks') return db.loadTracksFromDb()
       if (key === 'live') return db.loadLiveFromDb()
       if (key === 'schools') return db.loadSchoolsFromDb()
+    }
+    // Per-year track files — merge them, cache based on combined mtime.
+    if (key === 'tracks') {
+      try {
+        let latestMtime = 0
+        for (const y of TRACK_YEARS) {
+          try {
+            const st = await fs.stat(TRACKS_DIR + '\\tracks_' + y + '.json')
+            if (st.mtimeMs > latestMtime) latestMtime = st.mtimeMs
+          } catch {}
+        }
+        const cached = fileCache[key]
+        if (cached && cached.mtimeMs === latestMtime) return cached.data
+        const allTracks = []
+        for (const y of TRACK_YEARS) {
+          try {
+            const buf = await fs.readFile(TRACKS_DIR + '\\tracks_' + y + '.json', 'utf8')
+            const d = JSON.parse(buf)
+            if (d.tracks) allTracks.push(...d.tracks)
+          } catch {}
+        }
+        const data = buildIndex({ tracks: allTracks })
+        fileCache[key] = { mtimeMs: latestMtime, data }
+        return data
+      } catch (e) {
+        return buildIndex({ tracks: [] })
+      }
     }
     const p = path.resolve(FILE_PATHS[key])
     try {
@@ -195,18 +234,7 @@ function offensesApiPlugin() {
       if (cached && cached.mtimeMs === stat.mtimeMs) return cached.data
       const buf = await fs.readFile(p, 'utf8')
       const data = JSON.parse(buf)
-      // Pre-index tracks by tail for O(1) lookup
-      if (key === 'tracks' || key === 'live') {
-        const byTail = new Map()
-        for (const t of data.tracks || []) {
-          const k = (t.call || '').trim()
-          if (!k) continue
-          let arr = byTail.get(k)
-          if (!arr) { arr = []; byTail.set(k, arr) }
-          arr.push(t)
-        }
-        data._byTail = byTail
-      }
+      if (key === 'live') buildIndex(data)
       fileCache[key] = { mtimeMs: stat.mtimeMs, data }
       return data
     } catch (e) {
@@ -228,17 +256,12 @@ function offensesApiPlugin() {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const tail = (u.searchParams.get('tail') || '').trim()
           const hours = Number(u.searchParams.get('hours')) || 24
+          const limit = Number(u.searchParams.get('limit')) || 200
           const latParam = u.searchParams.get('lat')
           const lonParam = u.searchParams.get('lon')
           const center = (latParam != null && lonParam != null && latParam !== '' && lonParam !== '')
             ? { lat: Number(latParam), lon: Number(lonParam) }
             : null
-          if (!tail) {
-            res.statusCode = 400
-            res.setHeader('Content-Type', 'application/json')
-            res.end(JSON.stringify({ error: 'missing required parameter: tail' }))
-            return
-          }
           if (!zonesCache) {
             const mod = await import('./src/noiseZones.js')
             zonesCache = mod.NOISE_ZONES
@@ -327,12 +350,17 @@ function offensesApiPlugin() {
             const dy = (lat - center.lat) * FT_PER_DEG_LAT
             return dx * dx + dy * dy <= RADIUS_FT * RADIUS_FT
           }
-          const candidates = tracksData._byTail.get(tail) || []
-          const liveCandidates = liveData._byTail.get(tail) || []
-          // Historical tracks: filter by date window.
-          // Live tracks: src is literally "live", no embedded date — always
-          // include them (they are, by definition, "now") and tag them with
-          // today's date so downstream consumers see a uniform shape.
+          // When tail is provided, use the O(1) index. When omitted, scan
+          // all tracks in the time window — capped by `limit` to avoid
+          // returning the entire dataset.
+          let candidates, liveCandidates
+          if (tail) {
+            candidates = tracksData._byTail.get(tail) || []
+            liveCandidates = liveData._byTail.get(tail) || []
+          } else {
+            candidates = tracksData.tracks || []
+            liveCandidates = (liveData.tracks || [])
+          }
           const matches = candidates.filter((t) => {
             const m = (t.src || '').match(/(\d{4}-\d{2}-\d{2})/)
             if (!m) return false
@@ -340,6 +368,8 @@ function offensesApiPlugin() {
             return d >= fromDate && d <= toDate
           })
           for (const lt of liveCandidates) matches.push(lt)
+          // Cap to prevent OOM on wide queries.
+          if (matches.length > limit) matches.length = limit
           const tracksOut = []
           for (const t of matches) {
             const m = (t.src || '').match(/(\d{4}-\d{2}-\d{2})/)
@@ -384,25 +414,32 @@ function offensesApiPlugin() {
             const filtered = center
               ? segments.filter((s) => s.points.some((p) => withinRadius(p[0], p[1])))
               : segments
-            if (filtered.length) tracksOut.push({ src: t.src, date, live: isLive, segments: filtered })
-          }
-          // Aircraft fields can be blank on some days; pick the first
-          // non-empty value across all candidate tracks (historical + live).
-          const allCandidates = [...liveCandidates, ...candidates]
-          const pickField = (k) => {
-            for (const t of allCandidates) if (t[k]) return t[k]
-            return ''
+            if (filtered.length) tracksOut.push({
+              tail: t.call || t.reg || tail || '?',
+              type: t.type || '',
+              src: t.src, date, live: isLive, segments: filtered,
+            })
           }
           const payload = {
-            tail,
-            call: pickField('call') || tail,
-            type: pickField('type'),
-            desc: pickField('desc'),
-            ownOp: pickField('ownOp'),
-            window: { hours, from: fromDate, to: toDate },
-            live: { updated_at: liveData.updated_at || null, tracks: liveCandidates.length },
+            query: tail || 'all',
+            window: { hours, from: fromDate, to: toDate, limit },
+            matched: matches.length,
             center: center ? { lat: center.lat, lon: center.lon, radius_ft: RADIUS_FT } : null,
+            live: { updated_at: liveData.updated_at || null, tracks: liveCandidates.length },
             tracks: tracksOut,
+          }
+          // When querying a specific tail, add aircraft metadata.
+          if (tail) {
+            const allCandidates = [...liveCandidates, ...candidates]
+            const pickField = (k) => {
+              for (const t of allCandidates) if (t[k]) return t[k]
+              return ''
+            }
+            payload.tail = tail
+            payload.call = pickField('call') || tail
+            payload.type = pickField('type')
+            payload.desc = pickField('desc')
+            payload.ownOp = pickField('ownOp')
           }
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Access-Control-Allow-Origin', '*')
@@ -1333,8 +1370,10 @@ function complaintsApiPlugin() {
 }
 
 function liveCapturePlugin() {
-  const CENTER = [40.0394, -105.2258]
-  const RADIUS_NM = 15
+  // Front Range corridor center — covers KBDU, KLMO, KEIK, KBJC, KAPA, KGXY
+  // with a 36 nm radius from the geographic mean of all 6 airports.
+  const CENTER = [40.0211, -105.0063]
+  const RADIUS_NM = 36
   const POLL_MS = 2_000
   const ALT_MAX_FT = 10_000
   const LIVE_FILE = 'public/tracks_live.json'
@@ -1996,17 +2035,20 @@ function noiseApiPlugin() {
 }
 
 function externalDataPlugin() {
-  const DATA_PATH = 'C:\\tmp\\noise_data\\tracks_yearly.json'
+  const DATA_DIR = 'C:\\tmp\\noise_data'
   return {
     name: 'external-data',
     configureServer(server) {
-      server.middlewares.use('/tracks_yearly.json', async (_req, res) => {
-        const fs = await import('fs')
+      server.middlewares.use((req, res, next) => {
+        const m = req.url.match(/^\/(tracks_\d{4}\.json)$/)
+        if (!m) return next()
+        const fs = require('fs')
+        const filePath = DATA_DIR + '\\' + m[1]
         try {
-          const stat = fs.statSync(DATA_PATH)
+          const stat = fs.statSync(filePath)
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Content-Length', stat.size)
-          fs.createReadStream(DATA_PATH).pipe(res)
+          fs.createReadStream(filePath).pipe(res)
         } catch (e) {
           res.statusCode = 404
           res.end('{"tracks":[]}')

@@ -208,6 +208,9 @@ function Nav({ route }) {
 }
 
 const KBDU = [40.0394, -105.2258]
+// Front Range corridor center — geographic mean of KBDU/KLMO/KEIK/KBJC/KAPA/KGXY
+const CORRIDOR_CENTER = [40.0211, -105.0063]
+const CORRIDOR_RADIUS_NM = 36
 const LOCAL_RADIUS_NM = 3
 const MAP_RADIUS_NM = 6 // drop segments outside this ring for render perf
 
@@ -330,14 +333,24 @@ async function fetchTracksChunked(onProgress, onStatus) {
     const first = await fetch('/api/tracks?page=0&size=2000')
     console.log(`[tracks-loader] /api/tracks response: ${first.status}`)
     if (!first.ok) {
-      onStatus(`API returned ${first.status}, falling back to /tracks_yearly.json...`)
-      console.log('[tracks-loader] falling back to /tracks_yearly.json')
-      const r = await fetch('/tracks_yearly.json')
-      if (!r.ok) throw new Error(`tracks_yearly.json: ${r.status} ${r.statusText}`)
-      const d = await r.json()
-      console.log(`[tracks-loader] fallback loaded ${d.tracks?.length || 0} tracks`)
-      onStatus(`Loaded ${d.tracks?.length || 0} tracks from file`)
-      return d
+      onStatus(`API returned ${first.status}, loading per-year files...`)
+      console.log('[tracks-loader] loading per-year JSON files in parallel')
+      const years = ['2023', '2024', '2025', '2026']
+      const results = await Promise.all(
+        years.map(async (y) => {
+          try {
+            const r = await fetch(`/tracks_${y}.json`)
+            if (!r.ok) return []
+            const d = await r.json()
+            onStatus(`${y}: ${d.tracks?.length || 0} tracks`)
+            return d.tracks || []
+          } catch { return [] }
+        })
+      )
+      const allTracks = results.flat()
+      console.log(`[tracks-loader] loaded ${allTracks.length} tracks across ${years.length} years`)
+      onStatus(`Loaded ${allTracks.length.toLocaleString()} tracks`)
+      return { tracks: allTracks }
     }
     const firstData = await first.json()
     console.log(`[tracks-loader] page 0: ${firstData.tracks?.length} tracks, total=${firstData.total}, pages=${firstData.pages}`)
@@ -551,7 +564,7 @@ function MapPage() {
       let winnerId = null
       for (const feed of LIVE_FEEDS) {
         if (cancelled) return
-        const url = feed.makeUrl(KBDU[0], KBDU[1], 15)
+        const url = feed.makeUrl(CORRIDOR_CENTER[0], CORRIDOR_CENTER[1], CORRIDOR_RADIUS_NM)
         try {
           const r = await fetch(url)
           if (!r.ok) {

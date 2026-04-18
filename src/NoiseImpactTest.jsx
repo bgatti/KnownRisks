@@ -898,10 +898,13 @@ export default function NoiseImpactTest() {
   const set = (k) => (v) => setParams((p) => ({ ...p, [k]: v }))
 
   useEffect(() => {
-    fetch('/tracks_yearly.json')
-      .then((r) => r.json())
-      .then(setData)
-      .catch((e) => console.error(e))
+    Promise.all(
+      ['2023', '2024', '2025', '2026'].map((y) =>
+        fetch(`/tracks_${y}.json`).then((r) => r.ok ? r.json() : { tracks: [] }).catch(() => ({ tracks: [] }))
+      )
+    ).then((results) => {
+      setData({ tracks: results.flatMap((d) => d.tracks || []) })
+    })
   }, [])
 
   // Only the four curated example tracks — one per aircraft class. The
