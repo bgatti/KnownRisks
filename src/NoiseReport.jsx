@@ -1335,6 +1335,12 @@ export function NoiseStudio() {
       const reportLat = nearestSegPoint?.lat
       const reportLon = nearestSegPoint?.lng
 
+      // Distance from reporter to nearest flight point, rounded to Fibonacci
+      // tenths of a mile for anonymity. No exact distance or position stored.
+      const distanceFibMi = (rawCoords && nearestSegPoint)
+        ? fibMiles(haversine(rawCoords.lat, rawCoords.lng, nearestSegPoint.lat, nearestSegPoint.lng))
+        : null
+
       complaintPromise = postComplaint({
         tail: selectedExcursion.tail,
         startedAt: new Date(startMs).toISOString(),
@@ -1344,6 +1350,11 @@ export function NoiseStudio() {
         lat: reportLat,
         lon: reportLon,
         reporter: reporter || undefined,
+        score: score.total,
+        mediaKind: videoBlob ? 'video' : audioBlob ? 'audio' : null,
+        precision,
+        type: selectedExcursion.type || null,
+        distanceMiles: distanceFibMi,
         notes,
       })
         .then((result) => {

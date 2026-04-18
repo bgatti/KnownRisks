@@ -11,6 +11,7 @@ import ThinningTest from './ThinningTest.jsx'
 import NoiseImpactTest from './NoiseImpactTest.jsx'
 import DescentTest from './DescentTest.jsx'
 import { NoiseStudio as NoiseReportPage } from './NoiseReport.jsx'
+import NoiseHeatmap from './NoiseHeatmap.jsx'
 import React from 'react'
 
 class ErrorBoundary extends React.Component {
@@ -210,29 +211,6 @@ function navigate(to) {
   window.dispatchEvent(new PopStateEvent('popstate'))
 }
 
-function Nav({ route }) {
-  const link = (to, label) => (
-    <a
-      href={to}
-      onClick={(e) => { e.preventDefault(); navigate(to) }}
-      className={`px-2 py-1 rounded ${
-        route === to ? 'bg-white/15 text-white' : 'text-white/60 hover:text-white'
-      }`}
-    >
-      {label}
-    </a>
-  )
-  return (
-    <nav className="flex items-center gap-1 text-xs">
-      {link('/', 'Map')}
-      {link('/yoy', 'Year over Year')}
-      {link('/bases', 'Bases')}
-      {link('/thinning', 'Thinning')}
-      {link('/impact', 'Impact Model')}
-      {link('/descents', 'Descents')}
-    </nav>
-  )
-}
 
 const KBDU = [40.0394, -105.2258]
 const KBDU_ELEV_FT = 5288
@@ -508,27 +486,14 @@ export default function App() {
   if (route === '/report') {
     return <ErrorBoundary><NoiseReportPage /></ErrorBoundary>
   }
-  if (route === '/yoy' || route === '/bases' || route === '/thinning' || route === '/impact') {
-    return (
-      <div className="h-full w-full flex flex-col">
-        <header className="px-4 py-3 border-b border-white/10 flex items-center gap-4">
-          <h1 className="text-lg font-semibold">Front Range Aviation Monitor</h1>
-          <Nav route={route} />
-        </header>
-        <div className="flex-1 overflow-hidden">
-          {route === '/yoy'
-            ? <YearOverYear />
-            : route === '/bases'
-              ? <BasesDiagnostic />
-              : route === '/thinning'
-                ? <ThinningTest />
-                : route === '/descents'
-                  ? <DescentTest />
-                  : <NoiseImpactTest />}
-        </div>
-      </div>
-    )
+  if (route === '/heatmap') {
+    return <ErrorBoundary><NoiseHeatmap /></ErrorBoundary>
   }
+  if (route === '/yoy') return <YearOverYear />
+  if (route === '/bases') return <BasesDiagnostic />
+  if (route === '/thinning') return <ThinningTest />
+  if (route === '/impact') return <NoiseImpactTest />
+  if (route === '/descents') return <DescentTest />
   return <MapPage />
 }
 
@@ -2075,7 +2040,6 @@ function MapPage() {
           /* ── Desktop header: full controls ── */
           <>
         <h1 className="text-lg font-semibold">Front Range Aviation Monitor</h1>
-        <Nav route={route} />
         <div className="text-xs text-white/60">
           {visible.length} tracks ·{' '}
           <span className="text-red-400">
@@ -2168,25 +2132,6 @@ function MapPage() {
               <span className="w-6 text-[10px] tabular-nums text-right text-white/50">{impactPopOpacity.toFixed(1)}</span>
             </div>
           )}
-          <div className="flex items-center gap-1 flex-wrap">
-            {[
-              { code: 'KBDU', lat: 40.0394, lon: -105.2258, zoom: 13 },
-              { code: 'KBJC', lat: 39.9088, lon: -105.1172, zoom: 13 },
-              { code: 'KEIK', lat: 40.0098, lon: -105.0488, zoom: 13 },
-              { code: 'KLMO', lat: 40.1636, lon: -105.1636, zoom: 13 },
-              { code: 'KAPA', lat: 39.5701, lon: -104.8493, zoom: 13 },
-              { code: 'KGXY', lat: 40.4348, lon: -104.6331, zoom: 13 },
-              { code: 'All', lat: 39.97, lon: -105.03, zoom: 10 },
-            ].map((ap) => (
-              <button
-                key={ap.code}
-                onClick={() => mapRef.current && mapRef.current.flyTo([ap.lat, ap.lon], ap.zoom, { duration: 1 })}
-                className="text-[9px] px-1.5 py-0.5 rounded border border-white/20 text-white/70 hover:border-cyan-400 hover:text-cyan-200"
-              >
-                {ap.code}
-              </button>
-            ))}
-          </div>
           {realImpact && (
             <div className="flex items-center gap-1.5">
               <span className="text-white/50 text-[10px]">heatmap</span>
@@ -2299,63 +2244,69 @@ function MapPage() {
               })}
             </div>
           )}
-          {availableSchools.length > 0 && (
-            <select
-              value={schoolFilter}
-              onChange={(e) => setSchoolFilter(e.target.value)}
-              className="border border-white/15 text-xs rounded-full px-3 py-1 hover:border-white/30 bg-gray-800 text-white/90 max-w-[12rem]"
-            >
-              <option value="all">all schools</option>
-              {availableSchools.map((s) => (
-                <option key={s} value={s}>{s}</option>
-              ))}
-            </select>
-          )}
-          {noiseStats?.purposes && (
-            <select
-              value={purposeFilter}
-              onChange={(e) => setPurposeFilter(e.target.value)}
-              className="border border-white/15 text-xs rounded-full px-3 py-1 hover:border-white/30 bg-gray-800 text-white/90 max-w-[12rem]"
-            >
-              <option value="all">all purposes</option>
-              {noiseStats.purposes.map((p) => (
-                <option key={p} value={p}>{p.replace(/_/g, ' ')}</option>
-              ))}
-            </select>
-          )}
-          {availableBases.length > 0 && (
-            <div className="flex flex-col gap-1">
-              <div className="text-[9px] text-white/40 uppercase tracking-wider px-1">Saved Views</div>
-              <div className="flex items-center gap-1 flex-wrap">
-                <button
-                  onClick={() => setBaseFilter('all')}
-                  className={`px-2.5 py-0.5 text-xs rounded-full border ${
-                    baseFilter === 'all'
-                      ? 'border-cyan-400 bg-cyan-500/20 text-white'
-                      : 'border-white/15 text-white/60 hover:text-white hover:border-white/30'
-                  }`}
+          {/* ── Filters ── */}
+          <div className="flex flex-col gap-1">
+            <div className="text-[9px] text-white/40 uppercase tracking-wider px-1">Filters</div>
+            <div className="flex items-center gap-1 flex-wrap">
+              {availableBases.length > 0 && (
+                <select
+                  value={baseFilter}
+                  onChange={(e) => setBaseFilter(e.target.value)}
+                  className="border border-white/15 text-xs rounded-full px-3 py-1 hover:border-white/30 bg-gray-800 text-white/90"
                 >
-                  all airports
+                  <option value="all">all bases</option>
+                  {availableBases.map((b) => (
+                    <option key={b} value={b}>{b}</option>
+                  ))}
+                </select>
+              )}
+              {availableSchools.length > 0 && (
+                <select
+                  value={schoolFilter}
+                  onChange={(e) => setSchoolFilter(e.target.value)}
+                  className="border border-white/15 text-xs rounded-full px-3 py-1 hover:border-white/30 bg-gray-800 text-white/90 max-w-[12rem]"
+                >
+                  <option value="all">all schools</option>
+                  {availableSchools.map((s) => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+              )}
+              {noiseStats?.purposes && (
+                <select
+                  value={purposeFilter}
+                  onChange={(e) => setPurposeFilter(e.target.value)}
+                  className="border border-white/15 text-xs rounded-full px-3 py-1 hover:border-white/30 bg-gray-800 text-white/90 max-w-[12rem]"
+                >
+                  <option value="all">all purposes</option>
+                  {noiseStats.purposes.map((p) => (
+                    <option key={p} value={p}>{p.replace(/_/g, ' ')}</option>
+                  ))}
+                </select>
+              )}
+            </div>
+          </div>
+          {/* ── Quick Zoom ── */}
+          <div className="flex flex-col gap-1">
+            <div className="text-[9px] text-white/40 uppercase tracking-wider px-1">Quick Zoom</div>
+            <div className="flex items-center gap-1 flex-wrap">
+              {[
+                { code: 'All', lat: 39.97, lon: -105.03, zoom: 10 },
+                { code: 'KBDU', lat: 40.0394, lon: -105.2258, zoom: 13 },
+                { code: 'KBJC', lat: 39.9088, lon: -105.1172, zoom: 13 },
+                { code: 'KEIK', lat: 40.0098, lon: -105.0488, zoom: 13 },
+                { code: 'KLMO', lat: 40.1636, lon: -105.1636, zoom: 13 },
+                { code: 'KAPA', lat: 39.5701, lon: -104.8493, zoom: 13 },
+                { code: 'KGXY', lat: 40.4348, lon: -104.6331, zoom: 13 },
+              ].map(ap => (
+                <button
+                  key={ap.code}
+                  onClick={() => mapRef.current?.flyTo([ap.lat, ap.lon], ap.zoom, { duration: 1 })}
+                  className="text-[10px] px-2 py-0.5 rounded border border-white/20 text-white/70 hover:border-cyan-400 hover:text-cyan-200"
+                >
+                  {ap.code}
                 </button>
-                {availableBases.map((b) => {
-                  const pct = pillStats.basePct[b] ?? 0
-                  const bg = thermalColor(pct, pillStats.maxBase)
-                  return (
-                    <button
-                      key={b}
-                      onClick={() => setBaseFilter(b)}
-                      style={baseFilter !== b ? { backgroundColor: bg } : undefined}
-                      className={`px-2.5 py-0.5 text-xs font-mono rounded-full border ${
-                        baseFilter === b
-                          ? 'border-cyan-400 bg-cyan-500/20 text-white'
-                          : 'border-white/10 text-white/90 hover:brightness-125'
-                      }`}
-                      title={`${b} · ${pct.toFixed(1)}% red`}
-                    >
-                      {b}
-                    </button>
-                  )
-                })}
+              ))}
               </div>
             </div>
           )}
@@ -2425,20 +2376,6 @@ function MapPage() {
                   {noiseStats.purposes.map(p => <option key={p} value={p}>{p.replace(/_/g, ' ')}</option>)}
                 </select>
               )}
-            </div>
-            {/* Quick-fly buttons */}
-            <div className="flex gap-1 w-full overflow-x-auto">
-              {[
-                { code: 'KBDU', lat: 40.0394, lon: -105.2258, zoom: 13 },
-                { code: 'KBJC', lat: 39.9088, lon: -105.1172, zoom: 13 },
-                { code: 'KAPA', lat: 39.5701, lon: -104.8493, zoom: 13 },
-                { code: 'All', lat: 39.97, lon: -105.03, zoom: 10 },
-              ].map(ap => (
-                <button key={ap.code}
-                  onClick={() => { mapRef.current?.flyTo([ap.lat, ap.lon], ap.zoom, { duration: 1 }); setMobileFilters(false) }}
-                  className="text-[9px] px-1.5 py-0.5 rounded border border-white/20 text-white/70 whitespace-nowrap"
-                >{ap.code}</button>
-              ))}
             </div>
           </div>
         )}
@@ -2865,7 +2802,7 @@ The team at Boulder Municipal Airport (KBDU)`
           )
         })()}
         {byBase.length > 0 && (
-          <div className={`absolute bottom-3 right-3 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] w-64 ${
+          <div className={`absolute top-3 left-3 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] w-64 ${
             isMobile ? 'hidden' : ''
           }`}>
             <div className="flex items-center gap-2 mb-1 px-1">

@@ -122,6 +122,26 @@ export async function fetchMyComplaints({ reporter, signal } = {}) {
   return list
 }
 
+/** Fetch ALL complaints (unfiltered). Supports optional time range. */
+export async function fetchAllComplaints({ from, to, signal } = {}) {
+  const params = new URLSearchParams()
+  if (from) params.set('from', from)
+  if (to) params.set('to', to)
+  const qs = params.toString()
+  const res = await fetch(`${BASE}/api/complaints${qs ? '?' + qs : ''}`, { signal })
+  if (!res.ok) throw new Error(`complaints ${res.status}`)
+  const data = await res.json()
+  return data.complaints || []
+}
+
+/** Fetch ALL noise reports (unfiltered). */
+export async function fetchAllNoiseReports({ signal } = {}) {
+  const res = await fetch(`${BASE}/api/noise-reports`, { signal })
+  if (!res.ok) throw new Error(`noise-reports ${res.status}`)
+  const data = await res.json()
+  return data.reports || []
+}
+
 export const KLASS_COLORS = {
   yellow: '#facc15',
   orange: '#fb923c',

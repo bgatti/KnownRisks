@@ -1356,10 +1356,13 @@ function complaintsApiPlugin() {
             reporter: body.reporter || null,
             notes: body.notes || null,
             type: body.type || null,
+            lat: typeof body.lat === 'number' ? body.lat : null,
+            lon: typeof body.lon === 'number' ? body.lon : null,
             location: body.location || null,
             precision: body.precision || null,
             mediaKind: body.mediaKind || null,
             score: typeof body.score === 'number' ? body.score : null,
+            distanceMiles: typeof body.distanceMiles === 'number' ? body.distanceMiles : null,
           }
           if (db.useDb) {
             await db.addComplaint(record)
