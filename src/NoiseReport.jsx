@@ -1529,7 +1529,6 @@ export function NoiseStudio() {
                       reportMode={reportMode}
                       reportSegments={reportSegments}
                       onRemoveSegment={removeReportSegment}
-                      circleCenter={rawCoords}
                     />
                   )}
                 </>
@@ -2049,7 +2048,7 @@ function IdentifyStep({ activeList, activeStatus, typePhotos, selected, onSelect
   )
 }
 
-function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, videoUrl, selectedExcursion, reportMode, reportSegments, onRemoveSegment, circleCenter }) {
+function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, videoUrl, selectedExcursion, reportMode, reportSegments, onRemoveSegment }) {
   return (
     <>
       {/* Mini-map showing reported segments */}
@@ -2058,27 +2057,20 @@ function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, video
           title={`Reported Segment${reportSegments.length > 1 ? 's' : ''}`}
           subtitle={`${reportSegments.length} flight segment${reportSegments.length > 1 ? 's' : ''} selected — tap × to remove`}
         >
-          <SegmentsMiniMap segments={reportSegments} circleCenter={circleCenter} />
+          <SegmentsMiniMap segments={reportSegments} />
           <ul className="mt-2 space-y-1">
             {reportSegments.map((seg, i) => {
               const isExc = !!seg.klass
-              // Distance from reporter to nearest point (Fibonacci tenths of a mile)
-              const distText = (circleCenter && seg.nearestPt)
-                ? `${fibMiles(haversine(circleCenter.lat, circleCenter.lng, seg.nearestPt[0], seg.nearestPt[1]))} mi`
-                : null
               return (
                 <li key={i} className="flex items-center gap-2 text-[11px]">
                   <span
                     className="h-2 w-2 rounded-full flex-shrink-0"
-                    style={{ background: '#fb923c' }}
+                    style={{ background: '#ff8c00' }}
                   />
                   <span className="flex-1 text-neutral-200 truncate">
                     {seg.type || seg.tail || 'Unknown'}
                     {isExc && <span className="text-neutral-500"> · {seg.klass}</span>}
                   </span>
-                  {distText && (
-                    <span className="text-[10px] font-mono text-orange-300 flex-shrink-0">{distText}</span>
-                  )}
                   <button
                     onClick={() => onRemoveSegment(i)}
                     className="text-neutral-500 hover:text-rose-300 flex-shrink-0"
@@ -2454,7 +2446,7 @@ function CircularCaptureButton({
   )
 }
 
-function SegmentsMiniMap({ segments, circleCenter }) {
+function SegmentsMiniMap({ segments }) {
   const ref = useRef(null)
   const mapRef2 = useRef(null)
   useEffect(() => {
@@ -2472,41 +2464,28 @@ function SegmentsMiniMap({ segments, circleCenter }) {
     })
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', { maxZoom: 17 }).addTo(map)
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png', { maxZoom: 17 }).addTo(map)
-    // White audibility circle (same as the main map)
-    if (circleCenter) {
-      L.circle([circleCenter.lat, circleCenter.lng], {
-        radius: 4 * 1852, // 4 NM
-        color: '#fafafa',
-        weight: 1.5,
-        opacity: 0.5,
-        fillColor: '#ffffff',
-        fillOpacity: 0.06,
-        interactive: false,
-      }).addTo(map)
-      bounds.extend([circleCenter.lat, circleCenter.lng])
-    }
-    // Orange selected segments
+    // Only the selected segments in bright orange — no location indicators.
     for (const seg of segments) {
       if (!seg.points?.length) continue
       const pts = seg.points.map((p) => [p[0], p[1]])
       L.polyline(pts, {
-        color: '#fb923c',
+        color: '#ff8c00',
         weight: 6,
-        opacity: 0.95,
+        opacity: 1,
         lineCap: 'round',
         lineJoin: 'round',
       }).addTo(map)
       if (seg.nearestPt) {
         L.circleMarker([seg.nearestPt[0], seg.nearestPt[1]], {
-          radius: 5, color: '#fb923c', weight: 2, fillColor: '#000', fillOpacity: 0.5, interactive: false,
+          radius: 5, color: '#ff8c00', weight: 2, fillColor: '#000', fillOpacity: 0.5, interactive: false,
         }).addTo(map)
       }
       pts.forEach((p) => bounds.extend(p))
     }
-    if (bounds.isValid()) map.fitBounds(bounds.pad(0.15), { maxZoom: 13 })
+    if (bounds.isValid()) map.fitBounds(bounds.pad(0.2), { maxZoom: 14 })
     mapRef2.current = map
     return () => { map.remove(); mapRef2.current = null }
-  }, [segments, circleCenter])
+  }, [segments])
 
   return (
     <div ref={ref} className="w-full h-40 rounded-lg overflow-hidden border border-white/10" style={{ background: '#0a0a0a' }} />
