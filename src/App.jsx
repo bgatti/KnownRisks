@@ -753,7 +753,7 @@ function MapPage() {
   const [serverLoading, setServerLoading] = useState(false)
   // DB-backed mode: auto-detect by checking if the API responds.
   // On local dev (vite), there's no /api/noise backend → falls back to files.
-  const [useServerApi, setUseServerApi] = useState(false)
+  const useServerApi = true
   useEffect(() => {
     fetch('/api/noise/stats').then(r => {
       if (r.ok) setUseServerApi(true)
