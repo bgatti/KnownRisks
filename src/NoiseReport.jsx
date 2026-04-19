@@ -22,7 +22,6 @@ import {
   fetchActiveExcursions,
   fetchOffenseSegments,
   fetchNearbyTracks,
-  fetchLivePositions,
   fetchMyComplaints,
   fetchMyReports,
   postComplaint,
@@ -1053,74 +1052,54 @@ export function NoiseStudio() {
     }
   }, [nearbyTracks, segmentsByTail])
 
-  /* ── Live aircraft positions: poll every 5s, animate icons ────────── */
-  const liveMarkersRef = useRef(new Map()) // hex → L.Marker
+  /* ── Aircraft icons at the leading edge of each drawn live track ── */
+  const liveMarkersRef = useRef(new Map()) // tail → L.Marker
   useEffect(() => {
-    let active = true
-    const tick = async () => {
-      if (!active) return
-      const L = window.L
-      const map = mapRef.current
-      if (!L || !map) return
-      try {
-        const data = await fetchLivePositions({})
-        if (!active) return
-        // Only show icons for aircraft that:
-        // 1. Have a visible track on the map
-        // 2. Are actively broadcasting (updated in the last 60s)
-        const visibleTails = new Set()
-        for (const t of nearbyTracks) if (t.tail && t.live) visibleTails.add(t.tail)
-        for (const t of Object.keys(segmentsByTail)) visibleTails.add(t)
-        const now = Date.now()
+    const L = window.L
+    const map = mapRef.current
+    if (!L || !map) return
 
-        const seen = new Set()
-        for (const pos of data.positions || []) {
-          if (!pos.lat || !pos.lon) continue
-          if (!visibleTails.has(pos.tail)) continue
-          // Skip stale positions (aircraft likely landed)
-          if (pos.updated && now - pos.updated > 60000) continue
-          seen.add(pos.hex)
-          const existing = liveMarkersRef.current.get(pos.hex)
-          if (existing) {
-            // Smooth move: CSS transition on the marker's transform
-            const el = existing.getElement?.()
-            if (el) el.style.transition = 'transform 4.5s linear'
-            existing.setLatLng([pos.lat, pos.lon])
-            // Update rotation
-            if (pos.track != null) {
-              const inner = el?.querySelector?.('img')
-              if (inner) inner.style.transform = `rotate(${pos.track}deg)`
-            }
-          } else {
-            const photo = typePhotos?.[pos.type]
-            const iconHtml = photo
-              ? `<img src="${photo}" alt="${pos.type}" style="width:26px;height:26px;border-radius:50%;border:2px solid rgba(255,255,255,0.7);object-fit:cover;box-shadow:0 2px 8px rgba(0,0,0,0.7);${pos.track != null ? `transform:rotate(${pos.track}deg);` : ''}" />`
-              : `<div style="width:22px;height:22px;border-radius:50%;background:#333;border:2px solid rgba(255,255,255,0.5);display:flex;align-items:center;justify-content:center;font-size:7px;color:#aaa;font-weight:bold">${(pos.type || '?').slice(0,3)}</div>`
-            const icon = L.divIcon({
-              className: 'live-aircraft-icon',
-              html: iconHtml,
-              iconSize: [26, 26],
-              iconAnchor: [13, 13],
-            })
-            const marker = L.marker([pos.lat, pos.lon], { icon, interactive: false, zIndexOffset: 1000 }).addTo(map)
-            liveMarkersRef.current.set(pos.hex, marker)
-          }
-        }
-        // Remove stale markers (aircraft no longer in feed)
-        for (const [hex, marker] of liveMarkersRef.current.entries()) {
-          if (!seen.has(hex)) {
-            marker.remove()
-            liveMarkersRef.current.delete(hex)
-          }
-        }
-      } catch (err) {
-        console.error('[noise-report] live positions error:', err.message)
+    // Clear all existing icons
+    for (const [, marker] of liveMarkersRef.current) marker.remove()
+    liveMarkersRef.current.clear()
+
+    const now = Date.now()
+    for (const track of nearbyTracks) {
+      if (!track.live || !track.segments?.length) continue
+      // Get the very last point of the last segment — that's the leading edge
+      const lastSeg = track.segments[track.segments.length - 1]
+      const lastPt = lastSeg?.points?.[lastSeg.points.length - 1]
+      if (!lastPt) continue
+      // Only show if the last point is recent (< 5 minutes)
+      if (typeof lastPt[3] === 'number' && now - lastPt[3] > 5 * 60 * 1000) continue
+
+      // Compute heading from last two points
+      let hdg = null
+      if (lastSeg.points.length >= 2) {
+        const prev = lastSeg.points[lastSeg.points.length - 2]
+        const toRad = (d) => d * Math.PI / 180
+        const toDeg = (r) => r * 180 / Math.PI
+        const dLon = toRad(lastPt[1] - prev[1])
+        const y = Math.sin(dLon) * Math.cos(toRad(lastPt[0]))
+        const x = Math.cos(toRad(prev[0])) * Math.sin(toRad(lastPt[0])) -
+                  Math.sin(toRad(prev[0])) * Math.cos(toRad(lastPt[0])) * Math.cos(dLon)
+        hdg = Math.round((toDeg(Math.atan2(y, x)) + 360) % 360)
       }
+
+      const photo = typePhotos?.[track.type]
+      const iconHtml = photo
+        ? `<img src="${photo}" alt="${track.type}" style="width:26px;height:26px;border-radius:50%;border:2px solid rgba(255,255,255,0.7);object-fit:cover;box-shadow:0 2px 8px rgba(0,0,0,0.7);${hdg != null ? `transform:rotate(${hdg}deg);` : ''}" />`
+        : `<div style="width:22px;height:22px;border-radius:50%;background:#333;border:2px solid rgba(255,255,255,0.5);display:flex;align-items:center;justify-content:center;font-size:7px;color:#aaa;font-weight:bold">${(track.type || '?').slice(0, 3)}</div>`
+      const icon = L.divIcon({
+        className: 'live-aircraft-icon',
+        html: iconHtml,
+        iconSize: [26, 26],
+        iconAnchor: [13, 13],
+      })
+      const marker = L.marker([lastPt[0], lastPt[1]], { icon, interactive: false, zIndexOffset: 1000 }).addTo(map)
+      liveMarkersRef.current.set(track.tail, marker)
     }
-    tick()
-    const id = setInterval(tick, 5000)
-    return () => { active = false; clearInterval(id) }
-  }, [typePhotos, nearbyTracks, segmentsByTail])
+  }, [nearbyTracks, typePhotos])
 
   /* ── Displayed location text ─────────────────────────────────────── */
   const displayedLocation = useMemo(() => {
