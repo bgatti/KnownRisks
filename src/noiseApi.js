@@ -1,5 +1,10 @@
 // Same-origin — noise/web IS the API server.
 const BASE = ''
+   In local dev, use the Vite proxy at /noise-api. */
+const RAILWAY_API = 'https://web-app-production-fedf.up.railway.app'
+const BASE = typeof window !== 'undefined' && window.location.hostname !== 'localhost'
+  ? RAILWAY_API
+  : '/noise-api'
 
 /**
  * GET /api/noise/leaderboard
@@ -34,19 +39,6 @@ export async function fetchMissions({ signal } = {}) {
   return res.json()
 }
 
-/**
- * GET /api/offenses/boot — Combined active + segments in one request.
- * Returns { active, tracks, window, include, generated_at, live }.
- * Replaces separate fetchActiveExcursions + fetchNearbyTracks calls.
- */
-export async function fetchBoot({ hours = 1, limit = 100, include, signal } = {}) {
-  const params = new URLSearchParams({ hours: String(hours), limit: String(limit) })
-  if (include) params.set('include', Array.isArray(include) ? include.join(',') : include)
-  const res = await fetch(`${BASE}/api/offenses/boot?${params}`, { signal })
-  if (!res.ok) throw new Error(`boot ${res.status}`)
-  return res.json()
-}
-
 export async function fetchActiveExcursions({ hours = 48, include, signal } = {}) {
   const params = new URLSearchParams({ hours: String(hours) })
   if (include) params.set('include', Array.isArray(include) ? include.join(',') : include)
@@ -71,6 +63,16 @@ export async function fetchOffenseSegments({ tail, hours = 24, lat, lng, limit, 
 /** Fetch ALL tracks near a point (offenses + clean overflights). */
 export async function fetchNearbyTracks({ lat, lng, hours = 2, limit = 50, signal } = {}) {
   return fetchOffenseSegments({ lat, lng, hours, limit, signal })
+}
+
+/** Single combined boot call — active excursions + tracks in one request. */
+export async function fetchBoot({ hours = 1, limit = 100, include, signal } = {}) {
+  const params = new URLSearchParams({ hours: String(hours) })
+  if (limit) params.set('limit', String(limit))
+  if (include) params.set('include', Array.isArray(include) ? include.join(',') : include)
+  const res = await fetch(`${BASE}/api/offenses/boot?${params}`, { signal })
+  if (!res.ok) throw new Error(`boot ${res.status}`)
+  return res.json()
 }
 
 /** Lightweight current positions for all live aircraft. */
@@ -140,20 +142,6 @@ export async function fetchMyComplaints({ reporter, signal } = {}) {
   // Server may not filter by reporter yet — enforce client-side as a safety.
   if (reporter) list = list.filter((c) => (c.reporter || '') === reporter)
   return list
-}
-
-export async function fetchAllComplaints({ signal } = {}) {
-  const res = await fetch(`${BASE}/api/complaints`, { signal })
-  if (!res.ok) throw new Error(`complaints ${res.status}`)
-  const data = await res.json()
-  return data.complaints || []
-}
-
-export async function fetchAllNoiseReports({ signal } = {}) {
-  const res = await fetch(`${BASE}/api/noise-reports`, { signal })
-  if (!res.ok) throw new Error(`noise-reports ${res.status}`)
-  const data = await res.json()
-  return data.reports || []
 }
 
 export const KLASS_COLORS = {

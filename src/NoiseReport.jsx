@@ -20,8 +20,7 @@ import {
 } from '@tabler/icons-react'
 import {
   fetchActiveExcursions,
-  fetchOffenseSegments,
-  fetchNearbyTracks,
+  fetchBoot,
   fetchMyComplaints,
   fetchMyReports,
   postComplaint,
@@ -456,29 +455,57 @@ export function NoiseStudio() {
     return () => ctrl.abort()
   }, [rawCoords])
 
-  /* ── Active excursions (initial + periodic refresh) ────────────── */
-  const loadActive = async (signal) => {
-    console.log('[noise-report] loading active excursions…')
+  /* ── Single boot call: active excursions + tracks in one request ── */
+  const loadBoot = async (signal) => {
+    console.log('[noise-report] booting…')
     setActiveStatus((prev) => prev === 'ok' ? 'ok' : 'loading')
     try {
-      const data = await fetchActiveExcursions({
+      const data = await fetchBoot({
         hours: 1,
+        limit: 100,
         include: 'reports,notifications',
         signal,
       })
       if (signal?.aborted) return
+
+      // Active excursions
       const active = (data.active || []).sort((a, b) => (b.lastSeenMs || 0) - (a.lastSeenMs || 0))
-      console.log('[noise-report] active:', active.length)
       setActiveList(active)
       setActiveStatus('ok')
+
+      // Tracks: filter to 30 min, thin points
+      const MAX_PTS = 500
+      const now = Date.now()
+      const WINDOW = 30 * 60 * 1000
+      const tracks = (data.tracks || [])
+        .filter((t) => {
+          const segs = t.segments || []
+          if (!segs.length) return false
+          const lastSeg = segs[segs.length - 1]
+          const lastPt = lastSeg?.points?.[lastSeg.points.length - 1]
+          if (!lastPt) return false
+          if (typeof lastPt[3] !== 'number') return true
+          return now - lastPt[3] < WINDOW
+        })
+        .map((t) => ({
+          ...t,
+          segments: (t.segments || []).map((s) => {
+            if (!s.points || s.points.length <= MAX_PTS) return s
+            const step = Math.ceil(s.points.length / MAX_PTS)
+            return { ...s, points: s.points.filter((_, i) => i % step === 0 || i === s.points.length - 1) }
+          }),
+        }))
+      console.log('[noise-report] boot complete: active:', active.length, 'tracks:', tracks.length, '(from', data.tracks?.length, ')')
+      setNearbyTracks(tracks)
     } catch (err) {
       if (err.name === 'AbortError') return
+      console.error('[noise-report] boot failed:', err.message)
       setActiveStatus('error')
     }
   }
   useEffect(() => {
     const ctrl = new AbortController()
-    loadActive(ctrl.signal)
+    loadBoot(ctrl.signal)
     return () => { ctrl.abort() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -770,17 +797,7 @@ export function NoiseStudio() {
     return () => ctrl.abort()
   }, [rawCoords?.lat, rawCoords?.lng, rawCoords?.source])
 
-  /* ── Cross-street lookup when precision = cross ──────────────────── */
-  useEffect(() => {
-    if (!rawCoords || precision !== 'cross' || crossStreet) return
-    const ctrl = new AbortController()
-    setCrossLoading(true)
-    fetchNearestCrossStreet(rawCoords.lat, rawCoords.lng, { signal: ctrl.signal })
-      .then((r) => { if (!ctrl.signal.aborted) setCrossStreet(r) })
-      .catch(() => {})
-      .finally(() => { if (!ctrl.signal.aborted) setCrossLoading(false) })
-    return () => ctrl.abort()
-  }, [rawCoords, precision, crossStreet])
+  /* ── Cross-street lookup removed — slow and unnecessary ────────── */
 
   // 4 NM audibility radius for GA aircraft at pattern altitude (~7408 meters)
   const AUDIBLE_RADIUS_M = 4 * 1852
@@ -810,53 +827,7 @@ export function NoiseStudio() {
     tryDraw()
   }, [rawCoords, reportOpen])
 
-  /* ── Fetch ALL nearby tracks (initial + refresh every 30s) ────────── */
-  useEffect(() => {
-    // Fetch all recent tracks regardless of coords (no server-side radius filter)
-    const ctrl = new AbortController()
-    const load = () => {
-      // Don't pass lat/lon — the server's 4-mile radius filter is too
-      // tight when the user is several miles from the airport. Fetch all
-      // tracks in the time window and let client-side distance sort handle it.
-      console.log('[noise-report] fetching nearby tracks, coords:', rawCoords?.lat, rawCoords?.lng)
-      fetchNearbyTracks({
-        hours: 1,
-        limit: 100,
-        signal: ctrl.signal,
-      })
-        .then((data) => {
-          if (ctrl.signal.aborted) return
-          // Thin points: keep every Nth point to cap at ~500 per segment
-          const MAX_PTS = 500
-          const now = Date.now()
-          const WINDOW = 30 * 60 * 1000 // 30 minutes
-          const tracks = (data.tracks || [])
-            .filter((t) => {
-              const segs = t.segments || []
-              if (!segs.length) return false
-              const lastSeg = segs[segs.length - 1]
-              const lastPt = lastSeg?.points?.[lastSeg.points.length - 1]
-              if (!lastPt) return false
-              if (typeof lastPt[3] !== 'number') return true
-              return now - lastPt[3] < WINDOW
-            })
-            .map((t) => ({
-              ...t,
-              segments: (t.segments || []).map((s) => {
-                if (!s.points || s.points.length <= MAX_PTS) return s
-                const step = Math.ceil(s.points.length / MAX_PTS)
-                return { ...s, points: s.points.filter((_, i) => i % step === 0 || i === s.points.length - 1) }
-              }),
-            }))
-          console.log('[noise-report] nearby tracks:', tracks.length, '(filtered from', data.tracks?.length, ')')
-          setNearbyTracks(tracks)
-        })
-        .catch((err) => { console.error('[noise-report] nearby fetch failed', err) })
-    }
-    load()
-    return () => { ctrl.abort() }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []) // run once on mount — no coords dependency
+  /* ── Tracks now loaded via boot call above ──────────────────────── */
 
   // Build a set of keys for segments already reported (from sessionReports).
   // Used to render those segments in blue + tooltip.
@@ -1333,7 +1304,7 @@ export function NoiseStudio() {
     }, ...prev])
     // Refresh server-side lists then transition to My Reports after a brief pause.
     loadMyComplaints()
-    loadActive()
+    loadBoot()
 
     // After 1.5s, close the wizard and open the reports panel so the user
     // sees their saved reports with the new one at the top.
