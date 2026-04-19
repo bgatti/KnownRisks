@@ -22,6 +22,7 @@ import {
   fetchActiveExcursions,
   fetchOffenseSegments,
   fetchNearbyTracks,
+  fetchLivePositions,
   fetchMyComplaints,
   fetchMyReports,
   postComplaint,
@@ -1037,20 +1038,7 @@ export function NoiseStudio() {
         nearbyTracesRef.current.push(line, hit)
       }
 
-      // Aircraft photo icon at current position (last point of last segment)
-      if (lastPt && track.live) {
-        const photo = typePhotos?.[track.type]
-        if (photo) {
-          const icon = L.divIcon({
-            className: 'aircraft-photo-icon',
-            html: `<img src="${photo}" alt="${track.type}" style="width:28px;height:28px;border-radius:50%;border:2px solid rgba(255,255,255,0.6);object-fit:cover;box-shadow:0 2px 8px rgba(0,0,0,0.7);" />`,
-            iconSize: [28, 28],
-            iconAnchor: [14, 14],
-          })
-          const marker = L.marker([lastPt[0], lastPt[1]], { icon, interactive: false }).addTo(map)
-          nearbyTracesRef.current.push(marker)
-        }
-      }
+      // Aircraft icons now managed by the live-positions poll effect.
     }
     // Snake-draw animation for nearby tracks
     const nearbyQueue = nearbyTracesRef.current.filter((p) => p._segLastMs != null)
@@ -1064,6 +1052,64 @@ export function NoiseStudio() {
       try { localStorage.setItem('noise-report-crash', `${new Date().toISOString()} ${err.message}\n${err.stack}`) } catch {}
     }
   }, [nearbyTracks, segmentsByTail])
+
+  /* ── Live aircraft positions: poll every 5s, animate icons ────────── */
+  const liveMarkersRef = useRef(new Map()) // hex → L.Marker
+  useEffect(() => {
+    let active = true
+    const tick = async () => {
+      if (!active) return
+      const L = window.L
+      const map = mapRef.current
+      if (!L || !map) return
+      try {
+        const data = await fetchLivePositions({})
+        if (!active) return
+        const seen = new Set()
+        for (const pos of data.positions || []) {
+          if (!pos.lat || !pos.lon) continue
+          seen.add(pos.hex)
+          const existing = liveMarkersRef.current.get(pos.hex)
+          if (existing) {
+            // Smooth move: CSS transition on the marker's transform
+            const el = existing.getElement?.()
+            if (el) el.style.transition = 'transform 4.5s linear'
+            existing.setLatLng([pos.lat, pos.lon])
+            // Update rotation
+            if (pos.track != null) {
+              const inner = el?.querySelector?.('img')
+              if (inner) inner.style.transform = `rotate(${pos.track}deg)`
+            }
+          } else {
+            const photo = typePhotos?.[pos.type]
+            const iconHtml = photo
+              ? `<img src="${photo}" alt="${pos.type}" style="width:26px;height:26px;border-radius:50%;border:2px solid rgba(255,255,255,0.7);object-fit:cover;box-shadow:0 2px 8px rgba(0,0,0,0.7);${pos.track != null ? `transform:rotate(${pos.track}deg);` : ''}" />`
+              : `<div style="width:22px;height:22px;border-radius:50%;background:#333;border:2px solid rgba(255,255,255,0.5);display:flex;align-items:center;justify-content:center;font-size:7px;color:#aaa;font-weight:bold">${(pos.type || '?').slice(0,3)}</div>`
+            const icon = L.divIcon({
+              className: 'live-aircraft-icon',
+              html: iconHtml,
+              iconSize: [26, 26],
+              iconAnchor: [13, 13],
+            })
+            const marker = L.marker([pos.lat, pos.lon], { icon, interactive: false, zIndexOffset: 1000 }).addTo(map)
+            liveMarkersRef.current.set(pos.hex, marker)
+          }
+        }
+        // Remove stale markers (aircraft no longer in feed)
+        for (const [hex, marker] of liveMarkersRef.current.entries()) {
+          if (!seen.has(hex)) {
+            marker.remove()
+            liveMarkersRef.current.delete(hex)
+          }
+        }
+      } catch (err) {
+        console.error('[noise-report] live positions error:', err.message)
+      }
+    }
+    tick()
+    const id = setInterval(tick, 5000)
+    return () => { active = false; clearInterval(id) }
+  }, [typePhotos])
 
   /* ── Displayed location text ─────────────────────────────────────── */
   const displayedLocation = useMemo(() => {
@@ -1459,6 +1505,7 @@ export function NoiseStudio() {
                   drop-shadow(0 5px 9px rgba(0,0,0,0.65));
           cursor: pointer;
         }
+        .live-aircraft-icon { transition: transform 4.5s linear; }
         .crosshair-marker {
           filter: drop-shadow(0 0 6px rgba(251,146,60,0.8));
         }

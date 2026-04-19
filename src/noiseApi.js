@@ -60,6 +60,13 @@ export async function fetchNearbyTracks({ lat, lng, hours = 2, limit = 50, signa
   return fetchOffenseSegments({ lat, lng, hours, limit, signal })
 }
 
+/** Lightweight current positions for all live aircraft. */
+export async function fetchLivePositions({ signal } = {}) {
+  const res = await fetch(`${BASE}/api/live/positions`, { signal })
+  if (!res.ok) throw new Error(`positions ${res.status}`)
+  return res.json()
+}
+
 /**
  * POST the full noise report (metadata) to the noise/web archive store.
  * Lives alongside /api/complaints so all noise-related persistence is in
@@ -120,26 +127,6 @@ export async function fetchMyComplaints({ reporter, signal } = {}) {
   // Server may not filter by reporter yet — enforce client-side as a safety.
   if (reporter) list = list.filter((c) => (c.reporter || '') === reporter)
   return list
-}
-
-/** Fetch ALL complaints (unfiltered). Supports optional time range. */
-export async function fetchAllComplaints({ from, to, signal } = {}) {
-  const params = new URLSearchParams()
-  if (from) params.set('from', from)
-  if (to) params.set('to', to)
-  const qs = params.toString()
-  const res = await fetch(`${BASE}/api/complaints${qs ? '?' + qs : ''}`, { signal })
-  if (!res.ok) throw new Error(`complaints ${res.status}`)
-  const data = await res.json()
-  return data.complaints || []
-}
-
-/** Fetch ALL noise reports (unfiltered). */
-export async function fetchAllNoiseReports({ signal } = {}) {
-  const res = await fetch(`${BASE}/api/noise-reports`, { signal })
-  if (!res.ok) throw new Error(`noise-reports ${res.status}`)
-  const data = await res.json()
-  return data.reports || []
 }
 
 export const KLASS_COLORS = {

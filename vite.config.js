@@ -2092,6 +2092,68 @@ function externalDataPlugin() {
   }
 }
 
+// GET /api/live/positions — lightweight current positions for all live aircraft.
+// Returns just the last point per track with computed heading. 5s cache via loadLive.
+function livePositionsPlugin() {
+  const loadLive = async (fs, path) => {
+    if (db.useDb) return db.loadLiveFromDb()
+    try {
+      const buf = await fs.readFile(path.resolve('public/tracks_live.json'), 'utf8')
+      return JSON.parse(buf)
+    } catch { return { tracks: [], updated_at: null } }
+  }
+  const bearing = (lat1, lon1, lat2, lon2) => {
+    const toRad = (d) => d * Math.PI / 180
+    const toDeg = (r) => r * 180 / Math.PI
+    const dLon = toRad(lon2 - lon1)
+    const y = Math.sin(dLon) * Math.cos(toRad(lat2))
+    const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+              Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLon)
+    return (toDeg(Math.atan2(y, x)) + 360) % 360
+  }
+  return {
+    name: 'live-positions',
+    configureServer(server) {
+      server.middlewares.use('/api/live/positions', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const { default: fs } = await import('fs/promises')
+          const { default: path } = await import('path')
+          const live = await loadLive(fs, path)
+          const positions = []
+          for (const t of live.tracks || []) {
+            if (!t.points?.length) continue
+            const last = t.points[t.points.length - 1]
+            let hdg = null
+            if (t.points.length >= 2) {
+              const prev = t.points[t.points.length - 2]
+              hdg = Math.round(bearing(prev[0], prev[1], last[0], last[1]))
+            }
+            positions.push({
+              tail: t.call || t.hex,
+              hex: t.hex,
+              type: t.type || '',
+              lat: last[0],
+              lon: last[1],
+              alt: last[2] || null,
+              track: hdg,
+              updated: last[3] || null,
+            })
+          }
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({ at: live.updated_at, count: positions.length, positions }))
+        } catch (err) {
+          console.error('[live-positions] error', err)
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+    },
+  }
+}
+
 export default defineConfig({
   plugins: [
     react(),
@@ -2104,6 +2166,7 @@ export default defineConfig({
     noiseReportsApiPlugin(),
     pilotApiPlugin(),
     !db.useDb && liveCapturePlugin(),
+    livePositionsPlugin(),
     // On Railway, strip the @vite/client HMR script from HTML to prevent
     // reload loops (the dev server WebSocket is unreachable via the proxy).
     process.env.RAILWAY_ENVIRONMENT && {
