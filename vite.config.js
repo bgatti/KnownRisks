@@ -2,6 +2,7 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import crypto from 'crypto'
 import * as db from './db.js'
+import * as adsb from './adsb.js'
 
 // JSON file-backed ledger store. Each instance owns one file (e.g.
 // data/reports.json) and serializes concurrent mutations through a single
@@ -2154,6 +2155,494 @@ function livePositionsPlugin() {
   }
 }
 
+// ── ADS-B API ──────────────────────────────────────────────────────────
+// Endpoints: /api/adsb/live, /api/adsb/track/:icao, /api/adsb/flights,
+// /api/adsb/flights/:id/track, /api/adsb/stats, /api/adsb/active-tow,
+// /api/adsb/config/fleet, /api/adsb/config/zones, WS /api/adsb/stream
+function adsbApiPlugin() {
+  // Cache extracted flights so we don't re-process on every request
+  let flightsCache = { ts: 0, flights: [], byId: new Map() }
+  const FLIGHTS_TTL = 10_000
+
+  const loadLive = async () => {
+    if (db.useDb) return db.loadLiveFromDb()
+    const fs = await import('fs/promises')
+    const path = await import('path')
+    try {
+      const buf = await fs.default.readFile(path.default.resolve('public/tracks_live.json'), 'utf8')
+      return JSON.parse(buf)
+    } catch { return { tracks: [], updated_at: null } }
+  }
+
+  const buildFlights = async (zoneConfig, fleet, filterTail, filterFrom, filterTo) => {
+    const now = Date.now()
+    if (now - flightsCache.ts < FLIGHTS_TTL && !filterTail && !filterFrom) {
+      return flightsCache
+    }
+
+    const live = await loadLive()
+    const allFlights = []
+    const byId = new Map()
+
+    for (const t of live.tracks || []) {
+      const hex = t.hex || ''
+      const tail = t.call || hex
+      const fleetEntry = fleet[hex]
+
+      // Only process fleet aircraft, or filter by tail
+      if (filterTail && tail !== filterTail && hex !== filterTail) continue
+      if (!filterTail && !fleetEntry) continue
+
+      if (!t.points?.length) continue
+      const cycles = adsb.extractTowCycles(hex, tail, t.points, zoneConfig)
+      for (const f of cycles) {
+        if (fleetEntry) {
+          f.operator = fleetEntry.operator
+          f.role = fleetEntry.role
+        }
+        // Date filtering
+        if (filterFrom && f.date && f.date < filterFrom) continue
+        if (filterTo && f.date && f.date > filterTo) continue
+        allFlights.push(f)
+        byId.set(f.id, { flight: f, points: t.points })
+      }
+    }
+
+    const cache = { ts: now, flights: allFlights, byId }
+    if (!filterTail && !filterFrom) flightsCache = cache
+    return cache
+  }
+
+  // WebSocket clients for /api/adsb/stream
+  const wsClients = new Set()
+  let wsBroadcastTimer = null
+
+  return {
+    name: 'adsb-api',
+    async configureServer(server) {
+      // ── GET /api/adsb/live ──────────────────────────────────────────
+      server.middlewares.use('/api/adsb/live', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const icaoFilter = u.searchParams.get('icao')
+          const filterSet = icaoFilter ? new Set(icaoFilter.split(',').map(s => s.trim().toLowerCase())) : null
+
+          const fleet = await adsb.loadFleet()
+          const live = await loadLive()
+          const aircraft = []
+
+          for (const t of live.tracks || []) {
+            const hex = (t.hex || '').toLowerCase()
+            if (filterSet && !filterSet.has(hex)) continue
+
+            if (!t.points?.length) continue
+            const last = t.points[t.points.length - 1]
+            const fleetEntry = fleet[hex]
+
+            // Compute groundspeed from last two points
+            let gs = null, track_deg = null, vs = null
+            if (t.points.length >= 2) {
+              const prev = t.points[t.points.length - 2]
+              const dtSec = ((last[3] || 0) - (prev[3] || 0)) / 1000
+              if (dtSec > 0) {
+                const cos = Math.cos(((prev[0] + last[0]) / 2) * Math.PI / 180)
+                const dx = (last[1] - prev[1]) * 364560 * cos
+                const dy = (last[0] - prev[0]) * 364560
+                const dFt = Math.hypot(dx, dy)
+                gs = Math.round((dFt / 6076.12) / (dtSec / 3600))
+                track_deg = Math.round((Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360)
+                if (prev[2] != null && last[2] != null) {
+                  vs = Math.round((last[2] - prev[2]) / (dtSec / 60))
+                }
+              }
+            }
+
+            const lastSeenS = last[3] ? Math.round((Date.now() - last[3]) / 1000) : null
+
+            aircraft.push({
+              icao: hex,
+              tail: fleetEntry?.tail || t.call || hex,
+              lat: last[0],
+              lon: last[1],
+              alt_ft: last[2] || null,
+              gs_kts: gs,
+              track_deg,
+              vs_fpm: vs,
+              squawk: null, // not in our data yet
+              last_seen_s: lastSeenS,
+            })
+          }
+
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({ aircraft }))
+        } catch (err) {
+          console.error('[adsb/live] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+
+      // ── GET /api/adsb/track/:icao ──────────────────────────────────
+      server.middlewares.use('/api/adsb/track/', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          // Extract icao from path: /api/adsb/track/a59663 → url is /a59663
+          const icao = u.pathname.replace(/^\//, '').toLowerCase()
+          if (!icao) {
+            res.statusCode = 400
+            res.end(JSON.stringify({ error: 'icao required' }))
+            return
+          }
+
+          const sinceParam = u.searchParams.get('since')
+          const since = sinceParam ? new Date(sinceParam).getTime() : Date.now() - 4 * 3600 * 1000
+
+          const fleet = await adsb.loadFleet()
+          const zoneConfig = await adsb.loadZones()
+          const live = await loadLive()
+
+          let track = null
+          for (const t of live.tracks || []) {
+            if ((t.hex || '').toLowerCase() === icao) {
+              track = t
+              break
+            }
+          }
+
+          if (!track) {
+            res.statusCode = 404
+            res.end(JSON.stringify({ error: 'icao not found' }))
+            return
+          }
+
+          // Filter points by since timestamp
+          const filtered = (track.points || []).filter(p =>
+            !p[3] || p[3] >= since
+          )
+
+          const phases = adsb.detectPhases(filtered, zoneConfig)
+          const tail = fleet[icao]?.tail || track.call || icao
+
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({
+            icao,
+            tail,
+            points: filtered.map(p => ({
+              ts: p[3] ? new Date(p[3]).toISOString() : null,
+              lat: p[0], lon: p[1], alt: p[2],
+              gs: null, vs: null,
+            })),
+            phases: phases.map(p => ({
+              type: p.type,
+              start_ts: p.start_ts ? new Date(p.start_ts).toISOString() : null,
+              end_ts: p.end_ts ? new Date(p.end_ts).toISOString() : null,
+              alt_start: p.alt_start,
+              alt_end: p.alt_end,
+            })),
+          }))
+        } catch (err) {
+          console.error('[adsb/track] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+
+      // ── GET /api/adsb/flights/:id/track (must register BEFORE /api/adsb/flights)
+      server.middlewares.use('/api/adsb/flights/', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+        const pathParts = u.pathname.replace(/^\//, '').split('/')
+
+        // /api/adsb/flights/:id/track → pathParts = [":id", "track"]
+        if (pathParts.length === 2 && pathParts[1] === 'track') {
+          try {
+            const flightId = pathParts[0]
+            const fleet = await adsb.loadFleet()
+            const zoneConfig = await adsb.loadZones()
+            const { byId } = await buildFlights(zoneConfig, fleet)
+
+            const entry = byId.get(flightId)
+            if (!entry) {
+              res.statusCode = 404
+              res.end(JSON.stringify({ error: 'flight not found' }))
+              return
+            }
+
+            const { flight, points } = entry
+            const startIdx = flight._startIdx || 0
+            const endIdx = flight._endIdx || points.length - 1
+            const slice = points.slice(startIdx, endIdx + 1)
+
+            res.setHeader('Content-Type', 'application/json')
+            res.setHeader('Access-Control-Allow-Origin', '*')
+            res.end(JSON.stringify({
+              id: flight.id,
+              icao: flight.icao,
+              tail: flight.tail,
+              points: slice.map(p => ({
+                ts: p[3] ? new Date(p[3]).toISOString() : null,
+                lat: p[0], lon: p[1], alt: p[2],
+              })),
+            }))
+          } catch (err) {
+            console.error('[adsb/flights/track] error', err)
+            res.statusCode = 500
+            res.end(JSON.stringify({ error: String(err) }))
+          }
+          return
+        }
+
+        // Fall through to /api/adsb/flights list handler
+        return next()
+      })
+
+      // ── GET /api/adsb/flights ──────────────────────────────────────
+      server.middlewares.use('/api/adsb/flights', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const tail = u.searchParams.get('tail')
+          const from = u.searchParams.get('from')
+          const to = u.searchParams.get('to')
+
+          const fleet = await adsb.loadFleet()
+          const zoneConfig = await adsb.loadZones()
+          const { flights } = await buildFlights(zoneConfig, fleet, tail, from, to)
+
+          // Strip internal fields
+          const clean = flights.map(({ _startIdx, _endIdx, ...rest }) => rest)
+
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({ flights: clean }))
+        } catch (err) {
+          console.error('[adsb/flights] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+
+      // ── GET /api/adsb/stats ────────────────────────────────────────
+      server.middlewares.use('/api/adsb/stats', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const tail = u.searchParams.get('tail')
+          const from = u.searchParams.get('from')
+          const to = u.searchParams.get('to')
+          const groupBy = u.searchParams.get('group_by') || 'all'
+
+          const fleet = await adsb.loadFleet()
+          const zoneConfig = await adsb.loadZones()
+          const { flights } = await buildFlights(zoneConfig, fleet, tail, from, to)
+          const groups = adsb.aggregateStats(flights, groupBy)
+
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({ groups }))
+        } catch (err) {
+          console.error('[adsb/stats] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+
+      // ── GET /api/adsb/active-tow ───────────────────────────────────
+      server.middlewares.use('/api/adsb/active-tow', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const fleet = await adsb.loadFleet()
+          const zoneConfig = await adsb.loadZones()
+          const live = await loadLive()
+
+          // Pair tow planes with gliders via ADS-B proximity
+          const gliderPairs = adsb.pairTowWithGliders(live.tracks || [], fleet, zoneConfig)
+
+          const towPlanes = []
+          for (const t of live.tracks || []) {
+            const hex = (t.hex || '').toLowerCase()
+            const entry = fleet[hex]
+            if (!entry || entry.role !== 'tow') continue
+            if (!t.points?.length) continue
+
+            const state = adsb.currentPhase(t.points, zoneConfig)
+            if (!state) continue
+
+            const eta = adsb.predictEta(
+              state.phase, state.current_alt_ft || 0, state.climb_rate_fpm || 0, zoneConfig
+            )
+
+            // Find current cycle start
+            const phases = adsb.detectPhases(t.points, zoneConfig)
+            let cycleStart = null
+            for (let i = phases.length - 1; i >= 0; i--) {
+              if (phases[i].type === 'on_ground' || phases[i].type === 'taxiing') {
+                cycleStart = phases[i].end_ts ? new Date(phases[i].end_ts).toISOString() : null
+                break
+              }
+            }
+
+            const pair = gliderPairs.get(hex)
+            towPlanes.push({
+              tail: entry.tail,
+              icao: hex,
+              phase: state.phase,
+              current_alt_ft: state.current_alt_ft,
+              climb_rate_fpm: state.climb_rate_fpm,
+              est_release_ts: eta.est_release_s != null
+                ? new Date(Date.now() + eta.est_release_s * 1000).toISOString()
+                : null,
+              est_available_ts: eta.est_available_s != null
+                ? new Date(Date.now() + eta.est_available_s * 1000).toISOString()
+                : null,
+              current_cycle_start_ts: cycleStart,
+              paired_glider_tail: pair?.glider_tail || null,
+              paired_glider_icao: pair?.glider_hex || null,
+            })
+          }
+
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({ tow_planes: towPlanes }))
+        } catch (err) {
+          console.error('[adsb/active-tow] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+
+      // ── GET/PUT /api/adsb/config/fleet ─────────────────────────────
+      server.middlewares.use('/api/adsb/config/fleet', async (req, res, next) => {
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, OPTIONS')
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+        if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return }
+
+        if (req.method === 'GET') {
+          const fleet = await adsb.loadFleet()
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify(fleet))
+          return
+        }
+        if (req.method === 'PUT') {
+          try {
+            const body = await readJsonBody(req)
+            await adsb.saveFleet(body)
+            flightsCache = { ts: 0, flights: [], byId: new Map() }
+            res.setHeader('Content-Type', 'application/json')
+            res.end(JSON.stringify({ ok: true }))
+          } catch (err) {
+            res.statusCode = 400
+            res.end(JSON.stringify({ error: String(err) }))
+          }
+          return
+        }
+        next()
+      })
+
+      // ── GET/PUT /api/adsb/config/zones ─────────────────────────────
+      server.middlewares.use('/api/adsb/config/zones', async (req, res, next) => {
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, OPTIONS')
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+        if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return }
+
+        if (req.method === 'GET') {
+          const zones = await adsb.loadZones()
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify(zones))
+          return
+        }
+        if (req.method === 'PUT') {
+          try {
+            const body = await readJsonBody(req)
+            await adsb.saveZones(body)
+            flightsCache = { ts: 0, flights: [], byId: new Map() }
+            res.setHeader('Content-Type', 'application/json')
+            res.end(JSON.stringify({ ok: true }))
+          } catch (err) {
+            res.statusCode = 400
+            res.end(JSON.stringify({ error: String(err) }))
+          }
+          return
+        }
+        next()
+      })
+
+      // ── WebSocket /api/adsb/stream ─────────────────────────────────
+      // Piggybacks on the Vite HMR WebSocket server. Clients connect to
+      // ws://host:port/api/adsb/stream and receive JSON messages.
+      if (server.httpServer) {
+        const { WebSocketServer } = await import('ws')
+        const wss = new WebSocketServer({ noServer: true })
+
+        server.httpServer.on('upgrade', (req, socket, head) => {
+          if (req.url === '/api/adsb/stream') {
+            wss.handleUpgrade(req, socket, head, (ws) => {
+              wsClients.add(ws)
+              ws.on('close', () => wsClients.delete(ws))
+              ws.on('error', () => wsClients.delete(ws))
+            })
+          }
+          // Let other upgrade requests (Vite HMR) pass through
+        })
+
+        // Broadcast position updates every 2s
+        const broadcast = async () => {
+          if (wsClients.size === 0) return
+          try {
+            const fleet = await adsb.loadFleet()
+            const zoneConfig = await adsb.loadZones()
+            const live = await loadLive()
+
+            for (const t of live.tracks || []) {
+              const hex = (t.hex || '').toLowerCase()
+              const entry = fleet[hex]
+              if (!entry) continue
+              if (!t.points?.length) continue
+
+              const last = t.points[t.points.length - 1]
+              const state = adsb.currentPhase(t.points, zoneConfig)
+
+              const msg = JSON.stringify({
+                type: 'position',
+                icao: hex,
+                tail: entry.tail,
+                lat: last[0],
+                lon: last[1],
+                alt: last[2] || null,
+                vs: state?.climb_rate_fpm || null,
+                gs: null,
+              })
+
+              for (const ws of wsClients) {
+                try { ws.send(msg) } catch {}
+              }
+            }
+          } catch (err) {
+            console.error('[adsb/stream] broadcast error', err)
+          }
+        }
+
+        if (wsBroadcastTimer) clearInterval(wsBroadcastTimer)
+        wsBroadcastTimer = setInterval(broadcast, 2000)
+        server.httpServer.on('close', () => {
+          if (wsBroadcastTimer) { clearInterval(wsBroadcastTimer); wsBroadcastTimer = null }
+          for (const ws of wsClients) try { ws.close() } catch {}
+          wsClients.clear()
+        })
+        console.log('[adsb-api] WebSocket stream registered at /api/adsb/stream')
+      }
+
+      console.log('[adsb-api] endpoints registered: /api/adsb/{live,track,flights,stats,active-tow,config/*,stream}')
+    },
+  }
+}
+
 export default defineConfig({
   plugins: [
     react(),
@@ -2167,6 +2656,7 @@ export default defineConfig({
     pilotApiPlugin(),
     !db.useDb && liveCapturePlugin(),
     livePositionsPlugin(),
+    adsbApiPlugin(),
     // On Railway, strip the @vite/client HMR script from HTML to prevent
     // reload loops (the dev server WebSocket is unreachable via the proxy).
     process.env.RAILWAY_ENVIRONMENT && {

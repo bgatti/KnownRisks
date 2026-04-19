@@ -1065,9 +1065,15 @@ export function NoiseStudio() {
       try {
         const data = await fetchLivePositions({})
         if (!active) return
+        // Only show icons for aircraft that have a visible track on the map
+        const visibleTails = new Set()
+        for (const t of nearbyTracks) if (t.tail) visibleTails.add(t.tail)
+        for (const t of Object.keys(segmentsByTail)) visibleTails.add(t)
+
         const seen = new Set()
         for (const pos of data.positions || []) {
           if (!pos.lat || !pos.lon) continue
+          if (!visibleTails.has(pos.tail)) continue
           seen.add(pos.hex)
           const existing = liveMarkersRef.current.get(pos.hex)
           if (existing) {
@@ -1109,7 +1115,7 @@ export function NoiseStudio() {
     tick()
     const id = setInterval(tick, 5000)
     return () => { active = false; clearInterval(id) }
-  }, [typePhotos])
+  }, [typePhotos, nearbyTracks, segmentsByTail])
 
   /* ── Displayed location text ─────────────────────────────────────── */
   const displayedLocation = useMemo(() => {
