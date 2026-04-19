@@ -928,15 +928,29 @@ export function NoiseStudio() {
           if (ctrl.signal.aborted) return
           // Thin points: keep every Nth point to cap at ~500 per segment
           const MAX_PTS = 500
-          const tracks = (data.tracks || []).map((t) => ({
-            ...t,
-            segments: (t.segments || []).map((s) => {
-              if (!s.points || s.points.length <= MAX_PTS) return s
-              const step = Math.ceil(s.points.length / MAX_PTS)
-              return { ...s, points: s.points.filter((_, i) => i % step === 0 || i === s.points.length - 1) }
-            }),
-          }))
-          console.log('[noise-report] nearby tracks:', tracks.length, 'segments:', tracks.reduce((n, t) => n + (t.segments?.length || 0), 0))
+          const now = Date.now()
+          const TWO_HOURS = 2 * 60 * 60 * 1000
+          const tracks = (data.tracks || [])
+            // Filter out stale tracks: last point must be within 2 hours
+            .filter((t) => {
+              const segs = t.segments || []
+              if (!segs.length) return false
+              const lastSeg = segs[segs.length - 1]
+              const lastPt = lastSeg?.points?.[lastSeg.points.length - 1]
+              if (!lastPt) return false
+              // If no timestamp, keep it (historical tracks)
+              if (typeof lastPt[3] !== 'number') return true
+              return now - lastPt[3] < TWO_HOURS
+            })
+            .map((t) => ({
+              ...t,
+              segments: (t.segments || []).map((s) => {
+                if (!s.points || s.points.length <= MAX_PTS) return s
+                const step = Math.ceil(s.points.length / MAX_PTS)
+                return { ...s, points: s.points.filter((_, i) => i % step === 0 || i === s.points.length - 1) }
+              }),
+            }))
+          console.log('[noise-report] nearby tracks:', tracks.length, '(filtered from', data.tracks?.length, ')')
           setNearbyTracks(tracks)
         })
         .catch((err) => { console.error('[noise-report] nearby fetch failed', err) })
