@@ -462,7 +462,7 @@ export function NoiseStudio() {
     setActiveStatus((prev) => prev === 'ok' ? 'ok' : 'loading')
     try {
       const data = await fetchActiveExcursions({
-        hours: 2,
+        hours: 1,
         include: 'reports,notifications',
         signal,
       })
@@ -653,7 +653,7 @@ export function NoiseStudio() {
           const baseWeight = seg.klass === 'red' ? 6 : seg.klass === 'orange' ? 5.5 : seg.klass === 'yellow' ? 5 : 3.5
           const weight = selectedTail === tail ? baseWeight + 1.5 : baseWeight
           // Time-based fade: live = full, 2 hours old = faint
-          const WINDOW_MS = 2 * 60 * 60 * 1000
+          const WINDOW_MS = 30 * 60 * 1000
           const age = segLastMs ? (Date.now() - segLastMs) / WINDOW_MS : 0
           const timeOpacity = Math.max(0.15, 1 - age * 0.85)
           const opacity = isDim ? 0.25 : timeOpacity
@@ -920,8 +920,8 @@ export function NoiseStudio() {
       // tracks in the time window and let client-side distance sort handle it.
       console.log('[noise-report] fetching nearby tracks, coords:', rawCoords?.lat, rawCoords?.lng)
       fetchNearbyTracks({
-        hours: 2,
-        limit: 20,
+        hours: 1,
+        limit: 100,
         signal: ctrl.signal,
       })
         .then((data) => {
@@ -929,18 +929,16 @@ export function NoiseStudio() {
           // Thin points: keep every Nth point to cap at ~500 per segment
           const MAX_PTS = 500
           const now = Date.now()
-          const TWO_HOURS = 2 * 60 * 60 * 1000
+          const WINDOW = 30 * 60 * 1000 // 30 minutes
           const tracks = (data.tracks || [])
-            // Filter out stale tracks: last point must be within 2 hours
             .filter((t) => {
               const segs = t.segments || []
               if (!segs.length) return false
               const lastSeg = segs[segs.length - 1]
               const lastPt = lastSeg?.points?.[lastSeg.points.length - 1]
               if (!lastPt) return false
-              // If no timestamp, keep it (historical tracks)
               if (typeof lastPt[3] !== 'number') return true
-              return now - lastPt[3] < TWO_HOURS
+              return now - lastPt[3] < WINDOW
             })
             .map((t) => ({
               ...t,
@@ -989,7 +987,7 @@ export function NoiseStudio() {
     if (!nearbyTracks.length) return
 
     const now = Date.now()
-    const WINDOW_MS = 2 * 60 * 60 * 1000 // 2 hours
+    const WINDOW_MS = 30 * 60 * 1000 // 30 minutes
 
     for (const track of nearbyTracks) {
       // Skip tracks already rendered by the offense draw effect
