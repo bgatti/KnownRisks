@@ -1065,15 +1065,20 @@ export function NoiseStudio() {
       try {
         const data = await fetchLivePositions({})
         if (!active) return
-        // Only show icons for aircraft that have a visible track on the map
+        // Only show icons for aircraft that:
+        // 1. Have a visible track on the map
+        // 2. Are actively broadcasting (updated in the last 60s)
         const visibleTails = new Set()
-        for (const t of nearbyTracks) if (t.tail) visibleTails.add(t.tail)
+        for (const t of nearbyTracks) if (t.tail && t.live) visibleTails.add(t.tail)
         for (const t of Object.keys(segmentsByTail)) visibleTails.add(t)
+        const now = Date.now()
 
         const seen = new Set()
         for (const pos of data.positions || []) {
           if (!pos.lat || !pos.lon) continue
           if (!visibleTails.has(pos.tail)) continue
+          // Skip stale positions (aircraft likely landed)
+          if (pos.updated && now - pos.updated > 60000) continue
           seen.add(pos.hex)
           const existing = liveMarkersRef.current.get(pos.hex)
           if (existing) {
