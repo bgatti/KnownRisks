@@ -477,24 +477,25 @@ export function NoiseStudio() {
       const MAX_PTS = 500
       const now = Date.now()
       const WINDOW = 30 * 60 * 1000
+      const cutoff = now - WINDOW
       const tracks = (data.tracks || [])
-        .filter((t) => {
-          const segs = t.segments || []
-          if (!segs.length) return false
-          const lastSeg = segs[segs.length - 1]
-          const lastPt = lastSeg?.points?.[lastSeg.points.length - 1]
-          if (!lastPt) return false
-          if (typeof lastPt[3] !== 'number') return true
-          return now - lastPt[3] < WINDOW
-        })
         .map((t) => ({
           ...t,
+          // Trim every segment's points to only those within the 30-min window
           segments: (t.segments || []).map((s) => {
-            if (!s.points || s.points.length <= MAX_PTS) return s
-            const step = Math.ceil(s.points.length / MAX_PTS)
-            return { ...s, points: s.points.filter((_, i) => i % step === 0 || i === s.points.length - 1) }
-          }),
+            if (!s.points) return s
+            const trimmed = s.points.filter((p) =>
+              typeof p[3] !== 'number' || p[3] >= cutoff
+            )
+            // Thin if still too many points
+            if (trimmed.length > MAX_PTS) {
+              const step = Math.ceil(trimmed.length / MAX_PTS)
+              return { ...s, points: trimmed.filter((_, i) => i % step === 0 || i === trimmed.length - 1) }
+            }
+            return { ...s, points: trimmed }
+          }).filter((s) => s.points.length >= 2), // drop empty segments
         }))
+        .filter((t) => t.segments.length > 0) // drop tracks with no remaining segments
       console.log('[noise-report] boot complete: active:', active.length, 'tracks:', tracks.length, '(from', data.tracks?.length, ')')
       setNearbyTracks(tracks)
     } catch (err) {
