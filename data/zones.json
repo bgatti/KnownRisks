@@ -1,0 +1,14 @@
+{
+  "airport": "KBDU",
+  "lat": 40.0394,
+  "lon": -105.2258,
+  "field_elevation_ft": 5288,
+  "pattern_radius_nm": 2,
+  "runway_heading": 8,
+  "ground_speed_max_kts": 30,
+  "climb_threshold_fpm": 200,
+  "descent_threshold_fpm": -200,
+  "release_alt_min_ft": 500,
+  "release_alt_max_ft": 3500,
+  "on_ground_alt_agl_ft": 150
+}

@@ -471,6 +471,305 @@ function offensesApiPlugin() {
           res.end(JSON.stringify({ error: String(err) }))
         }
       })
+      // GET /api/offenses/boot — Combined endpoint that returns BOTH the
+      // active excursions list AND all track segments in a single response,
+      // doing the expensive classification loop only once instead of twice.
+      // Accepts all params from both /active and /segments.
+      server.middlewares.use('/api/offenses/boot', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const { default: fs } = await import('fs/promises')
+          const { default: path } = await import('path')
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const hours = Number(u.searchParams.get('hours')) || 1
+          const limit = Number(u.searchParams.get('limit')) || 100
+          const includeSet = new Set(
+            (u.searchParams.get('include') || '')
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean),
+          )
+          if (!zonesCache) {
+            const mod = await import('./src/noiseZones.js')
+            zonesCache = mod.NOISE_ZONES
+          }
+          const [tracksData, liveData, schoolsData] = await Promise.all([
+            loadCached(fs, path, 'tracks'),
+            loadCached(fs, path, 'live'),
+            loadCached(fs, path, 'schools'),
+          ])
+          // Tail → school/type lookup
+          const tailInfo = new Map()
+          for (const s of schoolsData.schools || []) {
+            for (const ac of s.aircraft || []) {
+              if (ac.tail) tailInfo.set(ac.tail, { type: ac.type || 'Unknown', school: s.name, airport: s.airport })
+            }
+          }
+          for (const lt of liveData.tracks || []) {
+            const tail = (lt.call || '').trim()
+            if (!tail || tailInfo.has(tail)) continue
+            tailInfo.set(tail, { type: lt.type || 'Unknown', school: null, airport: null })
+          }
+          // Classification helpers (same as /segments and /active)
+          const FT_PER_DEG_LAT = 364560
+          const pointInPolygon = (lat, lon, poly) => {
+            let inside = false
+            for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+              const [yi, xi] = poly[i]
+              const [yj, xj] = poly[j]
+              if (((yi > lat) !== (yj > lat)) && (lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi)) inside = !inside
+            }
+            return inside
+          }
+          const distPointToSegFt = (lat, lon, aLat, aLon, bLat, bLon) => {
+            const latRef = (aLat + bLat + lat) / 3
+            const cos = Math.cos((latRef * Math.PI) / 180)
+            const px = (lon - aLon) * FT_PER_DEG_LAT * cos
+            const py = (lat - aLat) * FT_PER_DEG_LAT
+            const dx = (bLon - aLon) * FT_PER_DEG_LAT * cos
+            const dy = (bLat - aLat) * FT_PER_DEG_LAT
+            const len2 = dx * dx + dy * dy
+            if (len2 === 0) return Math.hypot(px, py)
+            let t = (px * dx + py * dy) / len2
+            t = Math.max(0, Math.min(1, t))
+            return Math.hypot(px - t * dx, py - t * dy)
+          }
+          const signedDistance = (lat, lon) => {
+            let minAbs = Infinity
+            let insideAny = false
+            let nearestZone = null
+            for (const z of zonesCache) {
+              const poly = z.polygon
+              if (pointInPolygon(lat, lon, poly)) insideAny = true
+              let minEdge = Infinity
+              for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+                const d = distPointToSegFt(lat, lon, poly[i][0], poly[i][1], poly[j][0], poly[j][1])
+                if (d < minEdge) minEdge = d
+              }
+              if (minEdge < minAbs) { minAbs = minEdge; nearestZone = z.name }
+            }
+            return { d: insideAny ? -minAbs : minAbs, zone: nearestZone }
+          }
+          const ALT_THRESHOLD_FT = 7500
+          const classifyAlt = (alt) => {
+            if (alt == null) return null
+            const below = ALT_THRESHOLD_FT - alt
+            if (below > 500) return 'red'
+            if (below > 250) return 'orange'
+            if (below > -250) return 'yellow'
+            return null
+          }
+          const classifyZone = (d) => {
+            if (d < -500) return 'red'
+            if (d < -250) return 'orange'
+            if (d < 250) return 'yellow'
+            return null
+          }
+          const SEV = { yellow: 1, orange: 2, red: 3 }
+          const classifyPoint = (lat, lon, alt) => {
+            const { d, zone } = signedDistance(lat, lon)
+            const z = classifyZone(d)
+            const a = classifyAlt(alt)
+            if (!z || !a) return { klass: null, zone: null }
+            return { klass: SEV[z] <= SEV[a] ? z : a, zone }
+          }
+          // Time window
+          const nowMs = Date.now()
+          const fromDate = new Date(nowMs - hours * 3600 * 1000).toISOString().slice(0, 10)
+          const toDate = new Date(nowMs).toISOString().slice(0, 10)
+          const parseUtc = (s) => {
+            if (!s) return nowMs
+            const iso = /[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z'
+            const t = Date.parse(iso)
+            return Number.isFinite(t) ? t : nowMs
+          }
+          const liveUpdatedAtMs = parseUtc(liveData.updated_at)
+          // Gather candidate tracks (all tracks in window, capped by limit)
+          const allHist = tracksData.tracks || []
+          const allLive = liveData.tracks || []
+          const matches = allHist.filter((t) => {
+            const m = (t.src || '').match(/(\d{4}-\d{2}-\d{2})/)
+            if (!m) return false
+            return m[1] >= fromDate && m[1] <= toDate
+          })
+          for (const lt of allLive) matches.push(lt)
+          if (matches.length > limit) matches.length = limit
+          // ── Single pass: build segments AND accumulate active stats ──
+          const tracksOut = []
+          const activeByTail = new Map()
+          const fieldElev = 5288
+          const descThreshold = fieldElev + 300
+          for (const t of matches) {
+            const m = (t.src || '').match(/(\d{4}-\d{2}-\d{2})/)
+            const date = m ? m[1] : (t.src === 'live' ? toDate : null)
+            const isLive = t.src === 'live'
+            const tail = t.call || t.reg || '?'
+            // Classify all points → build segments + per-tail active stats
+            const segments = []
+            let cur = null
+            let trackWorst = null
+            const trackCounts = { yellow: 0, orange: 0, red: 0 }
+            let trackPointsHit = 0
+            let trackMaxPointTs = 0
+            let descents = 0, wasHigh = false
+            for (let i = 0; i < t.points.length; i++) {
+              const p = t.points[i]
+              // Descent detection
+              if (p[2] > descThreshold) wasHigh = true
+              else if (wasHigh) { descents++; wasHigh = false }
+              // Classify
+              const { klass, zone } = classifyPoint(p[0], p[1], p[2])
+              // Accumulate active stats
+              if (klass) {
+                trackCounts[klass]++
+                trackPointsHit++
+                if (!trackWorst || SEV[klass] > SEV[trackWorst]) trackWorst = klass
+                if (typeof p[3] === 'number' && p[3] > trackMaxPointTs) trackMaxPointTs = p[3]
+              }
+              // Build segment
+              if (cur && cur.klass === klass && cur.zone === zone) {
+                cur.points.push(p)
+              } else {
+                if (cur) { cur.points.push(p); segments.push(cur) }
+                cur = { klass, zone, points: [p] }
+              }
+            }
+            if (cur) segments.push(cur)
+            // Timestamp segments
+            for (const s of segments) {
+              let first = null, last = null
+              for (const p of s.points) {
+                if (typeof p[3] === 'number') { if (first == null) first = p[3]; last = p[3] }
+              }
+              s.startedAt = first != null ? new Date(first).toISOString() : null
+              s.endedAt = last != null ? new Date(last).toISOString() : null
+            }
+            // Phase detection
+            const firstLow = t.points[0] && t.points[0][2] < descThreshold
+            const lastLow = t.points[t.points.length - 1] && t.points[t.points.length - 1][2] < descThreshold
+            let phase = 'overflight'
+            if (firstLow && lastLow && descents >= 2) phase = 'pattern'
+            else if (firstLow && !lastLow) phase = 'departure'
+            else if (!firstLow && lastLow) phase = 'arrival'
+            else if (firstLow && lastLow) phase = 'pattern'
+            if (segments.length) {
+              tracksOut.push({ tail, type: t.type || '', src: t.src, date, live: isLive, phase, descents, hasDescents: descents > 0, segments })
+            }
+            // Merge into per-tail active summary
+            if (trackWorst) {
+              let rec = activeByTail.get(tail)
+              if (!rec) {
+                const info = tailInfo.get(tail) || {}
+                rec = { tail, type: info.type || 'Unknown', school: info.school || null, airport: info.airport || null, worst: null, counts: { yellow: 0, orange: 0, red: 0 }, pointsHit: 0, lastDate: '', lastSeenMs: 0, live: false }
+                activeByTail.set(tail, rec)
+              }
+              for (const k of ['yellow', 'orange', 'red']) rec.counts[k] += trackCounts[k]
+              rec.pointsHit += trackPointsHit
+              if (!rec.worst || SEV[trackWorst] > SEV[rec.worst]) rec.worst = trackWorst
+              if (date && date > rec.lastDate) rec.lastDate = date
+              if (isLive) rec.live = true
+              const ts = trackMaxPointTs || (isLive ? liveUpdatedAtMs : (Date.parse((date || '') + 'T12:00:00Z') || 0))
+              if (ts > rec.lastSeenMs) rec.lastSeenMs = ts
+            }
+          }
+          const active = Array.from(activeByTail.values())
+          // Opt-in joins (reports, notifications) — same as /active
+          const windowFromMs = nowMs - hours * 3600 * 1000
+          if (includeSet.has('reports')) {
+            let complaintsData = null
+            if (db.useDb) {
+              complaintsData = { complaints: await db.getComplaints(null) }
+            } else {
+              try { complaintsData = JSON.parse(await fs.readFile(path.resolve('data/complaints.json'), 'utf8')) } catch {}
+            }
+            const byTail = new Map()
+            for (const c of (complaintsData?.complaints) || []) {
+              const ts = Date.parse(c.createdAt || '')
+              if (!Number.isFinite(ts) || ts < windowFromMs || ts > nowMs) continue
+              const k = (c.tail || '').toUpperCase()
+              if (!k) continue
+              let rec = byTail.get(k)
+              if (!rec) { rec = { count: 0, scoreMax: null, scoreSum: 0, scoreN: 0 }; byTail.set(k, rec) }
+              rec.count++
+              if (typeof c.score === 'number') { rec.scoreSum += c.score; rec.scoreN++; if (rec.scoreMax == null || c.score > rec.scoreMax) rec.scoreMax = c.score }
+            }
+            for (const entry of active) {
+              const rec = byTail.get(entry.tail.toUpperCase())
+              entry.reportCount = rec ? rec.count : 0
+              entry.reportScoreMax = rec?.scoreMax ?? null
+              entry.reportScoreAvg = rec && rec.scoreN > 0 ? rec.scoreSum / rec.scoreN : null
+            }
+          }
+          if (includeSet.has('notifications')) {
+            let notifData = null
+            if (db.useDb) {
+              notifData = { items: await db.getNotifications(null, null) }
+            } else {
+              try { notifData = JSON.parse(await fs.readFile(path.resolve('data/notifications.json'), 'utf8')) } catch {}
+            }
+            const STATUS_RANK = { none: 0, acknowledged: 1, reviewed: 2, completed: 3 }
+            const actionToStatus = (action) => {
+              if (action === 'acknowledge') return 'acknowledged'
+              if (action === 'reviewed_flight' || action === 'reviewed_abatement') return 'reviewed'
+              if (action === 'completed_training') return 'completed'
+              return 'none'
+            }
+            const byTail = new Map()
+            for (const it of (notifData?.items) || []) {
+              const ts = Date.parse(it.at || '')
+              if (!Number.isFinite(ts) || ts < windowFromMs || ts > nowMs) continue
+              const k = (it.tail || '').toUpperCase()
+              if (!k) continue
+              let rec = byTail.get(k)
+              if (!rec) { rec = { operator: null, pilot: null, responses: [] }; byTail.set(k, rec) }
+              if (it.kind === 'operator') { if (!rec.operator || ts > Date.parse(rec.operator.at)) rec.operator = it }
+              else if (it.kind === 'pilot') { if (!rec.pilot || ts > Date.parse(rec.pilot.at)) rec.pilot = it }
+              else if (it.kind === 'pilot-response') rec.responses.push(it)
+            }
+            for (const entry of active) {
+              const rec = byTail.get(entry.tail.toUpperCase())
+              if (!rec) {
+                entry.operatorNotified = null; entry.pilotNotified = null
+                entry.pilotAction = { status: 'none', at: null, steps: { acknowledged: false, flight_reviewed: false, abatement_reviewed: false, completed_training: false } }
+                continue
+              }
+              entry.operatorNotified = rec.operator ? { at: rec.operator.at, via: rec.operator.via || null, contact: rec.operator.contact || null } : null
+              entry.pilotNotified = rec.pilot ? { at: rec.pilot.at, via: rec.pilot.via || null, channel: rec.pilot.channel || null } : null
+              const steps = { acknowledged: false, flight_reviewed: false, abatement_reviewed: false, completed_training: false }
+              let bestStatus = 'none', bestAt = null
+              for (const r of rec.responses) {
+                if (r.action === 'acknowledge') steps.acknowledged = true
+                else if (r.action === 'reviewed_flight') steps.flight_reviewed = true
+                else if (r.action === 'reviewed_abatement') steps.abatement_reviewed = true
+                else if (r.action === 'completed_training') steps.completed_training = true
+                const s = actionToStatus(r.action)
+                if (STATUS_RANK[s] >= STATUS_RANK[bestStatus]) { bestStatus = s; bestAt = r.at }
+              }
+              entry.pilotAction = { status: bestStatus, at: bestAt, steps }
+            }
+          }
+          active.sort((a, b) => {
+            if (SEV[b.worst] !== SEV[a.worst]) return SEV[b.worst] - SEV[a.worst]
+            return (b.lastSeenMs || 0) - (a.lastSeenMs || 0)
+          })
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({
+            generated_at: new Date(nowMs).toISOString(),
+            window: { hours, from: fromDate, to: toDate, limit },
+            include: [...includeSet],
+            active,
+            tracks: tracksOut,
+            live: { updated_at: liveData.updated_at || null, tracks: allLive.length },
+          }))
+        } catch (err) {
+          console.error('[offenses-boot] error', err)
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+
       // GET /api/offenses/active[&hours=48][&include=reports,notifications]
       // Returns all tails with at least one classified point within the
       // window, grouped per-tail (worst class, counts, last date, school/type

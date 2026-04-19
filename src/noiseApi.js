@@ -34,6 +34,19 @@ export async function fetchMissions({ signal } = {}) {
   return res.json()
 }
 
+/**
+ * GET /api/offenses/boot — Combined active + segments in one request.
+ * Returns { active, tracks, window, include, generated_at, live }.
+ * Replaces separate fetchActiveExcursions + fetchNearbyTracks calls.
+ */
+export async function fetchBoot({ hours = 1, limit = 100, include, signal } = {}) {
+  const params = new URLSearchParams({ hours: String(hours), limit: String(limit) })
+  if (include) params.set('include', Array.isArray(include) ? include.join(',') : include)
+  const res = await fetch(`${BASE}/api/offenses/boot?${params}`, { signal })
+  if (!res.ok) throw new Error(`boot ${res.status}`)
+  return res.json()
+}
+
 export async function fetchActiveExcursions({ hours = 48, include, signal } = {}) {
   const params = new URLSearchParams({ hours: String(hours) })
   if (include) params.set('include', Array.isArray(include) ? include.join(',') : include)
