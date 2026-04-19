@@ -617,107 +617,7 @@ export function NoiseStudio() {
     })
   }
 
-  /* ── Segments for every active tail (bulk, with error protection) ─ */
-  const didInitialFitRef = useRef(false)
-  useEffect(() => {
-    const L = window.L
-    const map = mapRef.current
-    if (!L || !map) return
-    for (const p of tracesRef.current) p.remove()
-    tracesRef.current = []
-    const tails = Object.keys(segmentsByTail)
-    if (!tails.length) return
-
-
-
-    const bounds = L.latLngBounds([])
-    for (const tail of tails) {
-      const data = segmentsByTail[tail]
-      if (!data?.tracks?.length) continue
-      const isDim = selectedTail != null && selectedTail !== tail
-
-      for (const track of data.tracks) {
-        for (const seg of track.segments || []) {
-          if (!seg.points || seg.points.length < 2) continue
-          const latlngs = seg.points.map((p) => [p[0], p[1]])
-          // Grab the most recent per-point timestamp in this segment (p[3] = epoch-ms).
-          let segLastMs = 0
-          for (const p of seg.points) {
-            if (typeof p[3] === 'number' && p[3] > segLastMs) segLastMs = p[3]
-          }
-          const type = (activeList.find((a) => a.tail === tail))?.type || data.type || ''
-          const { showHover, hideHover, clickSelect } = makeHoverHandlers(tail, segLastMs || null, {
-            klass: seg.klass, zone: seg.zone, points: seg.points, type,
-          })
-          const color = KLASS_COLORS[seg.klass] || 'rgba(200,200,200,0.7)'
-          const baseWeight = seg.klass === 'red' ? 6 : seg.klass === 'orange' ? 5.5 : seg.klass === 'yellow' ? 5 : 3.5
-          const weight = selectedTail === tail ? baseWeight + 1.5 : baseWeight
-          // Time-based fade: live = full, 2 hours old = faint
-          const WINDOW_MS = 30 * 60 * 1000
-          const age = segLastMs ? (Date.now() - segLastMs) / WINDOW_MS : 0
-          const timeOpacity = Math.max(0.15, 1 - age * 0.85)
-          const opacity = isDim ? 0.25 : timeOpacity
-          const line = L.polyline(latlngs, {
-            color,
-            weight,
-            opacity,
-            lineCap: 'round',
-            lineJoin: 'round',
-            className: 'flight-trace',
-          }).addTo(map)
-          line._segLastMs = segLastMs || 0 // tag for animation sort
-          // Invisible wider hit target per-segment
-          const hit = L.polyline(latlngs, {
-            color: '#ffffff',
-            weight: weight + 20,
-            opacity: 0,
-            lineCap: 'round',
-            lineJoin: 'round',
-            interactive: true,
-          }).addTo(map)
-          hit.on('mouseover', showHover)
-          hit.on('mouseout', hideHover)
-          hit.on('click', clickSelect)
-          tracesRef.current.push(line, hit)
-          // Only contribute to fit bounds when this tail is the focus or
-          // when nothing is focused (initial/all-shown state).
-          if (!selectedTail || selectedTail === tail) {
-            latlngs.forEach((ll) => bounds.extend(ll))
-          }
-        }
-      }
-    }
-
-    // Snake-draw animation: sort all drawn lines newest-first, stagger.
-    const animQueue = []
-    for (const p of tracesRef.current) {
-      if (p._segLastMs != null) animQueue.push(p)
-    }
-    animQueue.sort((a, b) => (b._segLastMs || 0) - (a._segLastMs || 0))
-    const DRAW_MS = 900  // each segment draws over 900ms
-    const STAGGER = 150  // 150ms between each segment start
-    for (let i = 0; i < animQueue.length; i++) {
-      snakeDraw(animQueue[i], DRAW_MS, i * STAGGER)
-    }
-
-    // Keep the user's location ring on top of the traces so it's never
-    // obscured by the newly-added polylines.
-    if (areaRef.current) areaRef.current.bringToFront()
-
-    if (reportOpen) return
-    if (selectedTail) {
-      // Explicit user click → fly to that trace + user location.
-      if (bounds.isValid()) {
-        if (rawCoords) bounds.extend([rawCoords.lat, rawCoords.lng])
-        map.flyToBounds(bounds.pad(0.18), { duration: 1, maxZoom: 14 })
-      }
-    } else if (!didInitialFitRef.current && bounds.isValid() && !rawCoords) {
-      // First load with no known location → frame the traces.
-      // When we DO have a location, leave the user's ring-centred view alone.
-      map.flyToBounds(bounds.pad(0.15), { duration: 1, maxZoom: 12 })
-      didInitialFitRef.current = true
-    }
-  }, [segmentsByTail, selectedTail, reportOpen, rawCoords])
+  /* ── (offense draw removed — nearby draw handles everything) ────── */
 
   /* ── Auto-request location after a delay so the map renders first ── */
   useEffect(() => {
@@ -990,8 +890,6 @@ export function NoiseStudio() {
     const WINDOW_MS = 30 * 60 * 1000 // 30 minutes
 
     for (const track of nearbyTracks) {
-      // Skip tracks already rendered by the offense draw effect
-      if (segmentsByTail[track.tail]) continue
       const lastSeg = track.segments?.[track.segments.length - 1]
       const lastPt = lastSeg?.points?.[lastSeg.points.length - 1]
       for (const seg of track.segments || []) {
@@ -1062,7 +960,7 @@ export function NoiseStudio() {
       console.error('[noise-report] draw crash:', err)
       try { localStorage.setItem('noise-report-crash', `${new Date().toISOString()} ${err.message}\n${err.stack}`) } catch {}
     }
-  }, [nearbyTracks, segmentsByTail])
+  }, [nearbyTracks])
 
   /* ── Aircraft icons at the leading edge of each drawn live track ── */
   const liveMarkersRef = useRef(new Map()) // tail → L.Marker
