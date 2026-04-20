@@ -804,17 +804,57 @@ function excursionsApiPlugin() {
             lastDate: r.last_date,
           }))
 
-          // ── Live tracks ──
+          // ── Live tracks: classify on the fly into bands ──
           let liveCount = 0, liveUpdatedAt = null
+          const liveTracks = []
           try {
+            if (!zonesCache) {
+              const mod = await import('./src/noiseZones.js')
+              zonesCache = mod.NOISE_ZONES
+            }
+            const { classifyPoint } = await import('./src/geo.js')
             const liveRes = await db.queryDb(
               'SELECT tracks, updated_at FROM live_tracks WHERE day = CURRENT_DATE ORDER BY id DESC LIMIT 1'
             )
             if (liveRes.rows.length) {
-              liveCount = (liveRes.rows[0].tracks || []).length
+              const rawLive = liveRes.rows[0].tracks || []
+              liveCount = rawLive.length
               liveUpdatedAt = liveRes.rows[0].updated_at || null
+              for (const t of rawLive) {
+                const pts = t.points || []
+                if (pts.length < 2) continue
+                // Build bands by classifying each point
+                const bands = []
+                let cur = null
+                for (const p of pts) {
+                  const klass = classifyPoint(p[0], p[1], p[2], zonesCache)
+                  if (cur && cur.klass === klass) {
+                    cur.points.push([p[0], p[1], p[2]])
+                  } else {
+                    if (cur) { cur.points.push([p[0], p[1], p[2]]); bands.push(cur) }
+                    cur = { klass, points: [[p[0], p[1], p[2]]] }
+                  }
+                }
+                if (cur) bands.push(cur)
+                const worst = bands.reduce((w, b) => {
+                  if (!b.klass) return w
+                  if (!w || (SEV[b.klass] || 0) > (SEV[w] || 0)) return b.klass
+                  return w
+                }, null)
+                liveTracks.push({
+                  call: t.call || t.reg || '?',
+                  type: t.type || '',
+                  src: 'live',
+                  date: toDate,
+                  base: null,
+                  worst,
+                  school: null,
+                  bands,
+                  live: true,
+                })
+              }
             }
-          } catch {}
+          } catch (e) { console.error('[excursions-boot] live error:', e.message) }
 
           // ── Opt-in joins: reports, notifications ──
           const windowFromMs = nowMs - hours * 3600 * 1000
@@ -898,7 +938,7 @@ function excursionsApiPlugin() {
               note: 'Each track.bands[] is an array of {klass, points} runs. Render each run as a Polyline colored by klass (null = clean_color). Points are [lat, lon, alt_ft]. Adjacent runs share their boundary point for continuity.',
             },
             active,
-            tracks: tracksRes.rows,
+            tracks: [...tracksRes.rows, ...liveTracks],
             live: { updated_at: liveUpdatedAt, tracks: liveCount },
           }))
         } catch (err) {
