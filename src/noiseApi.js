@@ -1,10 +1,5 @@
 // Same-origin — noise/web IS the API server.
 const BASE = ''
-   In local dev, use the Vite proxy at /noise-api. */
-const RAILWAY_API = 'https://web-app-production-fedf.up.railway.app'
-const BASE = typeof window !== 'undefined' && window.location.hostname !== 'localhost'
-  ? RAILWAY_API
-  : '/noise-api'
 
 /**
  * GET /api/noise/leaderboard
