@@ -927,7 +927,7 @@ export function NoiseStudio() {
     }
     // Snake-draw animation for nearby tracks
     const nearbyQueue = nearbyTracesRef.current.filter((p) => p._segLastMs != null)
-    nearbyQueue.sort((a, b) => (b._segLastMs || 0) - (a._segLastMs || 0))
+    nearbyQueue.sort((a, b) => (a._segLastMs || 0) - (b._segLastMs || 0))
     for (let i = 0; i < nearbyQueue.length; i++) {
       snakeDraw(nearbyQueue[i], 900, i * 150)
     }
