@@ -1,10 +1,5 @@
 // Same-origin — noise/web IS the API server.
 const BASE = ''
-   In local dev, use the Vite proxy at /noise-api. */
-const RAILWAY_API = 'https://web-app-production-fedf.up.railway.app'
-const BASE = typeof window !== 'undefined' && window.location.hostname !== 'localhost'
-  ? RAILWAY_API
-  : '/noise-api'
 
 /**
  * GET /api/noise/leaderboard
@@ -142,6 +137,20 @@ export async function fetchMyComplaints({ reporter, signal } = {}) {
   // Server may not filter by reporter yet — enforce client-side as a safety.
   if (reporter) list = list.filter((c) => (c.reporter || '') === reporter)
   return list
+}
+
+export async function fetchAllComplaints({ signal } = {}) {
+  const res = await fetch(`${BASE}/api/complaints`, { signal })
+  if (!res.ok) throw new Error(`complaints ${res.status}`)
+  const data = await res.json()
+  return data.complaints || []
+}
+
+export async function fetchAllNoiseReports({ signal } = {}) {
+  const res = await fetch(`${BASE}/api/noise-reports`, { signal })
+  if (!res.ok) throw new Error(`noise-reports ${res.status}`)
+  const data = await res.json()
+  return data.reports || []
 }
 
 export const KLASS_COLORS = {
