@@ -854,7 +854,8 @@ function excursionsApiPlugin() {
                 })
               }
             }
-          } catch (e) { console.error('[excursions-boot] live error:', e.message) }
+          } catch (e) { console.error('[excursions-boot] live error:', e.message, e.stack?.split('\n')[1]) }
+          console.log(`[excursions-boot] live: ${liveCount} raw, ${liveTracks.length} classified`)
 
           // ── Opt-in joins: reports, notifications ──
           const windowFromMs = nowMs - hours * 3600 * 1000
