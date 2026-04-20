@@ -468,16 +468,20 @@ export function NoiseStudio() {
       })
       if (signal?.aborted) return
 
-      // Active excursions
-      const active = (data.active || []).sort((a, b) => (b.lastSeenMs || 0) - (a.lastSeenMs || 0))
+      // Single window constant — nothing older than this appears anywhere
+      const MAX_AGE_MS = 30 * 60 * 1000 // 30 minutes
+      const now = Date.now()
+      const cutoff = now - MAX_AGE_MS
+
+      // Active excursions — filter to 30 min by lastSeenMs
+      const active = (data.active || [])
+        .filter((a) => a.lastSeenMs && a.lastSeenMs >= cutoff)
+        .sort((a, b) => (b.lastSeenMs || 0) - (a.lastSeenMs || 0))
       setActiveList(active)
       setActiveStatus('ok')
 
-      // Tracks: filter to 30 min, thin points
+      // Tracks: trim points to 30 min, thin
       const MAX_PTS = 500
-      const now = Date.now()
-      const WINDOW = 30 * 60 * 1000
-      const cutoff = now - WINDOW
       const tracks = (data.tracks || [])
         .map((t) => ({
           ...t,
