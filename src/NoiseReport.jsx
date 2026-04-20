@@ -326,7 +326,7 @@ export function NoiseStudio() {
   const [hoverCard, setHoverCard] = useState(null) // { tail, x, y, lastSeenMs }
   const hoverHideRef = useRef(null)
 
-  // Nearby tracks (all overflights, not just offenses)
+  // Nearby tracks (all overflights, not just excursions)
   const [nearbyTracks, setNearbyTracks] = useState([])
 
   // Segments the user selected for the report (multiple allowed).
@@ -558,7 +558,7 @@ export function NoiseStudio() {
 
   /* ── segmentsByTail: derived from nearbyTracks (no extra fetches) ─ */
   useEffect(() => {
-    // Build segmentsByTail from nearbyTracks so the offense draw effect
+    // Build segmentsByTail from nearbyTracks so the excursion list
     // can highlight tails that are in the active list. No per-tail API
     // calls — the nearby endpoint already returns everything we need.
     const map = {}
@@ -569,7 +569,7 @@ export function NoiseStudio() {
     setSegmentsByTail(map)
   }, [nearbyTracks, activeList])
 
-  /* ── Shared hover handler factory (used by offense + nearby draws) ─ */
+  /* ── Shared hover handler factory ──────────────────────────────── */
   const crosshairRef = useRef(null)
   const makeHoverHandlers = (tail, lastSeenMs, segInfo) => {
     // segInfo: { klass, zone, points, type }
@@ -649,7 +649,7 @@ export function NoiseStudio() {
     })
   }
 
-  /* ── (offense draw removed — nearby draw handles everything) ────── */
+  /* ── (single draw effect handles all tracks) ─────────────────────── */
 
   /* ── Auto-request location after a delay so the map renders first ── */
   useEffect(() => {
@@ -851,7 +851,7 @@ export function NoiseStudio() {
     return reportedSegKeys.has(`${tail}:${nearestPt[0]},${nearestPt[1]}`)
   }
 
-  /* ── Draw nearby tracks (clean + offense) with time-based opacity ── */
+  /* ── Draw all tracks with time-based opacity ──────────────────────── */
   useEffect(() => {
     console.log('[noise-report] draw nearby effect, tracks:', nearbyTracks.length)
     try {
@@ -891,10 +891,10 @@ export function NoiseStudio() {
         const midPt = seg.points[Math.floor(seg.points.length / 2)]
         const reported = isSegReported(track.tail, midPt)
 
-        const isOffense = !!seg.klass
-        const color = reported ? '#38bdf8' : isOffense ? (KLASS_COLORS[seg.klass] || '#aaa') : 'rgba(200,200,200,0.8)'
-        const weight = isOffense ? 5 : 3.5
-        const opacity = reported ? 0.9 : isOffense ? Math.max(0.3, timeOpacity) : timeOpacity
+        const isExcursion = !!seg.klass
+        const color = reported ? '#38bdf8' : isExcursion ? (KLASS_COLORS[seg.klass] || '#aaa') : 'rgba(200,200,200,0.8)'
+        const weight = isExcursion ? 5 : 3.5
+        const opacity = reported ? 0.9 : isExcursion ? Math.max(0.3, timeOpacity) : timeOpacity
 
         const line = L.polyline(latlngs, {
           color, weight, opacity,
