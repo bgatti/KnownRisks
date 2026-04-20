@@ -139,6 +139,22 @@ export async function fetchMyComplaints({ reporter, signal } = {}) {
   return list
 }
 
+/** Fetch ALL complaints (unfiltered). */
+export async function fetchAllComplaints({ signal } = {}) {
+  const res = await fetch(`${BASE}/api/complaints`, { signal })
+  if (!res.ok) throw new Error(`complaints ${res.status}`)
+  const data = await res.json()
+  return data.complaints || []
+}
+
+/** Fetch ALL noise reports (unfiltered). */
+export async function fetchAllNoiseReports({ signal } = {}) {
+  const res = await fetch(`${BASE}/api/noise-reports`, { signal })
+  if (!res.ok) throw new Error(`noise-reports ${res.status}`)
+  const data = await res.json()
+  return data.reports || []
+}
+
 export const KLASS_COLORS = {
   yellow: '#facc15',
   orange: '#fb923c',
