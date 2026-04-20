@@ -1541,7 +1541,12 @@ export function NoiseStudio() {
           >
             <IconAlertTriangle size={14} />
             {reportSegments.length > 0
-              ? <>Report {reportSegments.length} Selected Segment{reportSegments.length > 1 ? 's' : ''}</>
+              ? (() => {
+                  const uniqueTails = new Set(reportSegments.map((s) => s.tail))
+                  const n = reportSegments.length
+                  const a = uniqueTails.size
+                  return <>Report {n} Segment{n > 1 ? 's' : ''} · {a} Aircraft</>
+                })()
               : 'Report Flight Noise'
             }
             <IconArrowRight size={14} />
@@ -2140,11 +2145,14 @@ function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, video
   return (
     <>
       {/* Mini-map showing reported segments */}
-      {reportSegments?.length > 0 && (
+      {reportSegments?.length > 0 && (() => {
+        const uniqueTails = new Set(reportSegments.map((s) => s.tail))
+        return (
         <Card
-          title={`Reported Segment${reportSegments.length > 1 ? 's' : ''}`}
-          subtitle={`${reportSegments.length} flight segment${reportSegments.length > 1 ? 's' : ''} selected — tap × to remove`}
+          title={`${reportSegments.length} Segment${reportSegments.length > 1 ? 's' : ''} · ${uniqueTails.size} Aircraft`}
+          subtitle="Tap × to remove individual segments"
         >
+
           <SegmentsMiniMap segments={reportSegments} />
           <ul className="mt-2 space-y-1">
             {reportSegments.map((seg, i) => {
@@ -2171,7 +2179,8 @@ function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, video
             })}
           </ul>
         </Card>
-      )}
+        )
+      })()}
       <Card title="Report Score" subtitle="Higher scores are prioritised for follow-up.">
         <div className="flex items-center gap-4">
           <div className="relative w-24 h-24 flex-shrink-0">
@@ -2205,7 +2214,7 @@ function ReviewStep({ score, tier, tierColor, displayedLocation, audioUrl, video
       </Card>
       <Card title="Summary">
         <dl className="space-y-2 text-xs">
-          <Row label="Segments" value={`${reportSegments?.length || 0} flight segment${(reportSegments?.length || 0) === 1 ? '' : 's'} selected`} />
+          <Row label="Segments" value={`${reportSegments?.length || 0} segments · ${new Set(reportSegments?.map((s) => s.tail)).size || 0} aircraft`} />
           <Row label="Audio" value={audioUrl ? '5-second clip captured' : 'None'} />
           <Row label="Video" value={videoUrl ? 'Clip captured' : 'None'} />
           <Row
