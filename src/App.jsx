@@ -255,7 +255,7 @@ const AIRPORTS = [
 
 // Aircraft marker icon for live data. Rotates an SVG plane by the current
 // track heading so it points the way the aircraft is flying. Fill color
-// carries the aircraft's classification (offense color, or local/transient
+// carries the aircraft's classification (excursion color, or local/transient
 // blue/violet if clean).
 function makeLiveIcon(heading, fill, stroke) {
   return L.divIcon({
@@ -456,7 +456,7 @@ function bandTrack(points, t0, fieldElev) {
   // Standard zone+altitude classification
   const tags = points.map((p) => classifyPoint(p[0], p[1], p[2], NOISE_ZONES))
   // Overlay quiet-hour T&G as 'purple' — overrides whatever zone class
-  // those points had, since a T&G during quiet hours is its own offense.
+  // those points had, since a T&G during quiet hours is its own excursion.
   const tngRanges = detectQuietHourTnG(points, t0, fieldElev || KBDU_ELEV_FT)
   for (const r of tngRanges) {
     for (let i = r.startIdx; i <= Math.min(r.endIdx, tags.length - 1); i++) {
@@ -522,13 +522,13 @@ function MapPage() {
   // Live-data localStorage helpers. One key per day (YYYY-MM-DD local) so we
   // can later add a calendar picker that loads an arbitrary day's capture.
   const todayKey = () => `noise_live_${new Date().toISOString().slice(0, 10)}`
-  // Keep trail points < 3 h old. Offense points (inside a noise zone) are
+  // Keep trail points < 3 h old. Excursion points (inside a noise zone) are
   // retained up to 24 h so the offender list can still show them after their
   // trail has faded away.
   const pruneLiveAircraft = (aircraft) => {
     const now = Date.now()
     const TRAIL_MS = 3 * 60 * 60 * 1000
-    const OFFENSE_MS = 24 * 60 * 60 * 1000
+    const EXCURSION_MS = 24 * 60 * 60 * 1000
     const out = []
     for (const ac of aircraft) {
       if (!ac || !Array.isArray(ac.points)) continue
@@ -536,7 +536,7 @@ function MapPage() {
       for (const p of ac.points) {
         const age = now - (p[3] || 0)
         if (age < TRAIL_MS) { kept.push(p); continue }
-        if (age < OFFENSE_MS && classifyPoint(p[0], p[1], p[2], NOISE_ZONES)) {
+        if (age < EXCURSION_MS && classifyPoint(p[0], p[1], p[2], NOISE_ZONES)) {
           kept.push(p)
         }
       }
@@ -797,7 +797,7 @@ function MapPage() {
 
   // Deep-link: read ?tail=<N-number> from the URL once on mount and
   // auto-select it. Used by external services hitting the landing URL from
-  // /api/offenses responses. Also sets year=all so history isn't hidden.
+  // /api/excursions responses. Also sets year=all so history isn't hidden.
   useEffect(() => {
     try {
       const params = new URLSearchParams(window.location.search)
@@ -1853,10 +1853,10 @@ function MapPage() {
     return Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date))
   }, [noiseStats, rawStats, todAnimate, todCache, todAnimIdx])
 
-  // Live offenses — walk each aircraft's points, find contiguous runs of
+  // Live excursions — walk each aircraft's points, find contiguous runs of
   // non-clean points, summarize each as an event. Sorted worst-class first,
   // then most recent.
-  const liveOffenses = useMemo(() => {
+  const liveExcursions = useMemo(() => {
     if (!liveActive) return []
     const rank = { yellow: 1, orange: 2, red: 3 }
     // Build per-aircraft rows: aircraft header + nested event list
@@ -2623,19 +2623,19 @@ function MapPage() {
             </div>
           )
         })()}
-        {liveActive && liveOffenses.length > 0 && (() => {
-          // Max single-event distance across all visible offenses, used to
+        {liveActive && liveExcursions.length > 0 && (() => {
+          // Max single-event distance across all visible excursions, used to
           // scale each event's color bar width.
           const maxDist = Math.max(
             1,
-            ...liveOffenses.flatMap((a) => a.events.map((e) => e.distFt)),
+            ...liveExcursions.flatMap((a) => a.events.map((e) => e.distFt)),
           )
           return (
             <div className={`absolute top-3 z-[1000] bg-black/75 backdrop-blur-sm border border-white/10 rounded-lg p-2 text-[11px] w-64 max-h-[70%] overflow-y-auto ${
               isMobile ? 'hidden' : 'right-[19.5rem]'
             }`}>
               <div className="text-white/50 uppercase tracking-wide text-[9px] mb-1 px-1 flex items-center justify-between">
-                <span>Live offenders · {liveOffenses.length}</span>
+                <span>Live excursions · {liveExcursions.length}</span>
                 {selectedTails.length > 0 && (
                   <button
                     onClick={clearSelected}
@@ -2646,7 +2646,7 @@ function MapPage() {
                 )}
               </div>
               <div className="space-y-2">
-                {liveOffenses.slice(0, 20).map((a) => {
+                {liveExcursions.slice(0, 20).map((a) => {
                   const sel = isSelected(a.tail)
                   const sch = schoolsByTail.get(a.tail)
                   const outlineCls = a.worst === 'red' ? 'border-red-500/60' :

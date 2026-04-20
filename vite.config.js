@@ -169,10 +169,10 @@ function sendNoticePlugin() {
   }
 }
 
-// GET /api/offenses?tail=N12JA[&from=YYYY-MM-DD][&to=YYYY-MM-DD]
-// Returns JSON list of classified offenses for an aircraft within a date
+// GET /api/excursions?tail=N12JA[&from=YYYY-MM-DD][&to=YYYY-MM-DD]
+// Returns JSON list of classified excursions for an aircraft within a date
 // window, along with a deep link back to the map page pre-selecting the tail.
-function offensesApiPlugin() {
+function excursionsApiPlugin() {
   let zonesCache = null
   // mtime-based cache for the big tracks file. Re-read only when the file
   // on disk changes; avoids re-parsing 200 MB on every API hit.
@@ -245,11 +245,270 @@ function offensesApiPlugin() {
     }
   }
   return {
-    name: 'offenses-api',
+    name: 'excursions-api',
     configureServer(server) {
-      // Registered BEFORE /api/offenses because connect prefix-matches and
-      // would otherwise route /api/offenses/segments into the wrong handler.
-      server.middlewares.use('/api/offenses/segments', async (req, res, next) => {
+      console.log('[excursions-api] registering endpoints...')
+      // /api/excursions/flight-ops — intent model with intermediaries.
+      // Registered first within excursionsApiPlugin so it matches before
+      // the /api/excursions catch-all.
+      server.middlewares.use('/api/excursions/flight-ops', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        const u = new URL(req.originalUrl || req.url, `http://${req.headers.host || 'localhost'}`)
+        const baseParam = (u.searchParams.get('base') || '').toUpperCase()
+        const radiusNm = Number(u.searchParams.get('radius')) || (baseParam ? 15 : 999)
+        try {
+          const { default: fs } = await import('fs/promises')
+          const { default: path } = await import('path')
+          const liveData = await loadCached(fs, path, 'live')
+          const schoolsData = await loadCached(fs, path, 'schools')
+          const schoolMap = new Map()
+          for (const s of schoolsData.schools || []) {
+            for (const ac of s.aircraft || []) schoolMap.set(ac.tail, s.name)
+          }
+          const AP = [
+            { code: 'KBDU', lat: 40.0394, lon: -105.2258, elev: 5288, tpa: 6300 },
+            { code: 'KBJC', lat: 39.9088, lon: -105.1172, elev: 5673, tpa: 6700 },
+            { code: 'KEIK', lat: 40.0098, lon: -105.0488, elev: 5130, tpa: 6100 },
+            { code: 'KLMO', lat: 40.1636, lon: -105.1636, elev: 5055, tpa: 6100 },
+            { code: 'KAPA', lat: 39.5701, lon: -104.8493, elev: 5885, tpa: 6900 },
+            { code: 'KGXY', lat: 40.4348, lon: -104.6331, elev: 4697, tpa: 5700 },
+          ]
+          // Runway headings for pattern leg detection
+          const RUNWAYS = {
+            KBDU: [{ hdg: 80, name: '08' }, { hdg: 260, name: '26' }],
+            KBJC: [{ hdg: 119, name: '12' }, { hdg: 299, name: '30' }],
+            KEIK: [{ hdg: 152, name: '15' }, { hdg: 332, name: '33' }],
+            KLMO: [{ hdg: 113, name: '11' }, { hdg: 293, name: '29' }],
+            KAPA: [{ hdg: 174, name: '17' }, { hdg: 354, name: '35' }],
+          }
+          const distNm = (lat1, lon1, lat2, lon2) => {
+            const dLat = (lat1 - lat2) * 60
+            const dLon = (lon1 - lon2) * 60 * Math.cos(((lat1 + lat2) / 2) * Math.PI / 180)
+            return Math.hypot(dLat, dLon)
+          }
+          // When ?base=KBDU is set, ALL distances/intent are relative to that
+          // airport. Without it, each aircraft uses its nearest airport.
+          const fixedBase = baseParam ? AP.find(a => a.code === baseParam) : null
+          const nearAp = (lat, lon) => {
+            if (fixedBase) return { ...fixedBase, dist: distNm(lat, lon, fixedBase.lat, fixedBase.lon) }
+            let best = AP[0], bestD = Infinity
+            for (const ap of AP) {
+              const d = distNm(lat, lon, ap.lat, ap.lon)
+              if (d < bestD) { bestD = d; best = ap }
+            }
+            return { ...best, dist: bestD }
+          }
+          const normAngle = (a) => ((a % 360) + 540) % 360 - 180 // ±180
+          const purposeOf = (type) => {
+            if (!type) return 'unknown'
+            if (/PA25|PA18/.test(type)) return 'tow_plane'
+            if (/GLID|VENT|AS2|DG\d|NIMB|DISC|SGS/.test(type)) return 'glider'
+            if (/R22|R44|R66|AS50|EC\d|B06|B407|H500|S76/.test(type)) return 'helicopter'
+            if (/B73|B38|B78|A3[12]|A2[01]|CRJ|E7[05]|E19|MD[89]/.test(type)) return 'airline'
+            if (/C25|C5[0-6]|C6[89]|C750|CL[36]|LJ\d|GL[AX]|H25|E55P|E50P|SF50/.test(type)) return 'biz_jet'
+            if (/PC12|TBM|DHC6/.test(type)) return 'turboprop'
+            if (/RV[78]|LGEZ|VL3|LONG|LANCAIR/.test(type)) return 'experimental'
+            if (/PA44|DA42|BE58|BE55|BE76/.test(type)) return 'ga_twin'
+            return 'ga_single'
+          }
+
+          const aircraft = []
+          for (const t of liveData.tracks || []) {
+            const pts = t.points || []
+            if (pts.length < 5) continue
+            const tail = t.call || t.reg || t.hex || '?'
+            const type = t.type || ''
+            const school = schoolMap.get(tail) || null
+            const purpose = purposeOf(type)
+            const lastPt = pts[pts.length - 1]
+            const ap = nearAp(lastPt[0], lastPt[1])
+
+            // ─── 3-min window (last 90 pts at 2s, or whatever we have) ───
+            const WINDOW = 90
+            const recent = pts.slice(-WINDOW)
+            const first = recent[0], last = recent[recent.length - 1]
+            const hasTs = first.length > 3 && last.length > 3
+            const dtMin = hasTs ? (last[3] - first[3]) / 60000 : (recent.length * 2) / 60
+            const flightTimeMin = hasTs ? (last[3] - pts[0][3]) / 60000 : (pts.length * 2) / 60
+
+            // Distance to nearest airport at start and end of window
+            const distStart = distNm(first[0], first[1], ap.lat, ap.lon)
+            const distEnd = distNm(last[0], last[1], ap.lat, ap.lon)
+
+            // Groundspeed estimate (kt) from last few points
+            const gs = recent.length >= 3
+              ? distNm(recent[recent.length-3][0], recent[recent.length-3][1], last[0], last[1]) * 60 / ((hasTs ? (last[3] - recent[recent.length-3][3]) / 60000 : 6/60) || 1)
+              : 0
+
+            // ─── Intermediary 1: closure_pct ───
+            const closureRate = dtMin > 0 ? (distStart - distEnd) / dtMin : 0 // nm/min, positive = closing
+            const closure_pct = gs > 10 ? (closureRate * 60) / gs * 100 : 0
+
+            // ─── Intermediary 2: angular_accumulation ───
+            let totalTurn = 0
+            for (let i = 1; i < recent.length; i++) {
+              // Compute heading between consecutive points
+              const dLon = (recent[i][1] - recent[i-1][1]) * Math.cos(((recent[i][0] + recent[i-1][0]) / 2) * Math.PI / 180)
+              const dLat = recent[i][0] - recent[i-1][0]
+              if (Math.abs(dLon) < 1e-7 && Math.abs(dLat) < 1e-7) continue
+              const hdg = Math.atan2(dLon, dLat) * 180 / Math.PI
+              if (i >= 2) {
+                const dLon2 = (recent[i-1][1] - recent[i-2][1]) * Math.cos(((recent[i-1][0] + recent[i-2][0]) / 2) * Math.PI / 180)
+                const dLat2 = recent[i-1][0] - recent[i-2][0]
+                if (Math.abs(dLon2) > 1e-7 || Math.abs(dLat2) > 1e-7) {
+                  const prevHdg = Math.atan2(dLon2, dLat2) * 180 / Math.PI
+                  totalTurn += Math.abs(normAngle(hdg - prevHdg))
+                }
+              }
+            }
+            const trackDistNm = dtMin > 0 ? gs * dtMin / 60 : 0.1
+            const angular_accumulation = trackDistNm > 0.01 ? totalTurn / trackDistNm : 0
+
+            // ─── Intermediary 3: climb_energy (fpm averaged over window) ───
+            const climb_energy = dtMin > 0 ? (last[2] - first[2]) / dtMin : 0
+
+            // ─── Intermediary 4: vertical_stability ───
+            const meanAlt = recent.reduce((s, p) => s + p[2], 0) / recent.length
+            const altVar = recent.reduce((s, p) => s + (p[2] - meanAlt) ** 2, 0) / recent.length
+            const vertical_stability = Math.sqrt(altVar)
+
+            // ─── Intermediary 5: at_pattern_altitude ───
+            const at_pattern_altitude = Math.abs(last[2] - ap.tpa) < 200
+
+            // ─── Intermediary 6: orbit_radius_nm ───
+            const turnRateDegMin = dtMin > 0 ? totalTurn / dtMin : 0
+            const orbit_radius_nm = turnRateDegMin > 10 ? (gs / 60) / (turnRateDegMin * Math.PI / 180) : 99
+
+            // ─── Intermediary 7: directness ───
+            const displacement = distNm(first[0], first[1], last[0], last[1])
+            let pathLen = 0
+            for (let i = 1; i < recent.length; i++) pathLen += distNm(recent[i-1][0], recent[i-1][1], recent[i][0], recent[i][1])
+            const directness = pathLen > 0.01 ? displacement / pathLen : 1
+
+            // ─── Intermediary 8: heading_to_runway ───
+            const lastHdg = recent.length >= 2
+              ? Math.atan2(
+                  (last[1] - recent[recent.length-2][1]) * Math.cos(last[0] * Math.PI / 180),
+                  last[0] - recent[recent.length-2][0]
+                ) * 180 / Math.PI
+              : 0
+            const rwys = RUNWAYS[ap.code] || []
+            let bestRwyAlign = 180, bestRwy = null
+            for (const rwy of rwys) {
+              const align = Math.abs(normAngle(lastHdg - rwy.hdg))
+              if (align < bestRwyAlign) { bestRwyAlign = align; bestRwy = rwy.name }
+            }
+            const heading_to_runway = bestRwyAlign
+
+            // ─── Intent classification ───
+            const agl = last[2] - ap.elev
+            let intent, leg = null, confidence = 0.5
+
+            if (purpose === 'tow_plane' && angular_accumulation > 200) {
+              intent = 'towing'; confidence = 0.9
+            } else if (purpose === 'glider' && distEnd > 3) {
+              intent = 'soaring'; confidence = 0.8
+            } else if (purpose === 'glider') {
+              intent = 'local_soaring'; confidence = 0.7
+            } else if (distEnd < 3 && angular_accumulation > 150 && at_pattern_altitude) {
+              intent = 'pattern'; confidence = 0.85
+            } else if (distEnd < 3 && angular_accumulation > 100) {
+              intent = 'pattern'; confidence = 0.7
+            } else if (closure_pct > 60 && distEnd < 12 && climb_energy < 0) {
+              intent = 'inbound'; confidence = 0.8
+            } else if (closure_pct > 40 && distEnd < 15) {
+              intent = 'inbound'; confidence = 0.6
+            } else if (closure_pct < -60 && distEnd < 5) {
+              intent = 'outbound'; confidence = 0.8
+            } else if (closure_pct < -30 && distEnd < 8 && climb_energy > 200) {
+              intent = 'outbound'; confidence = 0.7
+            } else if (distEnd > 5 && directness < 0.4 && vertical_stability > 100) {
+              intent = 'practicing'; confidence = 0.75
+            } else if (distEnd > 5 && closure_pct > 20) {
+              intent = 'returning'; confidence = 0.6
+            } else if (distEnd > 5 && closure_pct < -20) {
+              intent = 'to_practice'; confidence = 0.6
+            } else if (purpose === 'airline') {
+              intent = climb_energy > 100 ? 'outbound' : 'inbound'; confidence = 0.6
+            } else {
+              intent = 'transit'; confidence = 0.4
+            }
+
+            // ─── Pattern leg (when intent = pattern) ───
+            if (intent === 'pattern' && rwys.length) {
+              // Find which runway direction is closest to our heading
+              let rwyHdg = rwys[0].hdg
+              for (const rwy of rwys) {
+                if (Math.abs(normAngle(lastHdg - rwy.hdg)) < Math.abs(normAngle(lastHdg - rwyHdg))) {
+                  rwyHdg = rwy.hdg
+                }
+              }
+              const relHdg = normAngle(lastHdg - rwyHdg)
+              if (agl < 50) leg = 'on_runway'
+              else if (agl < 200 && Math.abs(relHdg) < 30 && closureRate > 0) leg = 'short_final'
+              else if (Math.abs(relHdg) < 30 && climb_energy < -200) leg = 'final'
+              else if (Math.abs(normAngle(relHdg - 90)) < 40 && climb_energy < -100) leg = 'base'
+              else if (Math.abs(relHdg - 180) < 40 || Math.abs(relHdg + 180) < 40) leg = 'downwind'
+              else if (Math.abs(normAngle(relHdg - 90)) < 40 && climb_energy > 100) leg = 'crosswind'
+              else if (Math.abs(relHdg) < 30 && climb_energy > 100) leg = 'upwind'
+              else if (closureRate > 0 && distEnd > 1.5) leg = 'entering'
+              else leg = 'maneuvering'
+            }
+
+            aircraft.push({
+              tail, type, purpose, school,
+              intent, leg, confidence: +confidence.toFixed(2),
+              airport: ap.code, dist_nm: +distEnd.toFixed(1),
+              alt: last[2], agl: Math.round(agl),
+              groundspeed: Math.round(gs),
+              flight_time_min: Math.round(flightTimeMin),
+              intermediaries: {
+                closure_pct: Math.round(closure_pct),
+                angular_accumulation: Math.round(angular_accumulation),
+                climb_energy: Math.round(climb_energy),
+                vertical_stability: Math.round(vertical_stability),
+                at_pattern_altitude,
+                orbit_radius_nm: +orbit_radius_nm.toFixed(1),
+                directness: +directness.toFixed(2),
+                heading_to_runway: Math.round(heading_to_runway),
+              },
+            })
+          }
+
+          // Filter by radius when base is specified
+          const filtered = baseParam
+            ? aircraft.filter(ac => ac.dist_nm <= radiusNm)
+            : aircraft
+
+          // Group by intent
+          const groups = {}
+          for (const ac of filtered) {
+            if (!groups[ac.intent]) groups[ac.intent] = []
+            groups[ac.intent].push(ac)
+          }
+          const summary = Object.entries(groups)
+            .sort((a, b) => b[1].length - a[1].length)
+            .map(([intent, list]) => ({ intent, count: list.length }))
+
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({
+            timestamp: new Date().toISOString(),
+            base: fixedBase ? { code: fixedBase.code, lat: fixedBase.lat, lon: fixedBase.lon, elev: fixedBase.elev, radius_nm: radiusNm } : null,
+            total: filtered.length,
+            summary,
+            aircraft: filtered,
+          }, null, 2))
+        } catch (e) {
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: String(e) }))
+        }
+      })
+
+      // Registered BEFORE /api/excursions because connect prefix-matches and
+      // would otherwise route /api/excursions/segments into the wrong handler.
+      server.middlewares.use('/api/excursions/segments', async (req, res, next) => {
         if (req.method !== 'GET') return next()
         try {
           const { default: fs } = await import('fs/promises')
@@ -275,7 +534,7 @@ function offensesApiPlugin() {
           const nowMs = Date.now()
           const fromDate = new Date(nowMs - hours * 3600 * 1000).toISOString().slice(0, 10)
           const toDate = new Date(nowMs).toISOString().slice(0, 10)
-          // Geo helpers — duplicated from the /api/offenses handler to keep
+          // Geo helpers — duplicated from the /api/excursions handler to keep
           // this route self-contained. Any change to classification thresholds
           // must be mirrored in both places.
           const FT_PER_DEG_LAT = 364560
@@ -465,225 +724,104 @@ function offensesApiPlugin() {
           res.setHeader('Access-Control-Allow-Origin', '*')
           res.end(JSON.stringify(payload))
         } catch (err) {
-          console.error('[offenses-segments-api] error', err)
+          console.error('[excursions-segments-api] error', err)
           res.statusCode = 500
           res.setHeader('Content-Type', 'application/json')
           res.end(JSON.stringify({ error: String(err) }))
         }
       })
-      // GET /api/offenses/boot — Combined endpoint that returns BOTH the
-      // active excursions list AND all track segments in a single response,
-      // doing the expensive classification loop only once instead of twice.
-      // Accepts all params from both /active and /segments.
-      server.middlewares.use('/api/offenses/boot', async (req, res, next) => {
+      // GET /api/excursions/boot — Returns tracks with pre-computed bands
+      // and per-tail active summaries from Postgres. Optionally joins
+      // reports and notifications.
+      server.middlewares.use('/api/excursions/boot', async (req, res, next) => {
+        console.log('[excursions-boot] hit:', req.method, req.url)
         if (req.method !== 'GET') return next()
         try {
-          const { default: fs } = await import('fs/promises')
-          const { default: path } = await import('path')
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const hours = Number(u.searchParams.get('hours')) || 1
-          const limit = Number(u.searchParams.get('limit')) || 100
+          const limit = Math.min(500, Number(u.searchParams.get('limit')) || 100)
           const includeSet = new Set(
             (u.searchParams.get('include') || '')
               .split(',')
               .map((s) => s.trim())
               .filter(Boolean),
           )
-          if (!zonesCache) {
-            const mod = await import('./src/noiseZones.js')
-            zonesCache = mod.NOISE_ZONES
-          }
-          const [tracksData, liveData, schoolsData] = await Promise.all([
-            loadCached(fs, path, 'tracks'),
-            loadCached(fs, path, 'live'),
-            loadCached(fs, path, 'schools'),
-          ])
-          // Tail → school/type lookup
-          const tailInfo = new Map()
-          for (const s of schoolsData.schools || []) {
-            for (const ac of s.aircraft || []) {
-              if (ac.tail) tailInfo.set(ac.tail, { type: ac.type || 'Unknown', school: s.name, airport: s.airport })
-            }
-          }
-          for (const lt of liveData.tracks || []) {
-            const tail = (lt.call || '').trim()
-            if (!tail || tailInfo.has(tail)) continue
-            tailInfo.set(tail, { type: lt.type || 'Unknown', school: null, airport: null })
-          }
-          // Classification helpers (same as /segments and /active)
-          const FT_PER_DEG_LAT = 364560
-          const pointInPolygon = (lat, lon, poly) => {
-            let inside = false
-            for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-              const [yi, xi] = poly[i]
-              const [yj, xj] = poly[j]
-              if (((yi > lat) !== (yj > lat)) && (lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi)) inside = !inside
-            }
-            return inside
-          }
-          const distPointToSegFt = (lat, lon, aLat, aLon, bLat, bLon) => {
-            const latRef = (aLat + bLat + lat) / 3
-            const cos = Math.cos((latRef * Math.PI) / 180)
-            const px = (lon - aLon) * FT_PER_DEG_LAT * cos
-            const py = (lat - aLat) * FT_PER_DEG_LAT
-            const dx = (bLon - aLon) * FT_PER_DEG_LAT * cos
-            const dy = (bLat - aLat) * FT_PER_DEG_LAT
-            const len2 = dx * dx + dy * dy
-            if (len2 === 0) return Math.hypot(px, py)
-            let t = (px * dx + py * dy) / len2
-            t = Math.max(0, Math.min(1, t))
-            return Math.hypot(px - t * dx, py - t * dy)
-          }
-          const signedDistance = (lat, lon) => {
-            let minAbs = Infinity
-            let insideAny = false
-            let nearestZone = null
-            for (const z of zonesCache) {
-              const poly = z.polygon
-              if (pointInPolygon(lat, lon, poly)) insideAny = true
-              let minEdge = Infinity
-              for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-                const d = distPointToSegFt(lat, lon, poly[i][0], poly[i][1], poly[j][0], poly[j][1])
-                if (d < minEdge) minEdge = d
-              }
-              if (minEdge < minAbs) { minAbs = minEdge; nearestZone = z.name }
-            }
-            return { d: insideAny ? -minAbs : minAbs, zone: nearestZone }
-          }
-          const ALT_THRESHOLD_FT = 7500
-          const classifyAlt = (alt) => {
-            if (alt == null) return null
-            const below = ALT_THRESHOLD_FT - alt
-            if (below > 500) return 'red'
-            if (below > 250) return 'orange'
-            if (below > -250) return 'yellow'
-            return null
-          }
-          const classifyZone = (d) => {
-            if (d < -500) return 'red'
-            if (d < -250) return 'orange'
-            if (d < 250) return 'yellow'
-            return null
-          }
-          const SEV = { yellow: 1, orange: 2, red: 3 }
-          const classifyPoint = (lat, lon, alt) => {
-            const { d, zone } = signedDistance(lat, lon)
-            const z = classifyZone(d)
-            const a = classifyAlt(alt)
-            if (!z || !a) return { klass: null, zone: null }
-            return { klass: SEV[z] <= SEV[a] ? z : a, zone }
-          }
-          // Time window
+          const SEV = { yellow: 1, orange: 2, red: 3, purple: 4 }
           const nowMs = Date.now()
           const fromDate = new Date(nowMs - hours * 3600 * 1000).toISOString().slice(0, 10)
           const toDate = new Date(nowMs).toISOString().slice(0, 10)
-          const parseUtc = (s) => {
-            if (!s) return nowMs
-            const iso = /[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z'
-            const t = Date.parse(iso)
-            return Number.isFinite(t) ? t : nowMs
-          }
-          const liveUpdatedAtMs = parseUtc(liveData.updated_at)
-          // Gather candidate tracks (all tracks in window, capped by limit)
-          const allHist = tracksData.tracks || []
-          const allLive = liveData.tracks || []
-          const matches = allHist.filter((t) => {
-            const m = (t.src || '').match(/(\d{4}-\d{2}-\d{2})/)
-            if (!m) return false
-            return m[1] >= fromDate && m[1] <= toDate
-          })
-          for (const lt of allLive) matches.push(lt)
-          if (matches.length > limit) matches.length = limit
-          // ── Single pass: build segments AND accumulate active stats ──
-          const tracksOut = []
-          const activeByTail = new Map()
-          const fieldElev = 5288
-          const descThreshold = fieldElev + 300
-          for (const t of matches) {
-            const m = (t.src || '').match(/(\d{4}-\d{2}-\d{2})/)
-            const date = m ? m[1] : (t.src === 'live' ? toDate : null)
-            const isLive = t.src === 'live'
-            const tail = t.call || t.reg || '?'
-            // Classify all points → build segments + per-tail active stats
-            const segments = []
-            let cur = null
-            let trackWorst = null
-            const trackCounts = { yellow: 0, orange: 0, red: 0 }
-            let trackPointsHit = 0
-            let trackMaxPointTs = 0
-            let descents = 0, wasHigh = false
-            for (let i = 0; i < t.points.length; i++) {
-              const p = t.points[i]
-              // Descent detection
-              if (p[2] > descThreshold) wasHigh = true
-              else if (wasHigh) { descents++; wasHigh = false }
-              // Classify
-              const { klass, zone } = classifyPoint(p[0], p[1], p[2])
-              // Accumulate active stats
-              if (klass) {
-                trackCounts[klass]++
-                trackPointsHit++
-                if (!trackWorst || SEV[klass] > SEV[trackWorst]) trackWorst = klass
-                if (typeof p[3] === 'number' && p[3] > trackMaxPointTs) trackMaxPointTs = p[3]
-              }
-              // Build segment
-              if (cur && cur.klass === klass && cur.zone === zone) {
-                cur.points.push(p)
-              } else {
-                if (cur) { cur.points.push(p); segments.push(cur) }
-                cur = { klass, zone, points: [p] }
-              }
+
+          // ── Tracks from Postgres (pre-computed by backfill) ──
+          const tracksSql = `
+            SELECT call, type, desc_text AS desc, own_op AS "ownOp", src,
+                   date, base_airport AS base, worst_class AS worst, school,
+                   seg_total, seg_red, seg_orange, seg_yellow, seg_purple,
+                   len_total_ft, len_red_ft, len_orange_ft, len_yellow_ft, len_purple_ft,
+                   bands
+            FROM tracks
+            WHERE date >= $1 AND date <= $2
+              AND worst_class IS NOT NULL
+              AND bands IS NOT NULL
+            ORDER BY
+              CASE WHEN seg_purple > 0 THEN 0
+                   WHEN worst_class = 'red' THEN 1
+                   WHEN worst_class = 'orange' THEN 2
+                   ELSE 3 END,
+              rand_key
+            LIMIT $3
+          `
+          const tracksRes = await db.queryDb(tracksSql, [fromDate, toDate, limit])
+
+          // ── Per-tail active summary ──
+          const activeSql = `
+            SELECT call AS tail, type,
+                   MAX(worst_class) AS worst,
+                   SUM(seg_yellow)::int AS yellow,
+                   SUM(seg_orange)::int AS orange,
+                   SUM(seg_red)::int AS red,
+                   SUM(seg_purple)::int AS purple,
+                   SUM(seg_red + seg_orange + seg_yellow + seg_purple)::int AS points_hit,
+                   MAX(date) AS last_date,
+                   school, base_airport AS airport
+            FROM tracks
+            WHERE date >= $1 AND date <= $2
+              AND worst_class IS NOT NULL
+            GROUP BY call, type, school, base_airport
+            ORDER BY
+              CASE MAX(worst_class)
+                WHEN 'purple' THEN 4 WHEN 'red' THEN 3
+                WHEN 'orange' THEN 2 WHEN 'yellow' THEN 1
+                ELSE 0 END DESC,
+              SUM(seg_red) DESC
+          `
+          const activeRes = await db.queryDb(activeSql, [fromDate, toDate])
+          const active = activeRes.rows.map(r => ({
+            tail: r.tail, type: r.type || 'Unknown',
+            school: r.school || null, airport: r.airport || null,
+            worst: r.worst,
+            counts: { yellow: r.yellow, orange: r.orange, red: r.red, purple: r.purple },
+            pointsHit: r.points_hit,
+            lastDate: r.last_date,
+          }))
+
+          // ── Live tracks ──
+          let liveCount = 0, liveUpdatedAt = null
+          try {
+            const liveRes = await db.queryDb(
+              'SELECT tracks, updated_at FROM live_tracks WHERE day = CURRENT_DATE ORDER BY id DESC LIMIT 1'
+            )
+            if (liveRes.rows.length) {
+              liveCount = (liveRes.rows[0].tracks || []).length
+              liveUpdatedAt = liveRes.rows[0].updated_at || null
             }
-            if (cur) segments.push(cur)
-            // Timestamp segments
-            for (const s of segments) {
-              let first = null, last = null
-              for (const p of s.points) {
-                if (typeof p[3] === 'number') { if (first == null) first = p[3]; last = p[3] }
-              }
-              s.startedAt = first != null ? new Date(first).toISOString() : null
-              s.endedAt = last != null ? new Date(last).toISOString() : null
-            }
-            // Phase detection
-            const firstLow = t.points[0] && t.points[0][2] < descThreshold
-            const lastLow = t.points[t.points.length - 1] && t.points[t.points.length - 1][2] < descThreshold
-            let phase = 'overflight'
-            if (firstLow && lastLow && descents >= 2) phase = 'pattern'
-            else if (firstLow && !lastLow) phase = 'departure'
-            else if (!firstLow && lastLow) phase = 'arrival'
-            else if (firstLow && lastLow) phase = 'pattern'
-            if (segments.length) {
-              tracksOut.push({ tail, type: t.type || '', src: t.src, date, live: isLive, phase, descents, hasDescents: descents > 0, segments })
-            }
-            // Merge into per-tail active summary
-            if (trackWorst) {
-              let rec = activeByTail.get(tail)
-              if (!rec) {
-                const info = tailInfo.get(tail) || {}
-                rec = { tail, type: info.type || 'Unknown', school: info.school || null, airport: info.airport || null, worst: null, counts: { yellow: 0, orange: 0, red: 0 }, pointsHit: 0, lastDate: '', lastSeenMs: 0, live: false }
-                activeByTail.set(tail, rec)
-              }
-              for (const k of ['yellow', 'orange', 'red']) rec.counts[k] += trackCounts[k]
-              rec.pointsHit += trackPointsHit
-              if (!rec.worst || SEV[trackWorst] > SEV[rec.worst]) rec.worst = trackWorst
-              if (date && date > rec.lastDate) rec.lastDate = date
-              if (isLive) rec.live = true
-              const ts = trackMaxPointTs || (isLive ? liveUpdatedAtMs : (Date.parse((date || '') + 'T12:00:00Z') || 0))
-              if (ts > rec.lastSeenMs) rec.lastSeenMs = ts
-            }
-          }
-          const active = Array.from(activeByTail.values())
-          // Opt-in joins (reports, notifications) — same as /active
+          } catch {}
+
+          // ── Opt-in joins: reports, notifications ──
           const windowFromMs = nowMs - hours * 3600 * 1000
           if (includeSet.has('reports')) {
-            let complaintsData = null
-            if (db.useDb) {
-              complaintsData = { complaints: await db.getComplaints(null) }
-            } else {
-              try { complaintsData = JSON.parse(await fs.readFile(path.resolve('data/complaints.json'), 'utf8')) } catch {}
-            }
+            const complaints = await db.getComplaints(null)
             const byTail = new Map()
-            for (const c of (complaintsData?.complaints) || []) {
+            for (const c of complaints || []) {
               const ts = Date.parse(c.createdAt || '')
               if (!Number.isFinite(ts) || ts < windowFromMs || ts > nowMs) continue
               const k = (c.tail || '').toUpperCase()
@@ -701,12 +839,7 @@ function offensesApiPlugin() {
             }
           }
           if (includeSet.has('notifications')) {
-            let notifData = null
-            if (db.useDb) {
-              notifData = { items: await db.getNotifications(null, null) }
-            } else {
-              try { notifData = JSON.parse(await fs.readFile(path.resolve('data/notifications.json'), 'utf8')) } catch {}
-            }
+            const items = await db.getNotifications(null, null)
             const STATUS_RANK = { none: 0, acknowledged: 1, reviewed: 2, completed: 3 }
             const actionToStatus = (action) => {
               if (action === 'acknowledge') return 'acknowledged'
@@ -715,7 +848,7 @@ function offensesApiPlugin() {
               return 'none'
             }
             const byTail = new Map()
-            for (const it of (notifData?.items) || []) {
+            for (const it of items || []) {
               const ts = Date.parse(it.at || '')
               if (!Number.isFinite(ts) || ts < windowFromMs || ts > nowMs) continue
               const k = (it.tail || '').toUpperCase()
@@ -748,32 +881,38 @@ function offensesApiPlugin() {
               entry.pilotAction = { status: bestStatus, at: bestAt, steps }
             }
           }
-          active.sort((a, b) => {
-            if (SEV[b.worst] !== SEV[a.worst]) return SEV[b.worst] - SEV[a.worst]
-            return (b.lastSeenMs || 0) - (a.lastSeenMs || 0)
-          })
+
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Access-Control-Allow-Origin', '*')
           res.end(JSON.stringify({
             generated_at: new Date(nowMs).toISOString(),
             window: { hours, from: fromDate, to: toDate, limit },
             include: [...includeSet],
+            render: {
+              format: 'bands',
+              colors: { red: '#dc2626', orange: '#f97316', yellow: '#facc15', purple: '#a855f7' },
+              clean_color: '#1a7070',
+              weight: 1.5,
+              opacity: 0.7,
+              blend: 'multiply',
+              note: 'Each track.bands[] is an array of {klass, points} runs. Render each run as a Polyline colored by klass (null = clean_color). Points are [lat, lon, alt_ft]. Adjacent runs share their boundary point for continuity.',
+            },
             active,
-            tracks: tracksOut,
-            live: { updated_at: liveData.updated_at || null, tracks: allLive.length },
+            tracks: tracksRes.rows,
+            live: { updated_at: liveUpdatedAt, tracks: liveCount },
           }))
         } catch (err) {
-          console.error('[offenses-boot] error', err)
+          console.error('[excursions-boot] error', err)
           res.statusCode = 500
           res.setHeader('Content-Type', 'application/json')
           res.end(JSON.stringify({ error: String(err) }))
         }
       })
 
-      // GET /api/offenses/active[&hours=48][&include=reports,notifications]
+      // GET /api/excursions/active[&hours=48][&include=reports,notifications]
       // Returns all tails with at least one classified point within the
       // window, grouped per-tail (worst class, counts, last date, school/type
-      // lookup from flight_schools_fleets.json). Registered BEFORE /api/offenses
+      // lookup from flight_schools_fleets.json). Registered BEFORE /api/excursions
       // so connect's prefix matcher routes it correctly.
       //
       // include= opt-in joins. The base call stays cheap — the expensive
@@ -782,114 +921,7 @@ function offensesApiPlugin() {
       //                             the complaints store, filtered to window
       //   include=notifications   → operatorNotified / pilotNotified /
       //                             pilotAction from the notifications ledger
-      // GET /api/ops — real-time aircraft operations summary.
-      // Reads live tracks, classifies each by phase + cluster, returns
-      // a grouped summary suitable for a dashboard: "3 in pattern", etc.
-      server.middlewares.use('/api/ops', async (req, res, next) => {
-        if (req.method !== 'GET') return next()
-        try {
-          const { default: fs } = await import('fs/promises')
-          const { default: path } = await import('path')
-          const liveData = await loadCached(fs, path, 'live')
-          const schoolsData = await loadCached(fs, path, 'schools')
-          const schoolMap = new Map()
-          for (const s of schoolsData.schools || []) {
-            for (const ac of s.aircraft || []) schoolMap.set(ac.tail, s.name)
-          }
-          const AIRPORTS = [
-            { code: 'KBDU', lat: 40.0394, lon: -105.2258, elev: 5288 },
-            { code: 'KBJC', lat: 39.9088, lon: -105.1172, elev: 5673 },
-            { code: 'KEIK', lat: 40.0098, lon: -105.0488, elev: 5130 },
-            { code: 'KLMO', lat: 40.1636, lon: -105.1636, elev: 5055 },
-            { code: 'KAPA', lat: 39.5701, lon: -104.8493, elev: 5885 },
-            { code: 'KGXY', lat: 40.4348, lon: -104.6331, elev: 4697 },
-          ]
-          const nearAp = (lat, lon) => {
-            let best = AIRPORTS[0], bestD = Infinity
-            for (const ap of AIRPORTS) {
-              const d = Math.hypot((lat - ap.lat) * 69, (lon - ap.lon) * 53)
-              if (d < bestD) { bestD = d; best = ap }
-            }
-            return { ...best, dist: bestD }
-          }
-          const aircraft = []
-          for (const t of liveData.tracks || []) {
-            const pts = t.points || []
-            if (pts.length < 5) continue
-            const tail = t.call || t.reg || t.hex || '?'
-            const type = t.type || ''
-            const school = schoolMap.get(tail) || null
-            // Find nearest airport to lowest point
-            let lowestPt = pts[0], lowestAlt = pts[0][2]
-            for (const p of pts) { if (p[2] < lowestAlt) { lowestAlt = p[2]; lowestPt = p } }
-            const ap = nearAp(lowestPt[0], lowestPt[1])
-            const lastPt = pts[pts.length - 1]
-            const lastAp = nearAp(lastPt[0], lastPt[1])
-            // Phase detection
-            const LOW = ap.elev + 250, HIGH = ap.elev + 800
-            let descents = 0, ascents = 0, wasHigh = false, wentLow = false
-            for (const p of pts) {
-              if (p[2] > HIGH) { wasHigh = true }
-              else if (wasHigh && p[2] < LOW) { descents++; wasHigh = false }
-              if (p[2] < LOW) { wentLow = true }
-              else if (wentLow && p[2] > HIGH) { ascents++; wentLow = false }
-            }
-            const firstLow = pts[0][2] < LOW, lastLow = lastPt[2] < LOW
-            let phase
-            if (firstLow && lastLow && descents >= 2) phase = 'pattern'
-            else if (firstLow && !lastLow) phase = 'departure'
-            else if (!firstLow && lastLow) phase = 'arrival'
-            else if (!firstLow && !lastLow && descents === 0) phase = 'overflight'
-            else if (descents >= 1) phase = 'pattern'
-            else phase = 'transit'
-            // Activity label
-            const isGlider = /GLID|VENT|AS2|DG|NIMB|DISC/i.test(type)
-            const isTow = /PA25|PA18/.test(type) && descents >= 2
-            let activity
-            if (isTow) activity = 'towing'
-            else if (isGlider && lastAp.dist > 3) activity = 'ridge soaring'
-            else if (isGlider) activity = 'local soaring'
-            else if (phase === 'pattern' && descents >= 3) activity = 'touch-and-go practice'
-            else if (phase === 'pattern') activity = 'pattern work'
-            else if (phase === 'departure') activity = 'departing'
-            else if (phase === 'arrival') activity = 'arriving'
-            else if (lastAp.dist > 6) activity = 'practice area'
-            else activity = phase
-            aircraft.push({
-              tail, type, school, activity, phase,
-              airport: ap.code, dist_mi: +lastAp.dist.toFixed(1),
-              descents, ascents, points: pts.length,
-              alt: lastPt[2], agl: lastPt[2] - lastAp.elev,
-            })
-          }
-          // Group by activity
-          const groups = {}
-          for (const ac of aircraft) {
-            if (!groups[ac.activity]) groups[ac.activity] = []
-            groups[ac.activity].push(ac)
-          }
-          const summary = Object.entries(groups)
-            .sort((a, b) => b[1].length - a[1].length)
-            .map(([activity, list]) => ({
-              activity, count: list.length,
-              aircraft: list.map(a => ({ tail: a.tail, type: a.type, school: a.school, airport: a.airport, alt: a.alt, agl: a.agl })),
-            }))
-          res.setHeader('Content-Type', 'application/json')
-          res.setHeader('Access-Control-Allow-Origin', '*')
-          res.end(JSON.stringify({
-            timestamp: new Date().toISOString(),
-            total: aircraft.length,
-            summary,
-          }, null, 2))
-        } catch (e) {
-          console.error('[ops-api] error', e)
-          res.statusCode = 500
-          res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify({ error: String(e) }))
-        }
-      })
-
-      server.middlewares.use('/api/offenses/active', async (req, res, next) => {
+      server.middlewares.use('/api/excursions/active', async (req, res, next) => {
         if (req.method !== 'GET') return next()
         try {
           const { default: fs } = await import('fs/promises')
@@ -1215,14 +1247,14 @@ function offensesApiPlugin() {
           res.setHeader('Access-Control-Allow-Origin', '*')
           res.end(JSON.stringify(payload))
         } catch (err) {
-          console.error('[offenses-active-api] error', err)
+          console.error('[excursions-active-api] error', err)
           res.statusCode = 500
           res.setHeader('Content-Type', 'application/json')
           res.end(JSON.stringify({ error: String(err) }))
         }
       })
 
-      server.middlewares.use('/api/offenses', async (req, res, next) => {
+      server.middlewares.use('/api/excursions', async (req, res, next) => {
         if (req.method !== 'GET') return next()
         try {
           const { default: fs } = await import('fs/promises')
@@ -1337,7 +1369,7 @@ function offensesApiPlugin() {
             return true
           })
           // Walk each track, collect contiguous-violation events
-          const offenses = []
+          const excursions = []
           for (const t of matches) {
             const m = (t.src || '').match(/(\d{4}-\d{2}-\d{2})/)
             const date = m ? m[1] : null
@@ -1358,19 +1390,19 @@ function offensesApiPlugin() {
                   }
                 }
               } else if (cur) {
-                offenses.push(cur); cur = null
+                excursions.push(cur); cur = null
               }
             }
-            if (cur) offenses.push(cur)
+            if (cur) excursions.push(cur)
           }
-          offenses.sort((a, b) => (a.date || '').localeCompare(b.date || ''))
+          excursions.sort((a, b) => (a.date || '').localeCompare(b.date || ''))
           // Landing URL — deep link to the NoticePage with tail, timestamp
           // of the worst offense (midnight UTC of that day), and school
           // pre-populated for the compose flow.
           const host = req.headers.host || 'localhost:5174'
           const proto = req.headers['x-forwarded-proto'] || 'http'
-          const worstOffense = offenses.length
-            ? offenses.reduce((w, o) => (SEV[o.worst] > SEV[w.worst] ? o : w), offenses[0])
+          const worstOffense = excursions.length
+            ? excursions.reduce((w, o) => (SEV[o.worst] > SEV[w.worst] ? o : w), excursions[0])
             : null
           const atMs = worstOffense
             ? Date.parse(worstOffense.date + 'T12:00:00Z') || Date.now()
@@ -1391,11 +1423,11 @@ function offensesApiPlugin() {
             window: { from: from || null, to: to || null },
             tracks_seen: matches.length,
             tracks_in_index: candidates.length,
-            total_offenses: offenses.length,
-            worst: offenses.length
-              ? offenses.reduce((w, o) => (SEV[o.worst] > SEV[w] ? o.worst : w), offenses[0].worst)
+            total_excursions: excursions.length,
+            worst: excursions.length
+              ? excursions.reduce((w, o) => (SEV[o.worst] > SEV[w] ? o.worst : w), excursions[0].worst)
               : null,
-            offenses,
+            excursions,
             landing_url: landing,
             timing_ms: { total: elapsedMs, file_load: loadMs },
           }
@@ -1403,7 +1435,7 @@ function offensesApiPlugin() {
           res.setHeader('Access-Control-Allow-Origin', '*')
           res.end(JSON.stringify(payload, null, 2))
         } catch (err) {
-          console.error('[offenses-api] error', err)
+          console.error('[excursions-api] error', err)
           res.statusCode = 500
           res.setHeader('Content-Type', 'application/json')
           res.end(JSON.stringify({ error: String(err) }))
@@ -1417,7 +1449,7 @@ function offensesApiPlugin() {
 // preview/build-serve invocation): polls adsb.lol (falling back to
 // airplanes.live) every POLL_MS, accumulates per-hex tracks in memory, and
 // atomically flushes to public/tracks_live.json — the same file the
-// /api/offenses/segments endpoint merges with historical data. On UTC day
+// /api/excursions/segments endpoint merges with historical data. On UTC day
 // rollover the previous day is written to public/tracks_live_YYYY-MM-DD.json
 // and in-memory state resets. This replaces the brittle per-tab
 // localStorage persistence in App.jsx as the single source of truth for
@@ -3056,7 +3088,7 @@ export default defineConfig({
     db.useDb ? dbTracksPlugin() : externalDataPlugin(),
     noiseApiPlugin(),  // pre-aggregated stats + filtered tracks (DB-only)
     sendNoticePlugin(),
-    offensesApiPlugin(),
+    excursionsApiPlugin(),
     complaintsApiPlugin(),
     noiseReportsApiPlugin(),
     pilotApiPlugin(),
