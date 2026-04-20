@@ -782,6 +782,113 @@ function offensesApiPlugin() {
       //                             the complaints store, filtered to window
       //   include=notifications   → operatorNotified / pilotNotified /
       //                             pilotAction from the notifications ledger
+      // GET /api/ops — real-time aircraft operations summary.
+      // Reads live tracks, classifies each by phase + cluster, returns
+      // a grouped summary suitable for a dashboard: "3 in pattern", etc.
+      server.middlewares.use('/api/ops', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const { default: fs } = await import('fs/promises')
+          const { default: path } = await import('path')
+          const liveData = await loadCached(fs, path, 'live')
+          const schoolsData = await loadCached(fs, path, 'schools')
+          const schoolMap = new Map()
+          for (const s of schoolsData.schools || []) {
+            for (const ac of s.aircraft || []) schoolMap.set(ac.tail, s.name)
+          }
+          const AIRPORTS = [
+            { code: 'KBDU', lat: 40.0394, lon: -105.2258, elev: 5288 },
+            { code: 'KBJC', lat: 39.9088, lon: -105.1172, elev: 5673 },
+            { code: 'KEIK', lat: 40.0098, lon: -105.0488, elev: 5130 },
+            { code: 'KLMO', lat: 40.1636, lon: -105.1636, elev: 5055 },
+            { code: 'KAPA', lat: 39.5701, lon: -104.8493, elev: 5885 },
+            { code: 'KGXY', lat: 40.4348, lon: -104.6331, elev: 4697 },
+          ]
+          const nearAp = (lat, lon) => {
+            let best = AIRPORTS[0], bestD = Infinity
+            for (const ap of AIRPORTS) {
+              const d = Math.hypot((lat - ap.lat) * 69, (lon - ap.lon) * 53)
+              if (d < bestD) { bestD = d; best = ap }
+            }
+            return { ...best, dist: bestD }
+          }
+          const aircraft = []
+          for (const t of liveData.tracks || []) {
+            const pts = t.points || []
+            if (pts.length < 5) continue
+            const tail = t.call || t.reg || t.hex || '?'
+            const type = t.type || ''
+            const school = schoolMap.get(tail) || null
+            // Find nearest airport to lowest point
+            let lowestPt = pts[0], lowestAlt = pts[0][2]
+            for (const p of pts) { if (p[2] < lowestAlt) { lowestAlt = p[2]; lowestPt = p } }
+            const ap = nearAp(lowestPt[0], lowestPt[1])
+            const lastPt = pts[pts.length - 1]
+            const lastAp = nearAp(lastPt[0], lastPt[1])
+            // Phase detection
+            const LOW = ap.elev + 250, HIGH = ap.elev + 800
+            let descents = 0, ascents = 0, wasHigh = false, wentLow = false
+            for (const p of pts) {
+              if (p[2] > HIGH) { wasHigh = true }
+              else if (wasHigh && p[2] < LOW) { descents++; wasHigh = false }
+              if (p[2] < LOW) { wentLow = true }
+              else if (wentLow && p[2] > HIGH) { ascents++; wentLow = false }
+            }
+            const firstLow = pts[0][2] < LOW, lastLow = lastPt[2] < LOW
+            let phase
+            if (firstLow && lastLow && descents >= 2) phase = 'pattern'
+            else if (firstLow && !lastLow) phase = 'departure'
+            else if (!firstLow && lastLow) phase = 'arrival'
+            else if (!firstLow && !lastLow && descents === 0) phase = 'overflight'
+            else if (descents >= 1) phase = 'pattern'
+            else phase = 'transit'
+            // Activity label
+            const isGlider = /GLID|VENT|AS2|DG|NIMB|DISC/i.test(type)
+            const isTow = /PA25|PA18/.test(type) && descents >= 2
+            let activity
+            if (isTow) activity = 'towing'
+            else if (isGlider && lastAp.dist > 3) activity = 'ridge soaring'
+            else if (isGlider) activity = 'local soaring'
+            else if (phase === 'pattern' && descents >= 3) activity = 'touch-and-go practice'
+            else if (phase === 'pattern') activity = 'pattern work'
+            else if (phase === 'departure') activity = 'departing'
+            else if (phase === 'arrival') activity = 'arriving'
+            else if (lastAp.dist > 6) activity = 'practice area'
+            else activity = phase
+            aircraft.push({
+              tail, type, school, activity, phase,
+              airport: ap.code, dist_mi: +lastAp.dist.toFixed(1),
+              descents, ascents, points: pts.length,
+              alt: lastPt[2], agl: lastPt[2] - lastAp.elev,
+            })
+          }
+          // Group by activity
+          const groups = {}
+          for (const ac of aircraft) {
+            if (!groups[ac.activity]) groups[ac.activity] = []
+            groups[ac.activity].push(ac)
+          }
+          const summary = Object.entries(groups)
+            .sort((a, b) => b[1].length - a[1].length)
+            .map(([activity, list]) => ({
+              activity, count: list.length,
+              aircraft: list.map(a => ({ tail: a.tail, type: a.type, school: a.school, airport: a.airport, alt: a.alt, agl: a.agl })),
+            }))
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({
+            timestamp: new Date().toISOString(),
+            total: aircraft.length,
+            summary,
+          }, null, 2))
+        } catch (e) {
+          console.error('[ops-api] error', e)
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: String(e) }))
+        }
+      })
+
       server.middlewares.use('/api/offenses/active', async (req, res, next) => {
         if (req.method !== 'GET') return next()
         try {
