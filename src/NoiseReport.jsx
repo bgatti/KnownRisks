@@ -870,11 +870,18 @@ export function NoiseStudio() {
       const lastPt = lastSeg?.points?.[lastSeg.points.length - 1]
       for (const seg of track.segments || []) {
         if (!seg.points || seg.points.length < 2) continue
-        const latlngs = seg.points.map((p) => [p[0], p[1]])
+        // Ensure points are chronological (old → new = direction of travel)
+        const pts = [...seg.points]
+        const firstTs = pts[0]?.[3]
+        const lastTs = pts[pts.length - 1]?.[3]
+        if (typeof firstTs === 'number' && typeof lastTs === 'number' && firstTs > lastTs) {
+          pts.reverse()
+        }
+        const latlngs = pts.map((p) => [p[0], p[1]])
 
         // Most recent timestamp in this segment → drives opacity
         let segLastMs = 0
-        for (const p of seg.points) {
+        for (const p of pts) {
           if (typeof p[3] === 'number' && p[3] > segLastMs) segLastMs = p[3]
         }
         const age = segLastMs ? (now - segLastMs) / WINDOW_MS : 0.5
@@ -906,7 +913,7 @@ export function NoiseStudio() {
         }
 
         const { showHover, hideHover, clickSelect } = makeHoverHandlers(track.tail, segLastMs || null, {
-          klass: seg.klass, zone: seg.zone, points: seg.points, type: track.type || '',
+          klass: seg.klass, zone: seg.zone, points: pts, type: track.type || '',
         })
         const hit = L.polyline(latlngs, {
           color: '#ffffff',
@@ -919,17 +926,31 @@ export function NoiseStudio() {
         hit.on('mouseout', hideHover)
         hit.on('click', clickSelect)
 
+        // Tag with first + last timestamps for time-scheduled animation
+        const segFirstMs = pts.find((p) => typeof p[3] === 'number')?.[3] || 0
+        line._segFirstMs = segFirstMs
         line._segLastMs = segLastMs || 0
         nearbyTracesRef.current.push(line, hit)
       }
 
       // Aircraft icons now managed by the live-positions poll effect.
     }
-    // Snake-draw animation for nearby tracks
-    const nearbyQueue = nearbyTracesRef.current.filter((p) => p._segLastMs != null)
-    nearbyQueue.sort((a, b) => (a._segLastMs || 0) - (b._segLastMs || 0))
-    for (let i = 0; i < nearbyQueue.length; i++) {
-      snakeDraw(nearbyQueue[i], 900, i * 150)
+    // Snake-draw animation: schedule each segment to appear based on its
+    // actual start time, compressed into a ~5 second animation window.
+    const nearbyQueue = nearbyTracesRef.current.filter((p) => p._segFirstMs != null)
+    if (nearbyQueue.length) {
+      const minTs = Math.min(...nearbyQueue.map((p) => p._segFirstMs))
+      const maxTs = Math.max(...nearbyQueue.map((p) => p._segLastMs || p._segFirstMs))
+      const span = maxTs - minTs || 1
+      const ANIM_WINDOW = 5000 // compress the 30-min span into 5 seconds
+      for (const line of nearbyQueue) {
+        // Delay = where this segment starts relative to the oldest, scaled to 5s
+        const delay = Math.round(((line._segFirstMs - minTs) / span) * ANIM_WINDOW)
+        // Duration proportional to segment length in time (min 300ms, max 2s)
+        const segSpan = (line._segLastMs || line._segFirstMs) - line._segFirstMs
+        const duration = Math.max(300, Math.min(2000, (segSpan / span) * ANIM_WINDOW))
+        snakeDraw(line, duration, delay)
+      }
     }
     if (areaRef.current) areaRef.current.bringToFront()
     } catch (err) {
