@@ -804,7 +804,7 @@ function excursionsApiPlugin() {
             lastDate: r.last_date,
           }))
 
-          // ── Live tracks: classify on the fly into bands ──
+          // ── Live tracks (pre-classified by capture-worker) ──
           let liveCount = 0, liveUpdatedAt = null
           const liveTracks = []
           try {
@@ -815,89 +815,30 @@ function excursionsApiPlugin() {
               const rawLive = liveRes.rows[0].tracks || []
               liveCount = rawLive.length
               liveUpdatedAt = liveRes.rows[0].updated_at || null
-              // Lazy-load classification (Vite resolves these via its module graph)
-              let cpFn = null, zones = null
-              try {
-                const geoMod = await server.__pendingRequests || null // skip if not available
-                // Use inline classification matching geo.js logic
-              } catch {}
-              // Inline point classifier (same logic as geo.js classifyPoint)
-              if (!zonesCache) {
-                try { zonesCache = (await import('./src/noiseZones.js')).NOISE_ZONES } catch {
-                  try { zonesCache = (await import(new URL('./src/noiseZones.js', import.meta.url).href)).NOISE_ZONES } catch {}
-                }
-              }
-              const FT = 364560
-              const pip = (lat, lon, poly) => {
-                let inside = false
-                for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-                  const [yi, xi] = poly[i], [yj, xj] = poly[j]
-                  if (((yi > lat) !== (yj > lat)) && (lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi)) inside = !inside
-                }
-                return inside
-              }
-              const signedDist = (lat, lon) => {
-                if (!zonesCache) return 99999
-                let minAbs = Infinity, insideAny = false
-                for (const z of zonesCache) {
-                  if (pip(lat, lon, z.polygon)) insideAny = true
-                  for (let i = 0, j = z.polygon.length - 1; i < z.polygon.length; j = i++) {
-                    const [aLat, aLon] = z.polygon[j], [bLat, bLon] = z.polygon[i]
-                    const cos = Math.cos(lat * Math.PI / 180)
-                    const px = (lon - aLon) * FT * cos, py = (lat - aLat) * FT
-                    const dx = (bLon - aLon) * FT * cos, dy = (bLat - aLat) * FT
-                    const len2 = dx*dx + dy*dy
-                    let d
-                    if (len2 === 0) d = Math.hypot(px, py)
-                    else { let t = (px*dx + py*dy) / len2; t = Math.max(0, Math.min(1, t)); d = Math.hypot(px - t*dx, py - t*dy) }
-                    if (d < minAbs) minAbs = d
-                  }
-                }
-                return insideAny ? -minAbs : minAbs
-              }
-              const cpInline = (lat, lon, alt) => {
-                const d = signedDist(lat, lon)
-                const zK = d < -500 ? 'red' : d < -250 ? 'orange' : d < 250 ? 'yellow' : null
-                const below = 7500 - (alt || 99999)
-                const aK = below > 500 ? 'red' : below > 250 ? 'orange' : below > -250 ? 'yellow' : null
-                if (!zK || !aK) return null
-                return (SEV[zK]||0) <= (SEV[aK]||0) ? zK : aK
-              }
               for (const t of rawLive) {
-                const pts = t.points || []
-                if (pts.length < 2) continue
-                const bands = []
-                let cur = null
-                for (const p of pts) {
-                  const klass = cpInline(p[0], p[1], p[2])
-                  if (cur && cur.klass === klass) {
-                    cur.points.push([p[0], p[1], p[2]])
-                  } else {
-                    if (cur) { cur.points.push([p[0], p[1], p[2]]); bands.push(cur) }
-                    cur = { klass, points: [[p[0], p[1], p[2]]] }
-                  }
-                }
-                if (cur) bands.push(cur)
-                const worst = bands.reduce((w, b) => {
-                  if (!b.klass) return w
-                  if (!w || (SEV[b.klass] || 0) > (SEV[w] || 0)) return b.klass
-                  return w
-                }, null)
+                if (!t.bands || t.bands.length === 0) continue
                 liveTracks.push({
                   call: t.call || t.reg || '?',
                   type: t.type || '',
                   src: 'live',
                   date: toDate,
                   base: null,
-                  worst,
+                  worst: t.worst || null,
                   school: null,
-                  bands,
+                  seg_total: t.seg_total || 0,
+                  seg_red: t.seg_red || 0,
+                  seg_orange: t.seg_orange || 0,
+                  seg_yellow: t.seg_yellow || 0,
+                  len_total_ft: t.len_total_ft || 0,
+                  len_red_ft: t.len_red_ft || 0,
+                  len_orange_ft: t.len_orange_ft || 0,
+                  len_yellow_ft: t.len_yellow_ft || 0,
+                  bands: t.bands,
                   live: true,
                 })
               }
             }
           } catch (e) { console.error('[excursions-boot] live error:', e.message) }
-          console.log(`[excursions-boot] live: ${liveCount} raw, ${liveTracks.length} classified`)
 
           // ── Opt-in joins: reports, notifications ──
           const windowFromMs = nowMs - hours * 3600 * 1000

@@ -5,11 +5,50 @@
 // Runs as its own Railway service — independent of the Vite web server.
 
 import pg from 'pg'
+import { classifyPoint, distFt } from './src/geo.js'
+import { NOISE_ZONES } from './src/noiseZones.js'
 
 const CENTER = [40.0394, -105.2258]
 const RADIUS_NM = 15
 const POLL_MS = 2_000
 const ALT_MAX_FT = 10_000
+const SEVERITY = { yellow: 1, orange: 2, red: 3, purple: 4 }
+
+// Build bands + stats from a track's points
+function classifyTrackLive(points) {
+  const bands = []
+  let cur = null
+  let worst = null
+  let seg_total = 0, seg_red = 0, seg_orange = 0, seg_yellow = 0
+  let len_total_ft = 0, len_red_ft = 0, len_orange_ft = 0, len_yellow_ft = 0
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i]
+    const klass = classifyPoint(p[0], p[1], p[2], NOISE_ZONES)
+    if (klass && (!worst || SEVERITY[klass] > SEVERITY[worst])) worst = klass
+    // Bands
+    if (cur && cur.klass === klass) {
+      cur.points.push([p[0], p[1], p[2]])
+    } else {
+      if (cur) { cur.points.push([p[0], p[1], p[2]]); bands.push(cur) }
+      cur = { klass, points: [[p[0], p[1], p[2]]] }
+    }
+    // Segment stats
+    if (i > 0) {
+      const a = points[i - 1]
+      const seg = distFt(a[0], a[1], p[0], p[1])
+      len_total_ft += seg
+      seg_total++
+      // Use worst of adjacent point classes for segment
+      const prevK = classifyPoint(a[0], a[1], a[2], NOISE_ZONES)
+      const segK = (SEVERITY[klass] || 0) >= (SEVERITY[prevK] || 0) ? klass : prevK
+      if (segK === 'red') { seg_red++; len_red_ft += seg }
+      else if (segK === 'orange') { seg_orange++; len_orange_ft += seg }
+      else if (segK === 'yellow') { seg_yellow++; len_yellow_ft += seg }
+    }
+  }
+  if (cur) bands.push(cur)
+  return { bands, worst, seg_total, seg_red, seg_orange, seg_yellow, len_total_ft, len_red_ft, len_orange_ft, len_yellow_ft }
+}
 
 const FEEDS = [
   (lat, lon, nm) => `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${nm}`,
@@ -77,9 +116,19 @@ async function initDb() {
 }
 
 function serializeTracks(byHex) {
-  return Array.from(byHex.values()).map((t) => ({
-    hex: t.hex, call: t.call, type: t.type, reg: t.reg, src: 'live', points: t.points,
-  }))
+  return Array.from(byHex.values()).map((t) => {
+    const cls = classifyTrackLive(t.points)
+    return {
+      hex: t.hex, call: t.call, type: t.type, reg: t.reg, src: 'live',
+      points: t.points,
+      bands: cls.bands.map(b => ({ klass: b.klass, points: b.points })),
+      worst: cls.worst,
+      seg_total: cls.seg_total, seg_red: cls.seg_red,
+      seg_orange: cls.seg_orange, seg_yellow: cls.seg_yellow,
+      len_total_ft: cls.len_total_ft, len_red_ft: cls.len_red_ft,
+      len_orange_ft: cls.len_orange_ft, len_yellow_ft: cls.len_yellow_ft,
+    }
+  })
 }
 
 async function flush() {
