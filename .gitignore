@@ -1,3 +1,15 @@
 node_modules
-public/tracks_yearly.json
 dist
+.vite
+
+# Ephemeral / data files (regenerated at runtime)
+public/tracks_yearly.json
+public/tracks_live*.json
+public/tracks_live*.json.*
+public/tracks_live*.tmp
+*.tmp
+*.log
+
+.env
+.env.*
+.DS_Store
