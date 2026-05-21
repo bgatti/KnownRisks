@@ -1,5 +1,27 @@
-// Same-origin — noise/web IS the API server.
-const BASE = ''
+// Same-origin in production (noise/web IS the API server). When running
+// the Vite dev server on localhost, fall back to the deployed API so we
+// don't need a local DATABASE_URL.
+const BASE =
+  typeof window !== 'undefined' &&
+  /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname)
+    ? 'https://web-app-production-fedf.up.railway.app'
+    : ''
+
+/** Direct URL to a noise-report audio clip — for use in <audio src=…>. */
+export function reportAudioUrl(reportId, slot) {
+  return `${BASE}/api/noise-reports/${reportId}/audio/${slot}`
+}
+
+/**
+ * GET /api/noise-zones — voluntary noise-abatement polygons. Each zone:
+ *   { name, airport, note, ceiling_ft, polygon: [[lat,lng], ...] }
+ */
+export async function fetchNoiseZones({ signal } = {}) {
+  const res = await fetch(`${BASE}/api/noise-zones`, { signal })
+  if (!res.ok) throw new Error(`noise-zones ${res.status}`)
+  const data = await res.json()
+  return data.zones || []
+}
 
 /**
  * GET /api/noise/leaderboard
@@ -7,10 +29,14 @@ const BASE = ''
  * @param {number}  opts.days   Lookback window (1–3650, default 90)
  * @param {number}  opts.limit  Number of entries (1–100, default 20)
  * @param {string}  opts.by     Group by: 'tail' | 'base' | 'school'
+ * @param {string}  opts.homeBase  Restrict to aircraft based at this airport (home field), e.g. 'KBDU'
+ * @param {string}  opts.origin    'local' | 'transient' — per-flight geometric class
  * @param {AbortSignal} opts.signal
  */
-export async function fetchLeaderboard({ days = 90, limit = 20, by = 'tail', signal } = {}) {
+export async function fetchLeaderboard({ days = 90, limit = 20, by = 'tail', homeBase, origin, signal } = {}) {
   const params = new URLSearchParams({ days: String(days), limit: String(limit), by })
+  if (homeBase) params.set('homeBase', homeBase)
+  if (origin) params.set('origin', origin)
   const res = await fetch(`${BASE}/api/noise/leaderboard?${params}`, { signal })
   if (!res.ok) throw new Error(`leaderboard ${res.status}`)
   const data = await res.json()
@@ -26,10 +52,15 @@ export async function fetchLeaderboard({ days = 90, limit = 20, by = 'tail', sig
 }
 
 /**
- * GET /api/noise/missions — today's interesting flights by category.
+ * GET /api/noise/missions — completed flights (takeoff→landing cycles, with
+ * touch-and-go / taxi-back merged) categorized by purpose. `days` widens the
+ * window to the last N UTC days (default 1 = today, max 90).
  */
-export async function fetchMissions({ signal } = {}) {
-  const res = await fetch(`${BASE}/api/noise/missions`, { signal })
+export async function fetchMissions({ days = 1, signal } = {}) {
+  const params = new URLSearchParams()
+  if (days && days !== 1) params.set('days', String(days))
+  const qs = params.toString()
+  const res = await fetch(`${BASE}/api/noise/missions${qs ? `?${qs}` : ''}`, { signal })
   if (!res.ok) throw new Error(`missions ${res.status}`)
   return res.json()
 }
@@ -111,9 +142,10 @@ export async function postComplaint(payload, { signal } = {}) {
   return res.json()
 }
 
-export async function fetchMyReports({ reporter, signal } = {}) {
+export async function fetchMyReports({ reporter, signal, limit = 10 } = {}) {
   const params = new URLSearchParams()
   if (reporter) params.set('reporter', reporter)
+  if (limit) params.set('limit', String(limit))
   const res = await fetch(`${BASE}/api/noise-reports?${params}`, { signal })
   if (!res.ok) return []
   const data = await res.json()
@@ -124,19 +156,23 @@ export async function fetchMyReports({ reporter, signal } = {}) {
     if (typeof rep === 'object' && rep) return rep.email === reporter || rep.id === reporter || rep.name === reporter
     return false
   })
-  return list
+  // Server may or may not honor `limit` — sort newest-first and cap client-side.
+  list.sort((a, b) => Date.parse(b.submittedAt || b.receivedAt || b.createdAt || 0) - Date.parse(a.submittedAt || a.receivedAt || a.createdAt || 0))
+  return list.slice(0, limit)
 }
 
-export async function fetchMyComplaints({ reporter, signal } = {}) {
+export async function fetchMyComplaints({ reporter, signal, limit = 10 } = {}) {
   const params = new URLSearchParams()
   if (reporter) params.set('reporter', reporter)
+  if (limit) params.set('limit', String(limit))
   const res = await fetch(`${BASE}/api/complaints?${params}`, { signal })
   if (!res.ok) throw new Error(`complaints ${res.status}`)
   const data = await res.json()
   let list = data.complaints || []
   // Server may not filter by reporter yet — enforce client-side as a safety.
   if (reporter) list = list.filter((c) => (c.reporter || '') === reporter)
-  return list
+  list.sort((a, b) => Date.parse(b.createdAt || b.startedAt || 0) - Date.parse(a.createdAt || a.startedAt || 0))
+  return list.slice(0, limit)
 }
 
 export async function fetchAllComplaints({ signal } = {}) {
@@ -151,6 +187,27 @@ export async function fetchAllNoiseReports({ signal } = {}) {
   if (!res.ok) throw new Error(`noise-reports ${res.status}`)
   const data = await res.json()
   return data.reports || []
+}
+
+/**
+ * POST raw audio bytes for a noise report.
+ * @param {string} reportId  ID returned by postFullReport
+ * @param {string} slot      'spliced10s' | 'loudest5s'
+ * @param {Blob}   blob      Audio bytes (WAV or MP3)
+ * @param {string} mime      Content-Type (defaults to blob.type or audio/wav)
+ */
+export async function postReportAudio(reportId, slot, blob, mime) {
+  const ct = mime || blob.type || 'audio/wav'
+  const res = await fetch(`${BASE}/api/noise-reports/${reportId}/audio/${slot}`, {
+    method: 'POST',
+    headers: { 'Content-Type': ct },
+    body: blob,
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`audio ${slot} ${res.status} ${text}`.trim())
+  }
+  return res.json().catch(() => ({}))
 }
 
 export const KLASS_COLORS = {

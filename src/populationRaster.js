@@ -51,6 +51,9 @@ export async function loadPopulationDensity() {
  * @param {Object} [opts]
  * @param {number} [opts.logFloor=1]    - densities below this (people/km²) are transparent
  * @param {number} [opts.logCeil=15000] - density at which the palette saturates
+ * @param {boolean} [opts.grayscale=false] - emit luminance (black→white) instead of
+ *   the color palette. Pairs with a `screen` blend so dense areas glow like city
+ *   lights on a dark basemap (or `multiply` to carve them in as shadow).
  * @returns {{ dataUrl: string, latLngBounds: [[number,number],[number,number]] } | null}
  */
 export function rasterizePopulation(data, opts = {}) {
@@ -60,6 +63,7 @@ export function rasterizePopulation(data, opts = {}) {
 
   const logFloor = opts.logFloor ?? 1
   const logCeil = opts.logCeil ?? 15000
+  const grayscale = opts.grayscale ?? false
 
   const loL = Math.log(Math.max(1, logFloor))
   const hiL = Math.log(Math.max(2, logCeil))
@@ -100,10 +104,17 @@ export function rasterizePopulation(data, opts = {}) {
 
       let s = (Math.log(density) - loL) / span
       if (s < 0) s = 0; else if (s > 1) s = 1
-      const k = (s * (LUT_SIZE - 1)) | 0
-      px[idx + 0] = lutR[k]
-      px[idx + 1] = lutG[k]
-      px[idx + 2] = lutB[k]
+      if (grayscale) {
+        // Pure luminance, dense → bright. Under a `screen` blend a black pixel
+        // is a no-op and white adds full light, so density reads as a glow.
+        const v = (s * 255) | 0
+        px[idx + 0] = v; px[idx + 1] = v; px[idx + 2] = v
+      } else {
+        const k = (s * (LUT_SIZE - 1)) | 0
+        px[idx + 0] = lutR[k]
+        px[idx + 1] = lutG[k]
+        px[idx + 2] = lutB[k]
+      }
       // Alpha ramps from 0.3 at the low end to 0.7 at the high end —
       // translucent enough to see the basemap through, opaque enough
       // to read the density colors.

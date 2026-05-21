@@ -1,8 +1,29 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import crypto from 'crypto'
-import * as db from './db.js'
-import * as adsb from './adsb.js'
+import fs from 'fs'
+import path from 'path'
+
+// Load .env.local into process.env BEFORE importing db.js (which reads
+// DATABASE_URL at module load). Lets local dev point at Railway's Postgres
+// just by writing the connection string into noise/web/.env.local.
+// Only loads variables not already set so an explicit
+// `DATABASE_URL=... npx vite` still wins.
+{
+  const envPath = path.resolve(process.cwd(), '.env.local')
+  if (fs.existsSync(envPath)) {
+    for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+      if (line.trim().startsWith('#')) continue
+      const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$/i)
+      if (!m) continue
+      const [, k, v] = m
+      if (!process.env[k]) process.env[k] = v.replace(/^['"]|['"]$/g, '')
+    }
+    console.log('[env] loaded .env.local')
+  }
+}
+const db = await import('./db.js')
+const adsb = await import('./adsb.js')
 
 // JSON file-backed ledger store. Each instance owns one file (e.g.
 // data/reports.json) and serializes concurrent mutations through a single
@@ -195,9 +216,13 @@ function excursionsApiPlugin() {
     data._byTail = byTail
     return data
   }
-  const loadCached = async (fs, path, key) => {
+  // `opts` is forwarded to db.loadTracksFromDb when key === 'tracks':
+  //   { fromDate?, toDate?, hardCap? }
+  // Without it the DB loader defaults to "last 90 days, max 50000 rows"
+  // — large windows must opt in explicitly to avoid OOM-ing the heap.
+  const loadCached = async (fs, path, key, opts = {}) => {
     if (db.useDb) {
-      if (key === 'tracks') return db.loadTracksFromDb()
+      if (key === 'tracks') return db.loadTracksFromDb(opts)
       if (key === 'live') return db.loadLiveFromDb()
       if (key === 'schools') return db.loadSchoolsFromDb()
     }
@@ -261,10 +286,32 @@ function excursionsApiPlugin() {
           const { default: path } = await import('path')
           const liveData = await loadCached(fs, path, 'live')
           const schoolsData = await loadCached(fs, path, 'schools')
+          // Build school + per-aircraft description lookups from the
+          // schools file (each aircraft has tail + descriptive type, e.g.
+          // "Cessna 172P (1981)").
           const schoolMap = new Map()
+          const schoolAcDesc = new Map()
           for (const s of schoolsData.schools || []) {
-            for (const ac of s.aircraft || []) schoolMap.set(ac.tail, s.name)
+            for (const ac of s.aircraft || []) {
+              schoolMap.set(ac.tail, s.name)
+              if (ac.type) schoolAcDesc.set(ac.tail, ac.type)
+            }
           }
+          // Special-use registry — overrides type-code purpose for known
+          // medivac, firefighting, law enforcement, military, etc. tails.
+          const specialUseMap = new Map()
+          try {
+            const buf = await fs.readFile(path.resolve('public/special_use_aircraft.json'), 'utf8')
+            const sud = JSON.parse(buf)
+            for (const ac of sud.aircraft || []) {
+              specialUseMap.set(ac.tail, {
+                use: ac.use,                        // medivac, firefighting, …
+                description: ac.description,        // human-readable role
+                aircraft_desc: ac.aircraft_desc,    // e.g. "PILATUS PC-12"
+                owner: ac.owner,
+              })
+            }
+          } catch (e) { /* file optional — categorisation falls back to type-only */ }
           const AP = [
             { code: 'KBDU', lat: 40.0394, lon: -105.2258, elev: 5288, tpa: 6300 },
             { code: 'KBJC', lat: 39.9088, lon: -105.1172, elev: 5673, tpa: 6700 },
@@ -299,7 +346,30 @@ function excursionsApiPlugin() {
             return { ...best, dist: bestD }
           }
           const normAngle = (a) => ((a % 360) + 540) % 360 - 180 // ±180
-          const purposeOf = (type) => {
+          // Purpose: combined classification using:
+          //   1. Special-use registry (medivac, firefighting, military, …)
+          //   2. School fleet membership → 'training'
+          //   3. Type-code heuristic (tow_plane, glider, airline, biz_jet, …)
+          //   4. Default 'ga_single' / 'ga_twin'
+          const purposeOf = (type, tail, isSchoolFleet, specialUse) => {
+            if (specialUse) {
+              // Map special_use values to a normalized purpose label
+              const m = {
+                medivac: 'medevac',
+                medivac_possible: 'medevac',
+                firefighting: 'firefighting',
+                law_enforcement: 'law_enforcement',
+                military: 'military',
+                government: 'government',
+                patrol: 'patrol',
+                science: 'science',
+                survey: 'survey',
+                search_rescue: 'search_rescue',
+                helicopter_ops: 'helicopter_ops',
+              }
+              if (m[specialUse]) return m[specialUse]
+            }
+            if (isSchoolFleet) return 'training'
             if (!type) return 'unknown'
             if (/PA25|PA18/.test(type)) return 'tow_plane'
             if (/GLID|VENT|AS2|DG\d|NIMB|DISC|SGS/.test(type)) return 'glider'
@@ -311,6 +381,63 @@ function excursionsApiPlugin() {
             if (/PA44|DA42|BE58|BE55|BE76/.test(type)) return 'ga_twin'
             return 'ga_single'
           }
+          // ICAO type code → human-readable description. Used as a
+          // fallback when neither the schools file nor special-use
+          // registry has a description for the tail.
+          const TYPE_DESC = {
+            C152: 'Cessna 152', C172: 'Cessna Skyhawk 172', C72R: 'Cessna 172R Skyhawk',
+            C182: 'Cessna Skylane 182', C206: 'Cessna Stationair 206', C210: 'Cessna Centurion 210',
+            P28A: 'Piper Cherokee/Warrior PA-28', P28B: 'Piper Cherokee 180', PA28: 'Piper Cherokee PA-28',
+            P28R: 'Piper Arrow PA-28R', PA46: 'Piper Malibu/Mirage', PA44: 'Piper Seminole',
+            PA25: 'Piper Pawnee (tow plane)', PA18: 'Piper Super Cub (tow plane)',
+            DV20: 'Diamond Katana DV20', DA20: 'Diamond Katana DA20', DA40: 'Diamond Diamond Star',
+            DA42: 'Diamond Twin Star',
+            SR20: 'Cirrus SR20', SR22: 'Cirrus SR22', S22T: 'Cirrus SR22T',
+            M20P: 'Mooney M20P', M20J: 'Mooney M20J', M20K: 'Mooney M20K',
+            BE33: 'Beechcraft Bonanza 33', BE35: 'Beechcraft Bonanza V35', BE36: 'Beechcraft Bonanza A36',
+            BE55: 'Beechcraft Baron 55', BE58: 'Beechcraft Baron 58', BE76: 'Beechcraft Duchess',
+            BE9L: 'Beechcraft King Air', BE95: 'Beechcraft Travel Air', BE40: 'Beechjet 400',
+            C25A: 'Cessna Citation CJ2', C25B: 'Cessna Citation CJ3', C25C: 'Cessna Citation CJ4',
+            C501: 'Cessna Citation I/SP', C525: 'Cessna CitationJet', C551: 'Cessna Citation II/SP',
+            C560: 'Cessna Citation V', C56X: 'Cessna Citation Excel', C680: 'Cessna Citation Sovereign',
+            C68A: 'Cessna Citation Latitude', C750: 'Cessna Citation X',
+            CL30: 'Bombardier Challenger 300', CL35: 'Bombardier Challenger 350',
+            CL60: 'Bombardier Challenger 600',
+            GALX: 'Gulfstream G200', G200: 'Gulfstream G200', H25B: 'Hawker 800',
+            LJ40: 'Learjet 40', LJ60: 'Learjet 60',
+            E55P: 'Embraer Phenom 300', E50P: 'Embraer Phenom 100', SF50: 'Cirrus Vision Jet',
+            TBM7: 'Daher TBM 700', TBM8: 'Daher TBM 850', TBM9: 'Daher TBM 900',
+            PC12: 'Pilatus PC-12', PC24: 'Pilatus PC-24', DHC6: 'De Havilland Twin Otter',
+            R22: 'Robinson R22', R44: 'Robinson R44', R66: 'Robinson R66',
+            AS50: 'Airbus AS350 Écureuil', AS55: 'Airbus AS355 Écureuil 2',
+            AS65: 'Airbus AS365 Dauphin', AS21: 'Schleicher ASK 21 (glider)',
+            EC20: 'Airbus EC120 Colibri', EC30: 'Airbus EC130', EC35: 'Airbus EC135', EC45: 'Airbus EC145',
+            B06: 'Bell 206 JetRanger', B407: 'Bell 407', B429: 'Bell 429',
+            H500: 'Hughes/MD 500', S76: 'Sikorsky S-76', S92: 'Sikorsky S-92',
+            BD7T: 'Bonanza V35 Turbo', BDOG: 'Beagle Bulldog', VL3: 'JMB VL-3',
+            LGEZ: 'Rutan Long-EZ', LONG: 'Rutan Long-EZ', LANCAIR: 'Lancair',
+            RV6: "Van's RV-6", RV7: "Van's RV-7", RV8: "Van's RV-8", RV10: "Van's RV-10",
+            RV12: "Van's RV-12", RV14: "Van's RV-14",
+            GLID: 'Glider', VENT: 'Schempp-Hirth Ventus', NIMB: 'Schempp-Hirth Nimbus',
+            DISC: 'Schempp-Hirth Discus', JS1J: 'Jonker JS1', ASTR: 'Astir glider',
+            DG10: 'DG-100 (glider)', DG15: 'DG-150 (glider)', DG80: 'DG-800 (glider)',
+            DG1T: 'DG-1000T (glider)',
+            B738: 'Boeing 737-800', B739: 'Boeing 737-900', B38M: 'Boeing 737 MAX 8',
+            B39M: 'Boeing 737 MAX 9', B78X: 'Boeing 787-10',
+            A319: 'Airbus A319', A320: 'Airbus A320', A321: 'Airbus A321', A20N: 'Airbus A320neo',
+            A21N: 'Airbus A321neo',
+            CRJ2: 'Bombardier CRJ-200', CRJ7: 'Bombardier CRJ-700', CRJ9: 'Bombardier CRJ-900',
+            E170: 'Embraer E-170', E75L: 'Embraer E-175 (long wing)', E190: 'Embraer E-190',
+            E195: 'Embraer E-195',
+            MD83: 'McDonnell Douglas MD-83', MD88: 'McDonnell Douglas MD-88',
+            H60: 'Sikorsky UH-60 Black Hawk', GYRO: 'Gyroplane',
+          }
+          const descOf = (type, tail) => {
+            if (specialUseMap.get(tail)?.aircraft_desc) return specialUseMap.get(tail).aircraft_desc
+            if (schoolAcDesc.get(tail)) return schoolAcDesc.get(tail)
+            if (!type) return ''
+            return TYPE_DESC[type.toUpperCase()] || type
+          }
 
           const aircraft = []
           for (const t of liveData.tracks || []) {
@@ -319,7 +446,9 @@ function excursionsApiPlugin() {
             const tail = t.call || t.reg || t.hex || '?'
             const type = t.type || ''
             const school = schoolMap.get(tail) || null
-            const purpose = purposeOf(type)
+            const specialUseRec = specialUseMap.get(tail)
+            const purpose = purposeOf(type, tail, !!school, specialUseRec?.use)
+            const description = descOf(type, tail)
             const lastPt = pts[pts.length - 1]
             const ap = nearAp(lastPt[0], lastPt[1])
 
@@ -456,7 +585,11 @@ function excursionsApiPlugin() {
             }
 
             aircraft.push({
-              tail, type, purpose, school,
+              tail, type, description, purpose, school,
+              special_use: specialUseRec ? {
+                role: specialUseRec.description,
+                owner: specialUseRec.owner,
+              } : null,
               intent, leg, confidence: +confidence.toFixed(2),
               airport: ap.code, dist_nm: +distEnd.toFixed(1),
               alt: last[2], agl: Math.round(agl),
@@ -519,6 +652,11 @@ function excursionsApiPlugin() {
           const limit = Number(u.searchParams.get('limit')) || 200
           const latParam = u.searchParams.get('lat')
           const lonParam = u.searchParams.get('lon')
+          // Accept radius_mi (statute miles) or radius_nm (nautical miles).
+          // Default is 4 statute miles, matching the legacy hardcoded value.
+          const radiusMi = u.searchParams.get('radius_mi')
+            ? Number(u.searchParams.get('radius_mi'))
+            : (u.searchParams.get('radius_nm') ? Number(u.searchParams.get('radius_nm')) * 1.15078 : 4)
           const center = (latParam != null && lonParam != null && latParam !== '' && lonParam !== '')
             ? { lat: Number(latParam), lon: Number(lonParam) }
             : null
@@ -526,19 +664,60 @@ function excursionsApiPlugin() {
             const mod = await import('./src/noiseZones.js')
             zonesCache = mod.NOISE_ZONES
           }
-          const [tracksData, liveData] = await Promise.all([
-            loadCached(fs, path, 'tracks'),
-            loadCached(fs, path, 'live'),
-          ])
-          // hours window → day-level date range (historical tracks are keyed by day)
+          // Compute window first so the DB query only fetches that slice.
+          // Explicit `from`/`to` (ISO 8601 or epoch ms) take precedence over
+          // the lookback `hours` param. Either bound can be omitted —
+          // e.g. ?from=2026-05-07T20:15:00Z&to=2026-05-07T20:30:00Z
           const nowMs = Date.now()
-          const fromDate = new Date(nowMs - hours * 3600 * 1000).toISOString().slice(0, 10)
-          const toDate = new Date(nowMs).toISOString().slice(0, 10)
+          const fromParam = u.searchParams.get('from')
+          const toParam = u.searchParams.get('to')
+          const parseTs = (s) => {
+            if (!s) return null
+            // Accept epoch-ms strings ("1714324800000") and ISO 8601.
+            const asNum = Number(s)
+            if (Number.isFinite(asNum) && asNum > 1_000_000_000_000) return asNum
+            const t = Date.parse(s)
+            return Number.isFinite(t) ? t : null
+          }
+          let fromMs, toMs
+          if (fromParam || toParam) {
+            fromMs = fromParam ? parseTs(fromParam) : (nowMs - hours * 3600 * 1000)
+            toMs = toParam ? parseTs(toParam) : nowMs
+            if (fromMs == null || toMs == null) {
+              res.statusCode = 400
+              res.setHeader('Content-Type', 'application/json')
+              res.end(JSON.stringify({ error: 'invalid from/to — use ISO 8601 (e.g. 2026-05-07T20:15:00Z) or epoch-ms' }))
+              return
+            }
+            if (fromMs >= toMs) {
+              res.statusCode = 400
+              res.setHeader('Content-Type', 'application/json')
+              res.end(JSON.stringify({ error: 'from must be before to' }))
+              return
+            }
+          } else {
+            fromMs = nowMs - hours * 3600 * 1000
+            toMs = nowMs
+          }
+          const fromDate = new Date(fromMs).toISOString().slice(0, 10)
+          const toDate = new Date(toMs).toISOString().slice(0, 10)
+          // When a precise from/to is given AND the window dips before today,
+          // fan out across the live_tracks rows for each day in range. The
+          // default loadCached('live') only returns the most-recent (today's)
+          // snapshot, so historical windows would return zero live tracks.
+          const todayUtc = new Date().toISOString().slice(0, 10)
+          const needsHistoricalLive = (fromParam || toParam) && db.useDb && fromDate < todayUtc
+          const [tracksData, liveData] = await Promise.all([
+            loadCached(fs, path, 'tracks', { fromDate, toDate }),
+            needsHistoricalLive
+              ? db.loadLiveFromDbByDateRange(fromDate, toDate)
+              : loadCached(fs, path, 'live'),
+          ])
           // Geo helpers — duplicated from the /api/excursions handler to keep
           // this route self-contained. Any change to classification thresholds
           // must be mirrored in both places.
           const FT_PER_DEG_LAT = 364560
-          const RADIUS_FT = 4 * 5280
+          const RADIUS_FT = radiusMi * 5280
           const pointInPolygon = (lat, lon, poly) => {
             let inside = false
             for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
@@ -631,14 +810,26 @@ function excursionsApiPlugin() {
           // Cap to prevent OOM on wide queries.
           if (matches.length > limit) matches.length = limit
           const tracksOut = []
+          // Only filter points by timestamp when from/to was explicit AND
+          // the track carries per-point timestamps (4th element). Historical
+          // tracks are 3-element with no timestamps — for those we trust
+          // the date-level filter applied above.
+          const filterPointsByTime = !!(fromParam || toParam)
           for (const t of matches) {
             const m = (t.src || '').match(/(\d{4}-\d{2}-\d{2})/)
             const date = m ? m[1] : (t.src === 'live' ? toDate : null)
             const isLive = t.src === 'live'
+            // Build the point list to walk. When a precise window was
+            // requested and the track has per-point timestamps, drop points
+            // outside it; otherwise use all points.
+            const walk = (filterPointsByTime && t.points.length && typeof t.points[0][3] === 'number')
+              ? t.points.filter((p) => p[3] >= fromMs && p[3] <= toMs)
+              : t.points
+            if (walk.length === 0) continue
             const segments = []
             let cur = null
-            for (let i = 0; i < t.points.length; i++) {
-              const p = t.points[i]
+            for (let i = 0; i < walk.length; i++) {
+              const p = walk[i]
               const { klass, zone } = classifyPoint(p[0], p[1], p[2])
               if (cur && cur.klass === klass && cur.zone === zone) {
                 cur.points.push(p)
@@ -679,12 +870,12 @@ function excursionsApiPlugin() {
               const fieldElev = 5288 // KBDU default; good enough for classification
               const descThreshold = fieldElev + 300
               let descents = 0, wasHigh = false
-              for (const p of t.points) {
+              for (const p of walk) {
                 if (p[2] > descThreshold) wasHigh = true
                 else if (wasHigh) { descents++; wasHigh = false }
               }
-              const firstLow = t.points[0] && t.points[0][2] < descThreshold
-              const lastLow = t.points[t.points.length - 1] && t.points[t.points.length - 1][2] < descThreshold
+              const firstLow = walk[0] && walk[0][2] < descThreshold
+              const lastLow = walk[walk.length - 1] && walk[walk.length - 1][2] < descThreshold
               let phase = 'overflight'
               if (firstLow && lastLow && descents >= 2) phase = 'pattern'
               else if (firstLow && !lastLow) phase = 'departure'
@@ -701,11 +892,35 @@ function excursionsApiPlugin() {
           }
           const payload = {
             query: tail || 'all',
-            window: { hours, from: fromDate, to: toDate, limit },
-            matched: matches.length,
-            center: center ? { lat: center.lat, lon: center.lon, radius_ft: RADIUS_FT } : null,
-            live: { updated_at: liveData.updated_at || null, tracks: liveCandidates.length },
+            window: {
+              from: new Date(fromMs).toISOString(),
+              to: new Date(toMs).toISOString(),
+              from_date: fromDate,
+              to_date: toDate,
+              hours: (toMs - fromMs) / 3600_000,
+              limit,
+              point_filter: filterPointsByTime ? 'sub-day-precision' : 'date-only',
+            },
+            // matched = tracks that produced at least one in-window segment
+            // and were returned. candidates_considered = pre-filter pool size.
+            matched: tracksOut.length,
+            candidates_considered: matches.length,
+            center: center ? { lat: center.lat, lon: center.lon, radius_mi: radiusMi, radius_ft: RADIUS_FT } : null,
+            live: {
+              updated_at: liveData.updated_at || null,
+              tracks: liveCandidates.length,
+              days_loaded: liveData.days_loaded || 1,
+              source: needsHistoricalLive ? 'live_tracks-multi-day' : 'live_tracks-today',
+            },
             tracks: tracksOut,
+          }
+          // Surface the available history range so callers can detect when
+          // their window pre-dates what's persisted.
+          if (db.useDb) {
+            try {
+              const horizon = await db.getLiveDataHorizon()
+              payload.data_horizon = horizon
+            } catch {}
           }
           // When querying a specific tail, add aircraft metadata.
           if (tail) {
@@ -751,26 +966,31 @@ function excursionsApiPlugin() {
           const fromDate = new Date(nowMs - hours * 3600 * 1000).toISOString().slice(0, 10)
           const toDate = new Date(nowMs).toISOString().slice(0, 10)
 
-          // ── Tracks from Postgres (pre-computed by backfill) ──
-          const tracksSql = `
-            SELECT call, type, desc_text AS desc, own_op AS "ownOp", src,
-                   date, base_airport AS base, worst_class AS worst, school,
-                   seg_total, seg_red, seg_orange, seg_yellow, seg_purple,
-                   len_total_ft, len_red_ft, len_orange_ft, len_yellow_ft, len_purple_ft,
-                   bands
-            FROM tracks
-            WHERE date >= $1 AND date <= $2
-              AND worst_class IS NOT NULL
-              AND bands IS NOT NULL
-            ORDER BY
-              CASE WHEN seg_purple > 0 THEN 0
-                   WHEN worst_class = 'red' THEN 1
-                   WHEN worst_class = 'orange' THEN 2
-                   ELSE 3 END,
-              rand_key
-            LIMIT $3
-          `
-          const tracksRes = await db.queryDb(tracksSql, [fromDate, toDate, limit])
+          // Historical tracks are indexed by date only, so sub-day windows
+          // can't be filtered at the point level — live data covers that range.
+          // Skip the historical query entirely when hours < 24.
+          let tracksRes = { rows: [] }
+          if (hours >= 24) {
+            const tracksSql = `
+              SELECT call, type, desc_text AS desc, own_op AS "ownOp", src,
+                     date, base_airport AS base, worst_class AS worst, school,
+                     seg_total, seg_red, seg_orange, seg_yellow, seg_purple,
+                     len_total_ft, len_red_ft, len_orange_ft, len_yellow_ft, len_purple_ft,
+                     bands
+              FROM tracks
+              WHERE date >= $1 AND date <= $2
+                AND worst_class IS NOT NULL
+                AND bands IS NOT NULL
+              ORDER BY
+                CASE WHEN seg_purple > 0 THEN 0
+                     WHEN worst_class = 'red' THEN 1
+                     WHEN worst_class = 'orange' THEN 2
+                     ELSE 3 END,
+                rand_key
+              LIMIT $3
+            `
+            tracksRes = await db.queryDb(tracksSql, [fromDate, toDate, limit])
+          }
 
           // ── Per-tail active summary ──
           const activeSql = `
@@ -807,6 +1027,10 @@ function excursionsApiPlugin() {
           // ── Live tracks (pre-classified by capture-worker) ──
           let liveCount = 0, liveUpdatedAt = null
           const liveTracks = []
+          // Window cutoff in epoch-ms for trimming live track points.
+          // Live track points are 4-tuples [lat, lon, alt, ts_ms], so we can
+          // filter at sub-second resolution. Any `hours` value works here.
+          const windowFromMs = nowMs - hours * 3600 * 1000
           try {
             const liveRes = await db.queryDb(
               'SELECT tracks, updated_at FROM live_tracks WHERE day = CURRENT_DATE ORDER BY id DESC LIMIT 1'
@@ -817,6 +1041,26 @@ function excursionsApiPlugin() {
               liveUpdatedAt = liveRes.rows[0].updated_at || null
               for (const t of rawLive) {
                 if (!t.bands || t.bands.length === 0) continue
+                // Trim each band's points to the time window when possible.
+                // Bands whose last point is older than the cutoff are dropped;
+                // bands spanning the cutoff get their leading points sliced.
+                const trimmedBands = []
+                for (const b of t.bands) {
+                  const pts = b.points || []
+                  if (!pts.length) continue
+                  const hasTs = pts[pts.length - 1].length > 3
+                  if (!hasTs) { trimmedBands.push(b); continue }
+                  // Find the first point >= windowFromMs
+                  let startIdx = pts.length
+                  for (let i = 0; i < pts.length; i++) {
+                    if (pts[i][3] >= windowFromMs) { startIdx = i; break }
+                  }
+                  if (startIdx >= pts.length) continue // whole band is too old
+                  // Keep the last point before the window as a bridge for continuity
+                  const slice = startIdx > 0 ? pts.slice(startIdx - 1) : pts.slice(startIdx)
+                  if (slice.length >= 2) trimmedBands.push({ ...b, points: slice })
+                }
+                if (!trimmedBands.length) continue
                 liveTracks.push({
                   call: t.call || t.reg || '?',
                   type: t.type || '',
@@ -833,15 +1077,70 @@ function excursionsApiPlugin() {
                   len_red_ft: t.len_red_ft || 0,
                   len_orange_ft: t.len_orange_ft || 0,
                   len_yellow_ft: t.len_yellow_ft || 0,
-                  bands: t.bands,
+                  bands: trimmedBands,
                   live: true,
                 })
               }
             }
           } catch (e) { console.error('[excursions-boot] live error:', e.message) }
 
+          // ── Merge live tracks into per-tail active aggregation ──
+          // The active SQL above only scans the historical `tracks` table,
+          // which doesn't include today's in-progress flights. Without this
+          // merge, /boot returns 0 active for hours<24 even when /active sees
+          // live violations. Counts come from the trimmed bands so they
+          // reflect points still in the requested window.
+          const liveByTail = new Map()
+          for (const lt of liveTracks) {
+            const tail = lt.call
+            if (!tail || tail === '?') continue
+            let trackWorst = null
+            const trackCounts = { yellow: 0, orange: 0, red: 0, purple: 0 }
+            let trackPointsHit = 0
+            for (const b of lt.bands || []) {
+              if (!b.klass || !(b.klass in trackCounts)) continue // clean band
+              const n = b.points?.length || 0
+              trackCounts[b.klass] += n
+              trackPointsHit += n
+              if (!trackWorst || SEV[b.klass] > SEV[trackWorst]) trackWorst = b.klass
+            }
+            if (!trackWorst) continue // no in-window violations on this track
+            let rec = liveByTail.get(tail)
+            if (!rec) {
+              rec = {
+                tail, type: lt.type || 'Unknown',
+                school: null, airport: null,
+                worst: trackWorst,
+                counts: { ...trackCounts },
+                pointsHit: trackPointsHit,
+                lastDate: lt.date,
+                live: true,
+              }
+              liveByTail.set(tail, rec)
+            } else {
+              for (const k of ['yellow', 'orange', 'red', 'purple']) rec.counts[k] += trackCounts[k]
+              rec.pointsHit += trackPointsHit
+              if (SEV[trackWorst] > SEV[rec.worst]) rec.worst = trackWorst
+            }
+          }
+          // Merge by tail: bump counts on existing historical row, otherwise append
+          for (const [tail, rec] of liveByTail) {
+            const existing = active.find(a => a.tail === tail)
+            if (existing) {
+              for (const k of ['yellow', 'orange', 'red', 'purple']) {
+                existing.counts[k] = (existing.counts[k] || 0) + rec.counts[k]
+              }
+              existing.pointsHit = (existing.pointsHit || 0) + rec.pointsHit
+              if (SEV[rec.worst] > SEV[existing.worst]) existing.worst = rec.worst
+              existing.live = true
+            } else {
+              active.push(rec)
+            }
+          }
+          // Re-sort: severity desc, then points hit desc
+          active.sort((a, b) => SEV[b.worst] - SEV[a.worst] || (b.pointsHit || 0) - (a.pointsHit || 0))
+
           // ── Opt-in joins: reports, notifications ──
-          const windowFromMs = nowMs - hours * 3600 * 1000
           if (includeSet.has('reports')) {
             const complaints = await db.getComplaints(null)
             const byTail = new Map()
@@ -910,7 +1209,13 @@ function excursionsApiPlugin() {
           res.setHeader('Access-Control-Allow-Origin', '*')
           res.end(JSON.stringify({
             generated_at: new Date(nowMs).toISOString(),
-            window: { hours, from: fromDate, to: toDate, limit },
+            window: {
+              hours, from: fromDate, to: toDate, limit,
+              from_ms: windowFromMs, to_ms: nowMs,
+              note: hours < 24
+                ? 'Sub-day window: live track points trimmed to last N hours; historical tracks skipped (date-level only).'
+                : 'Historical tracks pulled by date; live track points trimmed to window.',
+            },
             include: [...includeSet],
             render: {
               format: 'bands',
@@ -962,8 +1267,11 @@ function excursionsApiPlugin() {
             const mod = await import('./src/noiseZones.js')
             zonesCache = mod.NOISE_ZONES
           }
+          const _activeNow = Date.now()
+          const _activeFrom = new Date(_activeNow - hours * 3600 * 1000).toISOString().slice(0, 10)
+          const _activeTo = new Date(_activeNow).toISOString().slice(0, 10)
           const [tracksData, liveData, schoolsData] = await Promise.all([
-            loadCached(fs, path, 'tracks'),
+            loadCached(fs, path, 'tracks', { fromDate: _activeFrom, toDate: _activeTo }),
             loadCached(fs, path, 'live'),
             loadCached(fs, path, 'schools'),
           ])
@@ -1298,8 +1606,13 @@ function excursionsApiPlugin() {
             zonesCache = mod.NOISE_ZONES
           }
           const t0 = Date.now()
+          // /api/excursions?tail=… optionally takes from/to. Default to a
+          // 1-year window to bound the query — querying 4+ years × 143k+
+          // tracks crashes the heap.
+          const _excTo = to || new Date().toISOString().slice(0, 10)
+          const _excFrom = from || new Date(Date.now() - 365 * 24 * 3600 * 1000).toISOString().slice(0, 10)
           const [tracksData, schoolsData] = await Promise.all([
-            loadCached(fs, path, 'tracks'),
+            loadCached(fs, path, 'tracks', { fromDate: _excFrom, toDate: _excTo }),
             loadCached(fs, path, 'schools'),
           ])
           const loadMs = Date.now() - t0
@@ -1490,6 +1803,23 @@ function excursionsApiPlugin() {
 //   panel). Returns { count, reports }.
 function noiseReportsApiPlugin() {
   const ledger = makeLedger('data/noise_reports.json')
+  // Allowed audio slots — anything else 400s. Add slots here when new clip
+  // types are introduced (e.g. raw60s).
+  const AUDIO_SLOTS = new Set(['spliced10s', 'loudest5s'])
+  const AUDIO_MAX_BYTES = 1_000_000 // 1 MB cap per clip (defends against WAV/PCM uploads)
+  // Match /api/noise-reports/<reportId>/audio/<slot>
+  const AUDIO_PATH_RE = /^\/([^/]+)\/audio\/([^/]+)\/?$/
+  // Read the whole request body into a Buffer with a hard size cap.
+  const readBytesCapped = async (req, max) => {
+    const chunks = []
+    let total = 0
+    for await (const c of req) {
+      total += c.length
+      if (total > max) throw new Error(`payload too large (>${max} bytes)`)
+      chunks.push(c)
+    }
+    return Buffer.concat(chunks, total)
+  }
   return {
     name: 'noise-reports-api',
     configureServer(server) {
@@ -1498,8 +1828,95 @@ function noiseReportsApiPlugin() {
         try {
           const { default: fs } = await import('fs/promises')
           const { default: path } = await import('path')
+
+          // ── Audio sub-route dispatch ──
+          // Vite's connect prefix-matches /api/noise-reports, so audio URLs
+          // arrive here. Strip the prefix and check for an audio path before
+          // falling through to the JSON list/create logic.
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const subPath = u.pathname.replace(/^\/api\/noise-reports/, '') || '/'
+          const audioMatch = subPath.match(AUDIO_PATH_RE)
+          if (audioMatch) {
+            const reportId = decodeURIComponent(audioMatch[1])
+            const slot = decodeURIComponent(audioMatch[2])
+            res.setHeader('Access-Control-Allow-Origin', '*')
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+            if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return }
+            if (!AUDIO_SLOTS.has(slot)) {
+              res.statusCode = 400
+              res.setHeader('Content-Type', 'application/json')
+              res.end(JSON.stringify({ error: `invalid slot; allowed: ${[...AUDIO_SLOTS].join(', ')}` }))
+              return
+            }
+
+            if (req.method === 'POST') {
+              const ctype = (req.headers['content-type'] || '').toLowerCase()
+              if (!ctype.startsWith('audio/mpeg') && !ctype.startsWith('audio/mp3')) {
+                res.statusCode = 415
+                res.setHeader('Content-Type', 'application/json')
+                res.end(JSON.stringify({ error: 'Content-Type must be audio/mpeg' }))
+                return
+              }
+              let buf
+              try {
+                buf = await readBytesCapped(req, AUDIO_MAX_BYTES)
+              } catch (err) {
+                res.statusCode = 413
+                res.setHeader('Content-Type', 'application/json')
+                res.end(JSON.stringify({ error: String(err.message || err) }))
+                return
+              }
+              if (buf.length === 0) {
+                res.statusCode = 400
+                res.setHeader('Content-Type', 'application/json')
+                res.end(JSON.stringify({ error: 'empty body' }))
+                return
+              }
+              if (db.useDb) {
+                await db.addAudio(reportId, slot, buf, 'audio/mpeg')
+              } else {
+                const dir = path.resolve('data/audio', reportId)
+                await fs.mkdir(dir, { recursive: true })
+                await fs.writeFile(path.join(dir, `${slot}.mp3`), buf)
+              }
+              res.statusCode = 201
+              res.setHeader('Content-Type', 'application/json')
+              res.end(JSON.stringify({ ok: true, reportId, slot, bytes: buf.length }))
+              return
+            }
+
+            if (req.method === 'GET') {
+              let bytes = null, mime = 'audio/mpeg'
+              if (db.useDb) {
+                const row = await db.getAudio(reportId, slot)
+                if (row) { bytes = row.bytes; mime = row.mime || 'audio/mpeg' }
+              } else {
+                try {
+                  bytes = await fs.readFile(path.resolve('data/audio', reportId, `${slot}.mp3`))
+                } catch { bytes = null }
+              }
+              if (!bytes) {
+                res.statusCode = 404
+                res.setHeader('Content-Type', 'application/json')
+                res.end(JSON.stringify({ error: 'audio not found' }))
+                return
+              }
+              res.setHeader('Content-Type', mime)
+              res.setHeader('Content-Length', bytes.length)
+              // Audio clips are immutable per (reportId, slot) — long cache.
+              res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+              res.end(bytes)
+              return
+            }
+
+            res.statusCode = 405
+            res.end()
+            return
+          }
+
+          // ── Original JSON list/create logic ──
           if (req.method === 'GET') {
-            const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
             const reporter = (u.searchParams.get('reporter') || '').trim()
             let list
             if (db.useDb) {
@@ -1859,7 +2276,7 @@ function liveCapturePlugin() {
   // with a 36 nm radius from the geographic mean of all 6 airports.
   const CENTER = [40.0211, -105.0063]
   const RADIUS_NM = 36
-  const POLL_MS = 2_000
+  const POLL_MS = 5_000
   const ALT_MAX_FT = 10_000
   const LIVE_FILE = 'public/tracks_live.json'
   const archivePathFor = (day) => `public/tracks_live_${day}.json`
@@ -2065,13 +2482,17 @@ function dbTracksPlugin() {
     configureServer(server) {
       console.log('[db-tracks] plugin registered — /api/tracks (paginated) + /tracks_yearly.json')
 
-      // Paginated endpoint — client fetches chunks from Postgres directly
+      // Paginated endpoint — client fetches chunks from Postgres directly.
+      // Defaults reduced so the Node heap can't be blown by a single page:
+      // each `tracks.points` JSONB can be hundreds of KB, so 2 000 rows
+      // can serialize into multi-GB. 200 rows / 1 000 cap is plenty for
+      // progressive loading on the client.
       server.middlewares.use('/api/tracks', async (req, res, next) => {
         if (req.method !== 'GET') return next()
         try {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const page = Math.max(0, parseInt(u.searchParams.get('page') || '0'))
-          const size = Math.min(5000, Math.max(100, parseInt(u.searchParams.get('size') || '2000')))
+          const size = Math.min(1000, Math.max(50, parseInt(u.searchParams.get('size') || '200')))
           const offset = page * size
 
           // Get total count (cached)
@@ -2155,15 +2576,26 @@ function noiseApiPlugin() {
       })
 
       // GET /api/noise/leaderboard?days=90&limit=20&by=tail|base|school
+      //                            [&homeBase=KBDU][&origin=local|transient]
       //
       // Public leaderboard API. Returns top entities ranked by clean flight
       // miles (total miles minus excursion miles) over the last N days.
       //
+      // Filters (all optional, combinable):
+      //   homeBase — restrict to aircraft whose HOME base (tracks.base_airport)
+      //              is this airport, e.g. ?homeBase=KBDU returns only KBDU-based
+      //              tails, ranked among themselves. Comma-separates for multiple.
+      //              This is the "based here" filter; it is NOT an operating-
+      //              airport filter — the backfill records each aircraft's home
+      //              field, not the field a given flight operated at.
+      //   origin   — local | transient. Per-flight geometric classification
+      //              (within vs beyond the local radius). Distinct from homeBase:
+      //              a based aircraft can fly transient, a visitor can fly local.
+      //
       // Response shape:
-      //   { generated_at, window: {days, from, to}, by, entries: [{
-      //       name, flights, total_nm, clean_nm, excursion_nm,
-      //       clean_pct, red_pct, orange_pct, yellow_pct
-      //   }] }
+      //   { generated_at, window: {days, from, to}, by, home_base, origin,
+      //     entries: [{ name, flights, total_nm, clean_nm, excursion_nm,
+      //       clean_pct, red_pct, orange_pct, yellow_pct }] }
       server.middlewares.use('/api/noise/leaderboard', async (req, res, next) => {
         if (req.method !== 'GET') return next()
         try {
@@ -2175,9 +2607,29 @@ function noiseApiPlugin() {
           const cutoff = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10)
           const FT_PER_NM = 6076
 
-          let sql, groupLabel
+          // Build optional filters. $1 is always the date cutoff; extra filter
+          // params are appended after it, the LIMIT param goes last.
+          const params = [cutoff]
+          const extra = []
+          // `base` is an alias for `homeBase`: on every other noise endpoint
+          // (buildFilters) `base` already filters tracks.base_airport (the home
+          // field), so the leaderboard now matches. There is no operating-
+          // airport dimension in the backfill to filter on.
+          const homeBaseRaw = u.searchParams.get('homeBase') || u.searchParams.get('base')
+          if (homeBaseRaw) {
+            const bases = homeBaseRaw.split(',').map(b => b.trim()).filter(Boolean)
+            if (bases.length === 1) { params.push(bases[0]); extra.push(`base_airport = $${params.length}`) }
+            else if (bases.length > 1) { params.push(bases); extra.push(`base_airport = ANY($${params.length})`) }
+          }
+          const originRaw = u.searchParams.get('origin')
+          const origin = (originRaw === 'local' || originRaw === 'transient') ? originRaw : null
+          if (origin) { params.push(origin); extra.push(`origin = $${params.length}`) }
+          const extraSql = extra.length ? ' AND ' + extra.join(' AND ') : ''
+          params.push(limit)
+          const limP = `$${params.length}`
+
+          let sql
           if (by === 'base') {
-            groupLabel = 'base_airport'
             sql = `
               SELECT base_airport AS name,
                      count(*)::int AS flights,
@@ -2188,11 +2640,11 @@ function noiseApiPlugin() {
                      round((SUM(len_orange_ft) / ${FT_PER_NM})::numeric, 1) AS orange_nm,
                      round((SUM(len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS yellow_nm
               FROM tracks
-              WHERE date >= $1 AND len_total_ft > 0 AND base_airport IS NOT NULL
+              WHERE date >= $1 AND len_total_ft > 0 AND base_airport IS NOT NULL${extraSql}
               GROUP BY base_airport
               HAVING SUM(len_total_ft) > 0
               ORDER BY SUM(len_total_ft - len_red_ft - len_orange_ft - len_yellow_ft) DESC
-              LIMIT $2
+              LIMIT ${limP}
             `
           } else if (by === 'school') {
             sql = `
@@ -2205,11 +2657,11 @@ function noiseApiPlugin() {
                      round((SUM(len_orange_ft) / ${FT_PER_NM})::numeric, 1) AS orange_nm,
                      round((SUM(len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS yellow_nm
               FROM tracks
-              WHERE date >= $1 AND len_total_ft > 0 AND school IS NOT NULL
+              WHERE date >= $1 AND len_total_ft > 0 AND school IS NOT NULL${extraSql}
               GROUP BY school
               HAVING SUM(len_total_ft) > 0
               ORDER BY SUM(len_total_ft - len_red_ft - len_orange_ft - len_yellow_ft) DESC
-              LIMIT $2
+              LIMIT ${limP}
             `
           } else {
             // by tail (default)
@@ -2224,15 +2676,15 @@ function noiseApiPlugin() {
                      round((SUM(len_orange_ft) / ${FT_PER_NM})::numeric, 1) AS orange_nm,
                      round((SUM(len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS yellow_nm
               FROM tracks
-              WHERE date >= $1 AND len_total_ft > 0
+              WHERE date >= $1 AND len_total_ft > 0${extraSql}
               GROUP BY call
               HAVING SUM(len_total_ft) > 0
               ORDER BY SUM(len_total_ft - len_red_ft - len_orange_ft - len_yellow_ft) DESC
-              LIMIT $2
+              LIMIT ${limP}
             `
           }
 
-          const r = await db.queryDb(sql, [cutoff, limit])
+          const r = await db.queryDb(sql, params)
           const entries = r.rows.map(row => ({
             ...row,
             clean_pct: row.total_nm > 0 ? Math.round(row.clean_nm / row.total_nm * 1000) / 10 : 0,
@@ -2249,6 +2701,8 @@ function noiseApiPlugin() {
             generated_at: now.toISOString(),
             window: { days, from: cutoff, to: now.toISOString().slice(0, 10) },
             by,
+            home_base: homeBaseRaw || null,
+            origin: origin || null,
             entries,
           }))
         } catch (e) {
@@ -2259,60 +2713,118 @@ function noiseApiPlugin() {
         }
       })
 
-      // GET /api/noise/missions
-      // Today's flights from live capture, categorized by purpose.
-      // Counts all aircraft seen since midnight UTC, looks up purpose
-      // from the tracks table (historical classification) and the
-      // special_use + flight_schools data.
+      // GET /api/noise/missions[?days=N]
+      // Completed flights from live capture, categorized by purpose.
+      //
+      // A "flight" is a takeoff→landing cycle (a track with both a takeoff
+      // and a landing). Touch-and-goes and taxi-backs do NOT count as
+      // separate flights: consecutive cycles whose on-ground gap is shorter
+      // than MISSION_GROUND_GAP_MIN are merged into one flight. Purpose is
+      // looked up per tail from the historical `tracks` classification.
+      //
+      // `days` (default 1 = today) widens the window to the last N UTC days.
+      // Each day has one current row in live_tracks; points for the same
+      // aircraft are concatenated across days before cycle extraction so a
+      // flight that crosses midnight is not double-counted.
+      const MISSION_GROUND_GAP_MIN = 10
       server.middlewares.use('/api/noise/missions', async (req, res, next) => {
         if (req.method !== 'GET') return next()
         try {
-          // Get today's live tracks
-          const liveRes = await db.queryDb(
-            'SELECT tracks FROM live_tracks WHERE day = CURRENT_DATE ORDER BY id DESC LIMIT 1'
-          )
-          if (!liveRes.rows.length || !liveRes.rows[0].tracks) {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const daysRaw = parseInt(u.searchParams.get('days') || '1', 10)
+          const days = Number.isFinite(daysRaw) ? Math.min(Math.max(daysRaw, 1), 90) : 1
+
+          // UTC date window [fromDate .. toDate]
+          const fmtDay = (d) => d.toISOString().slice(0, 10)
+          const today = new Date()
+          const toDate = fmtDay(today)
+          const fromD = new Date(today)
+          fromD.setUTCDate(fromD.getUTCDate() - (days - 1))
+          const fromDate = fmtDay(fromD)
+
+          const range = await db.loadLiveFromDbByDateRange(fromDate, toDate)
+          const tracks = range.tracks || []
+          if (!tracks.length) {
             res.setHeader('Content-Type', 'application/json')
             res.setHeader('Access-Control-Allow-Origin', '*')
-            res.end(JSON.stringify({ date: new Date().toISOString().slice(0, 10), total: 0, categories: {} }))
+            res.end(JSON.stringify({
+              date: toDate, days, from: fromDate, to: toDate, total: 0, categories: {},
+            }))
             return
           }
 
-          const liveTracks = liveRes.rows[0].tracks
-          const tails = liveTracks.map(t => t.call || t.reg || '').filter(Boolean)
+          const zoneConfig = await adsb.loadZones()
 
-          // Look up purpose for each tail from the historical tracks table
-          // (most recent record wins)
+          // Merge same-aircraft point sets across days (tracks repeat per day),
+          // sorted by timestamp, so cross-midnight cycles connect.
+          const byHex = new Map()
+          for (const t of tracks) {
+            const hex = t.hex || t.call
+            if (!hex || !Array.isArray(t.points) || !t.points.length) continue
+            if (!byHex.has(hex)) {
+              byHex.set(hex, { hex, call: t.call || hex, reg: t.reg || '', type: t.type || '', points: [] })
+            }
+            const g = byHex.get(hex)
+            for (const p of t.points) g.points.push(p)
+          }
+
+          // Extract takeoff→landing cycles, then collapse touch-and-go /
+          // taxi-back: consecutive completed cycles whose ground gap is under
+          // the threshold become a single flight.
+          const gapMs = MISSION_GROUND_GAP_MIN * 60_000
+          const flightsByHex = new Map() // hex -> { tail, type, flights }
+          let totalFlights = 0
+          for (const g of byHex.values()) {
+            g.points.sort((a, b) => (a[3] || 0) - (b[3] || 0))
+            const cycles = adsb.extractTowCycles(g.hex, g.call, g.points, zoneConfig)
+            const complete = cycles
+              .filter(f => f.takeoff_ts && f.landing_ts)
+              .sort((a, b) => new Date(a.takeoff_ts) - new Date(b.takeoff_ts))
+            const merged = []
+            for (const f of complete) {
+              const prev = merged[merged.length - 1]
+              if (prev && (new Date(f.takeoff_ts) - new Date(prev.landing_ts)) < gapMs) {
+                prev.landing_ts = f.landing_ts // touch-and-go / taxi-back → same flight
+              } else {
+                merged.push({ takeoff_ts: f.takeoff_ts, landing_ts: f.landing_ts })
+              }
+            }
+            if (merged.length) {
+              flightsByHex.set(g.hex, { tail: g.call || g.reg || g.hex, type: g.type, flights: merged.length })
+              totalFlights += merged.length
+            }
+          }
+
+          // Look up purpose per tail from the historical tracks table
+          const tails = Array.from(flightsByHex.values()).map(v => v.tail).filter(Boolean)
           const purposeRes = tails.length ? await db.queryDb(
             `SELECT DISTINCT ON (call) call, purpose, school, type, base_airport
              FROM tracks WHERE call = ANY($1) AND purpose IS NOT NULL
              ORDER BY call, id DESC`,
             [tails]
           ) : { rows: [] }
-
           const purposeMap = new Map()
           for (const r of purposeRes.rows) {
             purposeMap.set(r.call, { purpose: r.purpose, school: r.school, type: r.type, base: r.base_airport })
           }
 
-          // Categorize
+          // Categorize by purpose; count = flights, not aircraft
           const categories = {}
-          for (const t of liveTracks) {
-            const tail = t.call || t.reg || ''
-            const info = purposeMap.get(tail)
+          for (const v of flightsByHex.values()) {
+            const info = purposeMap.get(v.tail)
             const purpose = info?.purpose || 'unknown'
             if (!categories[purpose]) categories[purpose] = { count: 0, aircraft: [] }
-            categories[purpose].count++
+            categories[purpose].count += v.flights
             categories[purpose].aircraft.push({
-              tail,
-              type: t.type || info?.type || '',
+              tail: v.tail,
+              type: v.type || info?.type || '',
               school: info?.school || null,
               base: info?.base || null,
-              points: t.points?.length || 0,
+              flights: v.flights,
             })
           }
 
-          // Remove empty categories and sort by count desc
+          // Drop empties, sort categories by flight count desc
           const sorted = Object.entries(categories)
             .filter(([, v]) => v.count > 0)
             .sort((a, b) => b[1].count - a[1].count)
@@ -2324,9 +2836,13 @@ function noiseApiPlugin() {
           res.setHeader('Access-Control-Allow-Origin', '*')
           res.setHeader('Cache-Control', 'public, max-age=60')
           res.end(JSON.stringify({
-            date: now.toISOString().slice(0, 10),
-            updated_at: now.toISOString(),
-            total: liveTracks.length,
+            date: toDate,
+            days,
+            from: fromDate,
+            to: toDate,
+            updated_at: range.updated_at || now.toISOString(),
+            days_loaded: range.days_loaded ?? null,
+            total: totalFlights,
             categories: result,
           }))
         } catch (e) {
@@ -3053,7 +3569,7 @@ function adsbApiPlugin() {
           // Let other upgrade requests (Vite HMR) pass through
         })
 
-        // Broadcast position updates every 2s
+        // Broadcast position updates every 5s (matches capture poll cadence)
         const broadcast = async () => {
           if (wsClients.size === 0) return
           try {
@@ -3091,7 +3607,7 @@ function adsbApiPlugin() {
         }
 
         if (wsBroadcastTimer) clearInterval(wsBroadcastTimer)
-        wsBroadcastTimer = setInterval(broadcast, 2000)
+        wsBroadcastTimer = setInterval(broadcast, 5000)
         server.httpServer.on('close', () => {
           if (wsBroadcastTimer) { clearInterval(wsBroadcastTimer); wsBroadcastTimer = null }
           for (const ws of wsClients) try { ws.close() } catch {}
@@ -3101,6 +3617,723 @@ function adsbApiPlugin() {
       }
 
       console.log('[adsb-api] endpoints registered: /api/adsb/{live,track,flights,stats,active-tow,config/*,stream}')
+    },
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Flight Impact feed — scores each completed flight on how gentle it was on
+// the community below (ground noise × population density, community voices,
+// and time spent low over noise-abatement areas, all divided by trip time)
+// and turns that into an encouraging "Good Neighbor Score" where higher is
+// better. Reuses adsb.extractTowCycles, flightScore.js, src/geo.js zones,
+// data/complaints.json, and population_density.json.
+//
+//   GET /api/adsb/impact?airport=KBDU[&minutes=30]  — recent landings + scores
+//   GET /api/adsb/impact/:id                         — one flight, full detail
+//   GET /api/adsb/impact/:id/frame                   — embeddable Leaflet map
+//   GET /kiosk/impact                                — self-contained kiosk page
+function flightImpactPlugin() {
+  const AIRPORTS = {
+    KBDU: [40.0394, -105.2258], KBJC: [39.9088, -105.1172], KEIK: [40.0098, -105.0488],
+    KLMO: [40.1636, -105.1636], KAPA: [39.5701, -104.8493], KDEN: [39.8617, -104.6731],
+    KGXY: [40.4348, -104.6331], KFNL: [40.4517, -105.0114],
+  }
+  const FIELD_ELEV_FT = { KBDU: 5288, KBJC: 5673, KEIK: 5130, KLMO: 5055, KAPA: 5885, KFNL: 5016 }
+
+  const nmFrom = (lat, lon, rLat, rLon) => {
+    const dLat = (lat - rLat) * 60
+    const dLon = (lon - rLon) * 60 * Math.cos(((lat + rLat) / 2) * Math.PI / 180)
+    return Math.hypot(dLat, dLon)
+  }
+  const nearestAirport = (lat, lon, maxNm = 3) => {
+    let best = null, bestD = Infinity
+    for (const [code, [aLat, aLon]] of Object.entries(AIRPORTS)) {
+      const d = nmFrom(lat, lon, aLat, aLon)
+      if (d < bestD) { bestD = d; best = code }
+    }
+    return bestD <= maxNm ? best : null
+  }
+
+  // ── Lazy-loaded, cached supporting data ──
+  let popGridCache = null
+  const loadPopGrid = async () => {
+    if (popGridCache !== null) return popGridCache
+    try {
+      const fs = await import('fs/promises')
+      const path = await import('path')
+      const buf = await fs.default.readFile(path.default.resolve('public/population_density.json'), 'utf8')
+      popGridCache = JSON.parse(buf)
+    } catch { popGridCache = false }
+    return popGridCache
+  }
+
+  let zonesCache = null
+  const loadZonesByName = async () => {
+    if (zonesCache) return zonesCache
+    const mod = await import('./src/noiseZones.js')
+    zonesCache = (mod.NOISE_ZONES || []).map(z => ({
+      name: z.name,
+      airport: (z.name || '').split(/\s+/, 1)[0] || null,
+      polygon: z.polygon,
+    }))
+    return zonesCache
+  }
+
+  const loadComplaints = async () => {
+    if (db.useDb) {
+      try { return await db.getComplaints(null) } catch { return [] }
+    }
+    try {
+      const fs = await import('fs/promises')
+      const path = await import('path')
+      const buf = await fs.default.readFile(path.default.resolve('data/complaints.json'), 'utf8')
+      return JSON.parse(buf).complaints || []
+    } catch { return [] }
+  }
+
+  const loadLive = async () => {
+    if (db.useDb) return db.loadLiveFromDb()
+    const fs = await import('fs/promises')
+    const path = await import('path')
+    try {
+      const buf = await fs.default.readFile(path.default.resolve('public/tracks_live.json'), 'utf8')
+      return JSON.parse(buf)
+    } catch { return { tracks: [], updated_at: null } }
+  }
+
+  // Score every completed flight that touched down near `airport` within the
+  // last `minutes`. Returns the scored objects (with track slices attached
+  // so the detail/frame routes can reuse them) keyed by id.
+  const scoreRecentLandings = async (airport, minutes) => {
+    const score = await import('./flightScore.js')
+    const [zoneConfig, fleet, live, allZones, complaints, popGrid] = await Promise.all([
+      adsb.loadZones(), adsb.loadFleet(), loadLive(),
+      loadZonesByName(), loadComplaints(), loadPopGrid(),
+    ])
+    const zonesForAirport = allZones.filter(
+      z => !airport || (z.airport || '').toUpperCase() === airport
+    )
+    const fieldElevFt = FIELD_ELEV_FT[airport] || zoneConfig.field_elevation_ft || 5288
+    const cutoff = Date.now() - minutes * 60 * 1000
+
+    // First pass: extract cycles per aircraft, remember how many landed at
+    // this airport (for the home-vs-visitor call).
+    const landedHereCount = {}
+    const candidates = [] // { flight, points, hex, type }
+    for (const t of live.tracks || []) {
+      const hex = (t.hex || '').toLowerCase()
+      const tail = fleet[hex]?.tail || t.call || hex
+      if (!t.points?.length) continue
+      const cycles = adsb.extractTowCycles(hex, tail, t.points, zoneConfig)
+      for (const f of cycles) {
+        if (!f.landing_ts) continue // only completed (terminated) flights
+        const endIdx = f._endIdx ?? (t.points.length - 1)
+        const landPt = t.points[Math.min(endIdx, t.points.length - 1)]
+        if (!landPt) continue
+        const apt = nearestAirport(landPt[0], landPt[1])
+        if (!apt) continue
+        if (airport && apt !== airport) continue
+        landedHereCount[hex] = (landedHereCount[hex] || 0) + 1
+        const landedMs = Date.parse(f.landing_ts)
+        if (!(landedMs >= cutoff)) continue
+        const startIdx = f._startIdx || 0
+        candidates.push({
+          flight: f, hex, type: t.type || fleet[hex]?.type || '',
+          points: t.points.slice(startIdx, Math.min(endIdx, t.points.length - 1) + 1),
+          airport: apt, landedMs,
+        })
+      }
+    }
+
+    const scored = []
+    const byId = new Map()
+    for (const c of candidates) {
+      const inFleet = !!fleet[c.hex]
+      const isHome = inFleet || (landedHereCount[c.hex] || 0) >= 2
+      const result = score.scoreFlight(c.flight, c.points, {
+        type: c.type, zones: zonesForAirport, complaints, popGrid: popGrid || null,
+        fieldElevFt, isHome, airport: c.airport,
+      })
+      result._points = c.points
+      result._zones = zonesForAirport
+      byId.set(result.id, result)
+      scored.push(result)
+    }
+    scored.sort((a, b) => (Date.parse(b.landed_ts) || 0) - (Date.parse(a.landed_ts) || 0))
+    return { scored, byId }
+  }
+
+  // Strip the heavy internal fields for the list view.
+  const summarize = (r) => ({
+    id: r.id, tail: r.tail, type: r.type, airport: r.airport,
+    landed_ts: r.landed_ts, trip_minutes: r.trip_minutes,
+    score: r.score, tier: r.tier, home: r.home, greeting: r.greeting,
+    gentleness: r.gentleness, highlights: r.highlights, detail: r.detail,
+  })
+
+  const json = (res, code, body) => {
+    res.statusCode = code
+    res.setHeader('Content-Type', 'application/json')
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.end(JSON.stringify(body))
+  }
+  const html = (res, code, body) => {
+    res.statusCode = code
+    res.setHeader('Content-Type', 'text/html; charset=utf-8')
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.end(body)
+  }
+
+  return {
+    name: 'flight-impact-api',
+    configureServer(server) {
+      console.log('[flight-impact] registered /api/adsb/impact + /kiosk/impact')
+
+      // ── Detail + embeddable frame (register BEFORE the feed prefix) ──
+      server.middlewares.use('/api/adsb/impact/', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const parts = u.pathname.replace(/^\//, '').split('/').filter(Boolean)
+          const id = decodeURIComponent(parts[0] || '')
+          const wantFrame = parts[1] === 'frame'
+          if (!id) return next()
+
+          // The id encodes the icao + takeoff epoch; widen the lookback so an
+          // older-but-still-listed flight resolves regardless of the 30 min feed.
+          const minutes = Math.min(720, Math.max(30, Number(u.searchParams.get('minutes')) || 360))
+          const { byId } = await scoreRecentLandings(null, minutes)
+          const r = byId.get(id)
+          if (!r) {
+            if (wantFrame) return html(res, 404, '<!doctype html><meta charset=utf-8><body style="font:16px system-ui;padding:2rem">Flight not found or no longer in the live window.</body>')
+            return json(res, 404, { error: 'flight not found' })
+          }
+
+          if (wantFrame) return html(res, 200, renderFrame(r))
+
+          const grid = r._grid || {}
+          json(res, 200, {
+            ...summarize(r),
+            path: (r._points || []).map(p => ({ lat: p[0], lon: p[1], alt: p[2], ts: p[3] || null })),
+            zones: (r._zones || []).map(z => ({ name: z.name, polygon: z.polygon })),
+            impact_overlay: grid.bounds ? {
+              bounds: grid.bounds, w: grid.w, h: grid.h,
+              // dB grid (ground noise) — null cells are quiet. The frame
+              // multiplies visually by population; the score already did.
+              db: grid.db ? Array.from(grid.db).map(v => (isFinite(v) ? +v.toFixed(1) : null)) : null,
+            } : null,
+          })
+        } catch (err) {
+          console.error('[flight-impact/detail] error', err)
+          json(res, 500, { error: String(err) })
+        }
+      })
+
+      // ── Recent-landings feed ──
+      server.middlewares.use('/api/adsb/impact', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        // Mounted at /api/adsb/impact, so req.url is the remainder: '/' for
+        // the feed itself; anything deeper is a detail/frame (handled above).
+        const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+        if (u.pathname !== '/') return next()
+        try {
+          const airport = (u.searchParams.get('airport') || '').trim().toUpperCase() || null
+          const minutes = Math.min(720, Math.max(1, Number(u.searchParams.get('minutes')) || 30))
+          const { scored } = await scoreRecentLandings(airport, minutes)
+          json(res, 200, {
+            airport, window_minutes: minutes,
+            generated_at: new Date().toISOString(),
+            count: scored.length,
+            flights: scored.map(summarize),
+          })
+        } catch (err) {
+          console.error('[flight-impact/feed] error', err)
+          json(res, 500, { error: String(err) })
+        }
+      })
+
+      // ── Kiosk page ──
+      server.middlewares.use('/kiosk/impact', (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        html(res, 200, renderKiosk())
+      })
+    },
+  }
+}
+
+// Embeddable map frame for a single scored flight. Self-contained HTML —
+// pulls Leaflet from a CDN, fetches the flight detail, and paints the flight
+// path, the ground-noise heat (× population is baked into the score badge),
+// and the noise-abatement polygons.
+function renderFrame(r) {
+  const tierColor = { Gold: '#f5c518', Silver: '#b9c2cc', Bronze: '#c97b3c', Rising: '#7c9cff' }
+  const color = tierColor[r.tier] || '#7c9cff'
+  const data = JSON.stringify({ id: r.id, score: r.score, tier: r.tier })
+  return `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Good Neighbor Score — ${r.tail || ''}</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html,body,#map{height:100%;margin:0}
+  body{font:14px/1.4 system-ui,sans-serif;background:#0b1020;color:#e8edf6}
+  #badge{position:absolute;z-index:1000;top:12px;left:12px;background:rgba(11,16,32,.88);
+    border:1px solid ${color};border-radius:14px;padding:12px 16px;max-width:60%}
+  #badge .score{font-size:34px;font-weight:800;color:${color}}
+  #badge .tier{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:${color}}
+  #badge .greet{margin-top:6px;font-size:13px;opacity:.95}
+  #badge ul{margin:8px 0 0;padding-left:18px;font-size:12px;opacity:.9}
+  .leaflet-container{background:#0b1020}
+</style></head>
+<body>
+<div id="badge"><div class="tier" id="tier"></div><div class="score" id="score"></div>
+<div class="greet" id="greet"></div><ul id="hl"></ul></div>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const SEED = ${data};
+(async () => {
+  const map = L.map('map', { zoomControl: true, attributionControl: false });
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom: 19 }).addTo(map);
+  const r = await fetch('/api/adsb/impact/' + encodeURIComponent(SEED.id)).then(x => x.json());
+  document.getElementById('tier').textContent = (r.tier || '') + ' · Good Neighbor';
+  document.getElementById('score').textContent = (r.score ?? '–') + ' / 100';
+  document.getElementById('greet').textContent = r.greeting || '';
+  document.getElementById('hl').innerHTML = (r.highlights || []).map(h => '<li>' + h + '</li>').join('');
+
+  // Noise-abatement polygons.
+  (r.zones || []).forEach(z => {
+    L.polygon(z.polygon, { color: '#facc15', weight: 1, fillColor: '#facc15', fillOpacity: 0.08 })
+      .addTo(map).bindTooltip(z.name);
+  });
+
+  // Ground-noise heat overlay (canvas from the dB grid).
+  const ov = r.impact_overlay;
+  if (ov && ov.db) {
+    const { w, h, db, bounds } = ov;
+    let lo = Infinity, hi = -Infinity;
+    for (const v of db) { if (v != null) { if (v < lo) lo = v; if (v > hi) hi = v; } }
+    const span = Math.max(1, hi - lo);
+    const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+    const ctx = cv.getContext('2d'); const img = ctx.createImageData(w, h);
+    for (let row = 0; row < h; row++) {
+      const src = h - 1 - row; // grid row 0 = south, canvas row 0 = north
+      for (let col = 0; col < w; col++) {
+        const v = db[src * w + col]; const i = (row * w + col) * 4;
+        if (v == null) { img.data[i + 3] = 0; continue; }
+        const t = Math.min(1, Math.max(0, (v - lo) / span));
+        img.data[i] = t < .5 ? 0 : Math.round(255 * (t - .5) * 2);
+        img.data[i + 1] = t < .5 ? Math.round(255 * t * 2) : Math.round(255 * (1 - (t - .5) * 2));
+        img.data[i + 2] = t < .5 ? Math.round(255 * (1 - t * 2)) : 0;
+        img.data[i + 3] = Math.round(40 + 170 * t);
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    L.imageOverlay(cv.toDataURL('image/png'), bounds, { opacity: 0.6 }).addTo(map);
+  }
+
+  // Flight path.
+  const pts = (r.path || []).filter(p => p.lat != null).map(p => [p.lat, p.lon]);
+  if (pts.length > 1) {
+    const line = L.polyline(pts, { color: '${color}', weight: 3, opacity: 0.95 }).addTo(map);
+    map.fitBounds(line.getBounds().pad(0.2));
+  } else if (ov && ov.bounds) {
+    map.fitBounds(ov.bounds);
+  } else {
+    map.setView([40.0394, -105.2258], 12);
+  }
+})();
+</script></body></html>`
+}
+
+// Self-contained kiosk: asks for an airport, then lists recent landings with
+// their Good Neighbor Scores and refreshes every 30 s.
+function renderKiosk() {
+  return `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Recent Landings — Good Neighbor Scores</title>
+<style>
+  :root{--gold:#f5c518;--silver:#b9c2cc;--bronze:#c97b3c;--rising:#7c9cff}
+  body{margin:0;font:16px/1.5 system-ui,sans-serif;background:#0b1020;color:#e8edf6}
+  header{padding:18px 24px;display:flex;gap:16px;align-items:center;flex-wrap:wrap;
+    border-bottom:1px solid #1c2540;position:sticky;top:0;background:#0b1020;z-index:5}
+  h1{font-size:20px;margin:0}
+  select,button{font:15px system-ui;padding:8px 12px;border-radius:10px;border:1px solid #2a355c;
+    background:#131a33;color:#e8edf6}
+  .muted{opacity:.6;font-size:13px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;padding:24px}
+  .card{background:#111831;border:1px solid #1f2a4d;border-radius:16px;padding:16px;display:flex;gap:14px}
+  .ring{flex:0 0 84px;width:84px;height:84px;border-radius:50%;display:flex;align-items:center;
+    justify-content:center;font-size:26px;font-weight:800;border:4px solid var(--rising)}
+  .tier-Gold .ring{border-color:var(--gold);color:var(--gold)}
+  .tier-Silver .ring{border-color:var(--silver);color:var(--silver)}
+  .tier-Bronze .ring{border-color:var(--bronze);color:var(--bronze)}
+  .tier-Rising .ring{border-color:var(--rising);color:var(--rising)}
+  .body{flex:1;min-width:0}
+  .tail{font-size:18px;font-weight:700}
+  .greet{font-size:13px;opacity:.9;margin:2px 0 6px}
+  .hl{font-size:12px;opacity:.85;margin:6px 0 0;padding-left:16px}
+  .meta{font-size:12px;opacity:.6;margin-top:6px}
+  a.frame{font-size:12px;color:#7c9cff;text-decoration:none}
+  .empty{padding:48px;text-align:center;opacity:.6}
+</style></head>
+<body>
+<header>
+  <h1>🛬 Recent Landings — Good Neighbor Scores</h1>
+  <label>Airport
+    <select id="airport">
+      <option value="KBDU">KBDU</option><option value="KBJC">KBJC</option>
+      <option value="KEIK">KEIK</option><option value="KLMO">KLMO</option>
+      <option value="KFNL">KFNL</option><option value="">All nearby</option>
+    </select>
+  </label>
+  <label>Window
+    <select id="minutes"><option value="30">30 min</option><option value="60">60 min</option>
+      <option value="120">2 hours</option></select>
+  </label>
+  <button id="refresh">Refresh</button>
+  <span class="muted" id="status"></span>
+</header>
+<div id="list" class="grid"></div>
+<script>
+const $ = s => document.querySelector(s);
+async function load() {
+  const ap = $('#airport').value, mins = $('#minutes').value;
+  $('#status').textContent = 'loading…';
+  try {
+    const q = new URLSearchParams({ minutes: mins }); if (ap) q.set('airport', ap);
+    const r = await fetch('/api/adsb/impact?' + q).then(x => x.json());
+    const list = $('#list');
+    if (!r.flights || !r.flights.length) {
+      list.innerHTML = '<div class="empty">No landings in the last ' + mins + ' minutes. Check back soon — gentle skies ahead. ✈️</div>';
+    } else {
+      list.innerHTML = r.flights.map(f => {
+        const t = f.tier || 'Rising';
+        const hl = (f.highlights || []).slice(0, 2).map(h => '<li>' + h + '</li>').join('');
+        return '<div class="card tier-' + t + '">' +
+          '<div class="ring">' + f.score + '</div>' +
+          '<div class="body"><div class="tail">' + (f.tail || '—') + (f.home ? ' · 🏠 home' : ' · ✈️ visitor') + '</div>' +
+          '<div class="greet">' + (f.greeting || '') + '</div>' +
+          '<ul class="hl">' + hl + '</ul>' +
+          '<div class="meta">' + (f.type || '') + ' · ' + (f.trip_minutes ?? '–') + ' min · ' +
+          new Date(f.landed_ts).toLocaleTimeString() + ' · ' + t +
+          ' · <a class="frame" target="_blank" href="/api/adsb/impact/' + encodeURIComponent(f.id) + '/frame">map ↗</a></div>' +
+          '</div></div>';
+      }).join('');
+    }
+    $('#status').textContent = 'updated ' + new Date().toLocaleTimeString() + ' · ' + r.count + ' flight(s)';
+  } catch (e) { $('#status').textContent = 'error: ' + e.message; }
+}
+$('#refresh').onclick = load; $('#airport').onchange = load; $('#minutes').onchange = load;
+load(); setInterval(load, 30000);
+</script></body></html>`
+}
+
+// GET /api/noise-zones[?airport=KBDU]
+//   Voluntary noise abatement polygons with their upper altitude ceiling.
+//   Source data lives in src/noiseZones.js (auto-generated by import_kml.py).
+//   The airport prefix is derived from the zone name; ceiling_ft defaults to
+//   the global ALT_THRESHOLD_FT (7500 MSL) and can be overridden per zone or
+//   per airport via the maps below.
+function noiseZonesApiPlugin() {
+  // Default ceiling for the global "overflight below" rule. Mirrors
+  // ALT_THRESHOLD_FT in src/geo.js — keep in sync if that changes.
+  const DEFAULT_CEILING_FT = 7500
+  // Airport-level ceiling overrides. Empty for now; populate when airports
+  // publish different abatement ceilings (e.g. KAPA at higher field elev).
+  const AIRPORT_CEILING_FT = {}
+  // Per-zone ceiling overrides (keyed by zone name). Empty until specific
+  // zones publish their own ceilings.
+  const ZONE_CEILING_FT = {}
+
+  let cached = null
+  const buildZones = async () => {
+    if (cached) return cached
+    const mod = await import('./src/noiseZones.js')
+    const zones = (mod.NOISE_ZONES || []).map(z => {
+      // Names are written as "KBDU Frasier Meadows", "KAPA Cherry Creek"
+      // — first whitespace-delimited token is the airport ICAO.
+      const airport = (z.name || '').split(/\s+/, 1)[0] || null
+      const ceiling_ft =
+        ZONE_CEILING_FT[z.name] ??
+        AIRPORT_CEILING_FT[airport] ??
+        DEFAULT_CEILING_FT
+      return {
+        name: z.name,
+        airport,
+        note: z.note || null,
+        ceiling_ft,
+        polygon: z.polygon,
+      }
+    })
+    cached = zones
+    return zones
+  }
+
+  return {
+    name: 'noise-zones-api',
+    configureServer(server) {
+      server.middlewares.use('/api/noise-zones', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const airportFilter = (u.searchParams.get('airport') || '').trim().toUpperCase()
+          const all = await buildZones()
+          const zones = airportFilter
+            ? all.filter(z => (z.airport || '').toUpperCase() === airportFilter)
+            : all
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          // Polygons are static config — clients can cache for an hour.
+          // Bust by changing the filename or appending ?v=... in the URL.
+          res.setHeader('Cache-Control', 'public, max-age=3600')
+          res.end(JSON.stringify({
+            count: zones.length,
+            default_ceiling_ft: DEFAULT_CEILING_FT,
+            zones,
+          }))
+        } catch (err) {
+          console.error('[noise-zones-api] error', err)
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+    },
+  }
+}
+
+// ── Self-discovery / API manifest ──────────────────────────────────────
+// GET /api/discover           → markdown (prompt-ready, default)
+// GET /api/discover?format=json → structured JSON manifest
+//
+// The single source of truth for what endpoints exist and what params they
+// take. Keep this list updated when adding/changing routes — agents and
+// integrators should be able to fetch this and act on it without digging
+// through source.
+const API_MANIFEST = {
+  title: 'FlightSafe / Noise KBDU API',
+  description:
+    'Noise-monitoring and glider-ops API for KBDU (Boulder Municipal Airport, CO). ' +
+    'All endpoints return JSON (or audio/markdown where noted) with permissive CORS. ' +
+    'Coordinates are WGS-84 decimal degrees; altitudes are MSL feet unless suffixed _agl.',
+  base_urls: {
+    production: 'https://web-app-production-fedf.up.railway.app',
+    local: 'http://localhost:5174',
+  },
+  groups: [
+    {
+      name: 'Flight tracks (location-aware)',
+      summary: 'Recent ADS-B flight paths classified against noise zones.',
+      endpoints: [
+        {
+          method: 'GET',
+          path: '/api/excursions/segments',
+          purpose: 'Flight paths with violation segments. Filter by location + radius + time range. Time range can be a lookback (hours) OR an explicit from/to window.',
+          params: [
+            { name: 'lat', type: 'float', desc: 'Center latitude (decimal degrees, WGS-84). Required for radius filtering.' },
+            { name: 'lon', type: 'float', desc: 'Center longitude. Required for radius filtering.' },
+            { name: 'radius_mi', type: 'float', default: 4, desc: 'Radius in statute miles. Tracks with at least one point inside the circle are returned.' },
+            { name: 'radius_nm', type: 'float', desc: 'Alternative: nautical miles. Converted internally to radius_mi (1 nm = 1.15078 mi).' },
+            { name: 'from', type: 'iso-8601 | epoch-ms', desc: 'Window start. ISO 8601 (e.g. 2026-05-07T20:15:00Z) or epoch-ms. Combined with `to` for arbitrary windows. When set, live-track points are filtered at sub-second precision.' },
+            { name: 'to', type: 'iso-8601 | epoch-ms', desc: 'Window end. Defaults to now if omitted but `from` is given.' },
+            { name: 'hours', type: 'int', default: 24, desc: 'Lookback window from now. Ignored when `from`/`to` is provided.' },
+            { name: 'tail', type: 'string', desc: 'Optional: restrict to a single aircraft tail number.' },
+            { name: 'limit', type: 'int', default: 200, desc: 'Cap on number of tracks returned (sorted by recency).' },
+          ],
+          response: {
+            tracks: '[{tail, type, src, date, live, phase, descents, segments:[{klass, zone, points, startedAt, endedAt}]}]',
+            center: '{lat, lon, radius_mi, radius_ft} | null',
+            window: '{hours, from, to, limit}',
+            matched: 'int — total tracks before limit',
+          },
+          example: '/api/excursions/segments?lat=40.04&lon=-105.22&radius_mi=5&hours=2',
+          example2: '/api/excursions/segments?lat=40.04&lon=-105.22&radius_nm=2&from=2026-05-07T20:15:00Z&to=2026-05-07T20:30:00Z',
+          notes: 'Each segment.klass is null|yellow|orange|red — null = clean, others = noise violation severity. Points are [lat, lon, alt_ft, ts_ms]. Live tracks (src=live) carry per-point timestamps for sub-second filtering; historical tracks are date-only.',
+        },
+        {
+          method: 'GET',
+          path: '/api/excursions/boot',
+          purpose: 'Combined active-excursions list + recent tracks in one request (used by the main UI).',
+          params: [
+            { name: 'hours', type: 'int', default: 1, desc: 'Lookback window.' },
+            { name: 'limit', type: 'int', default: 100, desc: 'Cap on tracks returned.' },
+            { name: 'include', type: 'csv', desc: 'Opt-in joins: reports, notifications.' },
+          ],
+          response: { active: '[{tail, worst, counts, pointsHit, lastDate, live}]', tracks: 'array of tracks with bands', live: '{updated_at, tracks}' },
+          example: '/api/excursions/boot?hours=1&include=reports,notifications',
+        },
+        {
+          method: 'GET',
+          path: '/api/excursions/active',
+          purpose: 'Per-tail aggregated noise violations within a time window.',
+          params: [
+            { name: 'hours', type: 'int', default: 48 },
+            { name: 'include', type: 'csv', desc: 'reports, notifications.' },
+          ],
+          example: '/api/excursions/active?hours=24&include=reports',
+        },
+      ],
+    },
+    {
+      name: 'ADS-B (live + fleet)',
+      summary: 'Live ADS-B positions, per-aircraft tracks, and tow-cycle analytics.',
+      endpoints: [
+        {
+          method: 'GET',
+          path: '/api/adsb/live',
+          purpose: 'Current position for every tracked aircraft (~600+).',
+          params: [{ name: 'icao', type: 'csv', desc: 'Comma-separated hex codes to filter (e.g. a59663,a5f99b).' }],
+          response: { aircraft: '[{icao, tail, lat, lon, alt_ft, gs_kts, track_deg, vs_fpm, last_seen_s}]' },
+          example: '/api/adsb/live?icao=a59663',
+        },
+        {
+          method: 'GET',
+          path: '/api/adsb/track/:icao',
+          purpose: 'Full track + detected flight phases for one aircraft.',
+          params: [{ name: 'since', type: 'iso-timestamp', default: '4h ago', desc: 'Only points after this time.' }],
+          response: { icao: 'string', tail: 'string', points: '[{ts, lat, lon, alt, gs, vs}]', phases: '[{type, start_ts, end_ts, alt_start, alt_end}]' },
+        },
+        {
+          method: 'GET',
+          path: '/api/adsb/flights',
+          purpose: 'Extracted tow cycles (takeoff → climb → release → descend → land).',
+          params: [
+            { name: 'tail', type: 'string', desc: 'Filter by tail. Without this, only fleet aircraft are returned.' },
+            { name: 'from', type: 'date', desc: 'YYYY-MM-DD start.' },
+            { name: 'to', type: 'date', desc: 'YYYY-MM-DD end.' },
+          ],
+        },
+        { method: 'GET', path: '/api/adsb/flights/:id/track', purpose: 'Position points for a specific completed flight.' },
+        {
+          method: 'GET',
+          path: '/api/adsb/stats',
+          purpose: 'Aggregated tow performance (cycle time, climb rate percentiles).',
+          params: [
+            { name: 'tail', type: 'string' },
+            { name: 'from', type: 'date' },
+            { name: 'to', type: 'date' },
+            { name: 'group_by', type: 'string', default: 'all', desc: 'all | da_band | hour | glider' },
+          ],
+        },
+        { method: 'GET', path: '/api/adsb/active-tow', purpose: 'Real-time tow plane state with ETA + glider pairing.' },
+        { method: 'GET/PUT', path: '/api/adsb/config/fleet', purpose: 'ICAO hex → tail/operator/role mapping.' },
+        { method: 'GET/PUT', path: '/api/adsb/config/zones', purpose: 'Airport geofence + phase detection thresholds.' },
+        { method: 'WS', path: '/api/adsb/stream', purpose: 'Live position broadcasts every 2s for fleet aircraft.' },
+      ],
+    },
+    {
+      name: 'Noise zones',
+      summary: 'Voluntary noise abatement polygons.',
+      endpoints: [
+        {
+          method: 'GET',
+          path: '/api/noise-zones',
+          purpose: 'All noise abatement polygons with their upper altitude ceiling.',
+          params: [{ name: 'airport', type: 'string', desc: 'Filter by airport (e.g. KBDU). Default: all.' }],
+          response: { count: 'int', default_ceiling_ft: 7500, zones: '[{name, airport, note, ceiling_ft, polygon: [[lat, lon], ...]}]' },
+        },
+      ],
+    },
+    {
+      name: 'Noise reports & complaints',
+      summary: 'User-submitted noise reports with optional MP3 audio attachments.',
+      endpoints: [
+        {
+          method: 'POST',
+          path: '/api/noise-reports',
+          purpose: 'Create a noise report. Returns { id, receivedAt }.',
+          body: 'JSON: { reporter (string|object), score?, location?, note?, ... }',
+        },
+        {
+          method: 'GET',
+          path: '/api/noise-reports',
+          purpose: 'List noise reports, optionally filtered by reporter.',
+          params: [{ name: 'reporter', type: 'string', desc: 'Email/id/name match against reporter field.' }],
+        },
+        {
+          method: 'POST',
+          path: '/api/noise-reports/:id/audio/:slot',
+          purpose: 'Attach raw MP3 bytes to a report. Slot ∈ {spliced10s, loudest5s}. Content-Type must be audio/mpeg. Body capped at 1 MB.',
+        },
+        { method: 'GET', path: '/api/noise-reports/:id/audio/:slot', purpose: 'Retrieve the raw MP3 bytes for a report+slot.' },
+        { method: 'POST/GET', path: '/api/complaints', purpose: 'Quick noise complaints (lighter than full reports).' },
+      ],
+    },
+    {
+      name: 'Self-discovery',
+      summary: 'This manifest.',
+      endpoints: [
+        {
+          method: 'GET',
+          path: '/api/discover',
+          purpose: 'Returns this API manifest. Markdown by default; ?format=json for structured.',
+          params: [{ name: 'format', type: 'string', default: 'markdown', desc: 'markdown | json' }],
+        },
+      ],
+    },
+  ],
+}
+
+function manifestToMarkdown(m) {
+  const lines = []
+  lines.push(`# ${m.title}`)
+  lines.push('')
+  lines.push(m.description)
+  lines.push('')
+  lines.push(`**Production:** ${m.base_urls.production}`)
+  lines.push(`**Local:** ${m.base_urls.local}`)
+  lines.push('')
+  for (const g of m.groups) {
+    lines.push(`## ${g.name}`)
+    if (g.summary) { lines.push(''); lines.push(g.summary) }
+    lines.push('')
+    for (const e of g.endpoints) {
+      lines.push(`### \`${e.method} ${e.path}\``)
+      lines.push('')
+      lines.push(e.purpose)
+      lines.push('')
+      if (e.params?.length) {
+        lines.push('| Param | Type | Default | Description |')
+        lines.push('|---|---|---|---|')
+        for (const p of e.params) {
+          lines.push(`| \`${p.name}\` | ${p.type} | ${p.default ?? '—'} | ${p.desc || ''} |`)
+        }
+        lines.push('')
+      }
+      if (e.body) { lines.push(`**Body:** ${e.body}`); lines.push('') }
+      if (e.response) {
+        lines.push('**Response shape:**')
+        lines.push('```')
+        for (const [k, v] of Object.entries(e.response)) lines.push(`${k}: ${v}`)
+        lines.push('```')
+      }
+      if (e.example) { lines.push(`**Example:** \`${e.example}\``); lines.push('') }
+      if (e.example2) { lines.push(`**Example (arbitrary window):** \`${e.example2}\``); lines.push('') }
+      if (e.notes) { lines.push(`> ${e.notes}`); lines.push('') }
+    }
+  }
+  return lines.join('\n')
+}
+
+function discoverPlugin() {
+  return {
+    name: 'discover-api',
+    configureServer(server) {
+      server.middlewares.use('/api/discover', (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+        const format = (u.searchParams.get('format') || 'markdown').toLowerCase()
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('Cache-Control', 'public, max-age=300')
+        if (format === 'json') {
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify(API_MANIFEST, null, 2))
+        } else {
+          res.setHeader('Content-Type', 'text/markdown; charset=utf-8')
+          res.end(manifestToMarkdown(API_MANIFEST))
+        }
+      })
     },
   }
 }
@@ -3119,6 +4352,9 @@ export default defineConfig({
     !db.useDb && liveCapturePlugin(),
     livePositionsPlugin(),
     adsbApiPlugin(),
+    flightImpactPlugin(),
+    noiseZonesApiPlugin(),
+    discoverPlugin(),
     // On Railway, strip the @vite/client HMR script from HTML to prevent
     // reload loops (the dev server WebSocket is unreachable via the proxy).
     process.env.RAILWAY_ENVIRONMENT && {
@@ -3154,6 +4390,19 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/airplaneslive/, ''),
       },
+      // When REMOTE_API=1 is set, forward /api/* to Railway production so
+      // local dev gets the DB-backed endpoints (/api/noise/*, /api/tracks,
+      // and live aircraft data) without running Postgres locally.
+      // Local API plugins still register first; the proxy only catches
+      // unmatched routes (because vite middleware runs before proxy).
+      // To force ALL api calls to Railway, also remove the local plugins.
+      ...(process.env.REMOTE_API === '1' ? {
+        '/api': {
+          target: 'https://web-app-production-fedf.up.railway.app',
+          changeOrigin: true,
+          secure: true,
+        },
+      } : {}),
     },
   },
 })

@@ -44,12 +44,63 @@ function lookupHp(typeCode) {
   return v ?? AIRCRAFT_HP._default
 }
 
+// Typical cruise groundspeed (knots) by aircraft type. Used to estimate
+// time-between-points when timestamps are missing: dt ≈ distance / speed.
+// Better than guessing a fixed sample period because a 200-knot jet covers
+// the same ground in 1 second that a 70-knot trainer takes 3 seconds to do.
+const AIRCRAFT_KT = {
+  // Light singles
+  C152: 100, C172: 110, C72R: 125, C182: 130, C206: 140, C210: 165,
+  P28A: 110, P28B: 115, PA28: 115, P28R: 130, PA46: 175,
+  PA25: 90, PA18: 80,
+  DV20: 90, DA20: 110, DA40: 130, DA42: 165,
+  SR20: 140, SR22: 175, S22T: 200,
+  M20P: 150, M20J: 155, M20K: 175,
+  BE33: 165, BE35: 165, BE36: 170, BE55: 180, BE58: 200, BE76: 165,
+  BE9L: 240, BE95: 180, BE40: 350,
+  // Jets
+  C25A: 380, C25B: 380, C25C: 400, C501: 350, C525: 380, C551: 360,
+  C560: 420, C56X: 440, C680: 460, C68A: 470, C750: 500,
+  CL30: 470, CL35: 480, CL60: 480,
+  GALX: 470, G200: 470, H25B: 460, LJ40: 460, LJ60: 480,
+  E55P: 350, E50P: 320, SF50: 300,
+  // Turboprops
+  TBM7: 280, TBM8: 290, TBM9: 290, PC12: 270, PC24: 420,
+  DHC6: 160,
+  // Helicopters
+  R22: 80, R44: 110, R66: 120,
+  AS50: 130, AS55: 140, AS65: 145, AS21: 90,
+  EC20: 130, EC30: 130, EC35: 135, EC45: 140,
+  B06: 110, B407: 130, B429: 145,
+  H500: 110, S76: 145, S92: 155,
+  // Experimental / other
+  BD7T: 140, BDOG: 110, VL3: 130, LGEZ: 150, LONG: 150,
+  // Gliders (towed/launched, soaring speeds)
+  GLID: 65, AS20: 60, AS26: 65, AS31: 65,
+  DG10: 60, DG15: 65, DG80: 70, DG1T: 70,
+  DISC: 65, VENT: 75, NIMB: 70, JS1J: 75, ASTR: 60,
+  _default: 120, // generic GA single
+}
+function lookupCruiseKt(typeCode) {
+  if (!typeCode) return AIRCRAFT_KT._default
+  const v = AIRCRAFT_KT[typeCode.toUpperCase()]
+  return v ?? AIRCRAFT_KT._default
+}
+
 // ─── Geometry helpers ───────────────────────────────────────────────────────
 function dist3dFt(a, b) {
   const dLat = (b[0] - a[0]) * FT_PER_DEG_LAT
   const dLon = (b[1] - a[1]) * FT_PER_DEG_LAT * Math.cos(((a[0] + b[0]) / 2) * Math.PI / 180)
   const dAlt = (b[2] || 0) - (a[2] || 0)
   return Math.sqrt(dLat * dLat + dLon * dLon + dAlt * dAlt)
+}
+
+// Ground (2D) distance — what shows up on the map. Use this for arc-length
+// walks that must produce visually-uniform spacing on the rendered map.
+function distGroundFt(a, b) {
+  const dLat = (b[0] - a[0]) * FT_PER_DEG_LAT
+  const dLon = (b[1] - a[1]) * FT_PER_DEG_LAT * Math.cos(((a[0] + b[0]) / 2) * Math.PI / 180)
+  return Math.hypot(dLat, dLon)
 }
 
 function bearing(a, b) {
@@ -417,6 +468,14 @@ export function computeNoiseRaster(tracks, opts = {}) {
     samplePeriodS = 1,
     maxBlobs = 50000,
     rasterPx = 1200,       // pixels on the longer grid axis
+    // Distance-based densification: lay down N blobs per nautical mile
+    // along each segment, regardless of source point spacing. This gives
+    // consistent visual density — fast cruise legs and pattern turns
+    // both render with the same blob-to-blob distance on the map.
+    // Default 10 blobs/nm = one blob every ~600 ft (~180 m).
+    blobsPerNm = 10,
+    // Legacy time-based mode kept for backward compat with NoiseImpactTest.
+    targetBlobsPerMin = 20,
     // Time-of-day filter (local hour, MST = UTC-7). When set, only points
     // whose local hour falls in [todStart, todEnd) contribute blobs.
     // todStart > todEnd wraps past midnight (e.g. 22→4 = 10PM–4AM).
@@ -433,17 +492,14 @@ export function computeNoiseRaster(tracks, opts = {}) {
     if (todStart <= todEnd) return hour >= todStart && hour < todEnd
     return hour >= todStart || hour < todEnd  // wraps midnight
   }
-  // ── Per-track: thin → energy → blobs → TOD filter → upsample ──────
-  // Upsampling runs per-track so interpolation never bridges across
-  // track boundaries. This keeps the noise path continuous along each
-  // individual flight even when multiple tracks are combined.
-  const effectiveMult = Math.max(1, Math.min(16, noiseResolution | 0))
+  // ── Per-track: energy → blobs → TOD filter → distance-densify ──
+  // Each segment between consecutive raw points is upsampled so the
+  // resulting on-map blob spacing is uniform (~1/blobsPerNm nm apart).
+  // This eliminates the variable spacing that made single-aircraft
+  // renders look blotchy when ADS-B reporting was uneven.
   const lerp = (a, b, t) => a + (b - a) * t
   let allBlobs = []
   for (const t of tracks) {
-    // Use raw points — no thinning. The polyline renders raw points so
-    // the raster must match; thinning was causing path divergence and
-    // visual gaps. The maxBlobs budget gate handles performance.
     const pts = t.points || []
     if (pts.length < 3) continue
     const prof = buildEnergyProfile(pts, samplePeriodS, t.type)
@@ -454,24 +510,60 @@ export function computeNoiseRaster(tracks, opts = {}) {
         return inTodRange(t.t0, p && p[3])
       })
     }
-    // Upsample THIS track's blobs so interpolation stays within the flight.
-    for (let i = 0; i < blobs.length; i++) {
-      const a = blobs[i], b = blobs[i + 1]
-      allBlobs.push({ ...a, hp: a.hp / effectiveMult })
-      if (!b || effectiveMult <= 1) continue
-      const mPerDegLat = 111320
-      const mPerDegLon = 111320 * Math.cos(((a.lat + b.lat) / 2) * Math.PI / 180)
-      const segM = Math.hypot((b.lon-a.lon)*mPerDegLon, (b.lat-a.lat)*mPerDegLat)
-      if (segM * 3.281 > gapThresholdFt) continue
-      for (let k = 1; k < effectiveMult; k++) {
-        const tf = k / effectiveMult
-        allBlobs.push({
-          lat: lerp(a.lat, b.lat, tf), lon: lerp(a.lon, b.lon, tf),
-          radius_m: lerp(a.radius_m, b.radius_m, tf),
-          hp: lerp(a.hp, b.hp, tf) / effectiveMult,
-          heading: bearing([a.lat, a.lon], [b.lat, b.lon]),
-        })
+    // Resample blobs at uniform arc-length spacing using true great-circle
+    // (haversine) distance — same algorithm as App.jsx mile markers.
+    // Drops duplicate consecutive points, monotonic walk, linear lerp
+    // within each segment.
+    const stepNm = 1 / Math.max(0.01, blobsPerNm)
+    const minRadiusM = (stepNm * 1852) * 0.6 // 1 nm = 1852 m; 60% of step for overlap
+    // Drop duplicates so segNm is never zero
+    const cleanIdx = [0]
+    for (let i = 1; i < blobs.length; i++) {
+      const prev = blobs[cleanIdx[cleanIdx.length - 1]]
+      const cur = blobs[i]
+      if (cur.lat !== prev.lat || cur.lon !== prev.lon) cleanIdx.push(i)
+    }
+    if (cleanIdx.length < 2) continue
+    // Per-segment haversine distances
+    const segNm = new Float64Array(cleanIdx.length - 1)
+    let totalNm = 0
+    for (let i = 0; i < segNm.length; i++) {
+      const a = blobs[cleanIdx[i]], b = blobs[cleanIdx[i + 1]]
+      const lat1 = a.lat * Math.PI / 180, lat2 = b.lat * Math.PI / 180
+      const dLat = lat2 - lat1
+      const dLon = (b.lon - a.lon) * Math.PI / 180
+      const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2
+      segNm[i] = 2 * 3440.065 * Math.asin(Math.min(1, Math.sqrt(h)))
+      totalNm += segNm[i]
+    }
+    if (totalNm < stepNm) {
+      for (const b of blobs) allBlobs.push(b)
+      continue
+    }
+    // Walk and emit
+    const emit = (a, b, tf) => {
+      const altRadius = lerp(a.radius_m, b.radius_m, tf)
+      allBlobs.push({
+        lat: lerp(a.lat, b.lat, tf),
+        lon: lerp(a.lon, b.lon, tf),
+        radius_m: Math.max(minRadiusM, altRadius),
+        hp: lerp(a.hp, b.hp, tf),
+        heading: bearing([a.lat, a.lon], [b.lat, b.lon]),
+      })
+    }
+    emit(blobs[cleanIdx[0]], blobs[cleanIdx[1]], 0)
+    let segIdx = 0
+    let segStart = 0
+    let nextEmit = stepNm
+    while (nextEmit <= totalNm) {
+      while (segIdx < segNm.length && segStart + segNm[segIdx] < nextEmit) {
+        segStart += segNm[segIdx]
+        segIdx++
       }
+      if (segIdx >= segNm.length) break
+      const tf = (nextEmit - segStart) / segNm[segIdx]
+      emit(blobs[cleanIdx[segIdx]], blobs[cleanIdx[segIdx + 1]], tf)
+      nextEmit += stepNm
     }
   }
   if (!allBlobs.length) return null
@@ -512,6 +604,27 @@ export function computeNoiseRaster(tracks, opts = {}) {
     result.stats.rawBlobs = rawBlobCount
     result.stats.decimation = decimation
     result.stats.tracks = tracks.length
+    // Diagnostic: measure actual on-map distances between consecutive
+    // emitted blobs so we can verify the walker is producing uniform
+    // spacing. Surfaced via window.__noiseDebug for inspection.
+    if (typeof window !== 'undefined' && upsampled.length > 1) {
+      const spacings = []
+      for (let i = 1; i < Math.min(upsampled.length, 200); i++) {
+        const a = upsampled[i - 1], b = upsampled[i]
+        const dLat = (b.lat - a.lat) * 364560 / 6076.12
+        const dLon = (b.lon - a.lon) * 364560 / 6076.12 * Math.cos(a.lat * Math.PI / 180)
+        spacings.push(Math.hypot(dLat, dLon)) // nm
+      }
+      spacings.sort((x, y) => x - y)
+      result.stats.spacingNm = {
+        min: spacings[0],
+        p25: spacings[Math.floor(spacings.length * 0.25)],
+        p50: spacings[Math.floor(spacings.length * 0.5)],
+        p75: spacings[Math.floor(spacings.length * 0.75)],
+        max: spacings[spacings.length - 1],
+        sample_count: spacings.length,
+      }
+    }
   }
   return result
 }
@@ -569,6 +682,8 @@ export function computeImpactRaster(tracks, popData, opts = {}) {
     samplePeriodS = 1,
     maxBlobs = 50000,
     rasterPx = 1200,
+    blobsPerNm = 10,
+    targetBlobsPerMin = 20,
     todStart = null,
     todEnd = null,
     tzOffsetS = -7 * 3600,
@@ -585,7 +700,6 @@ export function computeImpactRaster(tracks, popData, opts = {}) {
     return hour >= todStart || hour < todEnd
   }
 
-  const effectiveMult = Math.max(1, Math.min(16, noiseResolution | 0))
   const lerp = (a, b, t) => a + (b - a) * t
   let allBlobs = []
   for (const t of tracks) {
@@ -599,23 +713,54 @@ export function computeImpactRaster(tracks, popData, opts = {}) {
         return inTodRange(t.t0, p && p[3])
       })
     }
-    for (let i = 0; i < blobs.length; i++) {
-      const a = blobs[i], b = blobs[i + 1]
-      allBlobs.push({ ...a, hp: a.hp / effectiveMult })
-      if (!b || effectiveMult <= 1) continue
-      const mPerDegLat = 111320
-      const mPerDegLon = 111320 * Math.cos(((a.lat + b.lat) / 2) * Math.PI / 180)
-      const segM = Math.hypot((b.lon-a.lon)*mPerDegLon, (b.lat-a.lat)*mPerDegLat)
-      if (segM * 3.281 > gapThresholdFt) continue
-      for (let k = 1; k < effectiveMult; k++) {
-        const tf = k / effectiveMult
-        allBlobs.push({
-          lat: lerp(a.lat, b.lat, tf), lon: lerp(a.lon, b.lon, tf),
-          radius_m: lerp(a.radius_m, b.radius_m, tf),
-          hp: lerp(a.hp, b.hp, tf) / effectiveMult,
-          heading: bearing([a.lat, a.lon], [b.lat, b.lon]),
-        })
+    // Haversine resample — same algorithm as computeNoiseRaster.
+    const stepNm = 1 / Math.max(0.01, blobsPerNm)
+    const minRadiusM = (stepNm * 1852) * 0.6
+    const cleanIdx = [0]
+    for (let i = 1; i < blobs.length; i++) {
+      const prev = blobs[cleanIdx[cleanIdx.length - 1]]
+      const cur = blobs[i]
+      if (cur.lat !== prev.lat || cur.lon !== prev.lon) cleanIdx.push(i)
+    }
+    if (cleanIdx.length < 2) continue
+    const segNm = new Float64Array(cleanIdx.length - 1)
+    let totalNm = 0
+    for (let i = 0; i < segNm.length; i++) {
+      const a = blobs[cleanIdx[i]], b = blobs[cleanIdx[i + 1]]
+      const lat1 = a.lat * Math.PI / 180, lat2 = b.lat * Math.PI / 180
+      const dLat = lat2 - lat1
+      const dLon = (b.lon - a.lon) * Math.PI / 180
+      const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2
+      segNm[i] = 2 * 3440.065 * Math.asin(Math.min(1, Math.sqrt(h)))
+      totalNm += segNm[i]
+    }
+    if (totalNm < stepNm) {
+      for (const b of blobs) allBlobs.push(b)
+      continue
+    }
+    const emit = (a, b, tf) => {
+      const altRadius = lerp(a.radius_m, b.radius_m, tf)
+      allBlobs.push({
+        lat: lerp(a.lat, b.lat, tf),
+        lon: lerp(a.lon, b.lon, tf),
+        radius_m: Math.max(minRadiusM, altRadius),
+        hp: lerp(a.hp, b.hp, tf),
+        heading: bearing([a.lat, a.lon], [b.lat, b.lon]),
+      })
+    }
+    emit(blobs[cleanIdx[0]], blobs[cleanIdx[1]], 0)
+    let segIdx = 0
+    let segStart = 0
+    let nextEmit = stepNm
+    while (nextEmit <= totalNm) {
+      while (segIdx < segNm.length && segStart + segNm[segIdx] < nextEmit) {
+        segStart += segNm[segIdx]
+        segIdx++
       }
+      if (segIdx >= segNm.length) break
+      const tf = (nextEmit - segStart) / segNm[segIdx]
+      emit(blobs[cleanIdx[segIdx]], blobs[cleanIdx[segIdx + 1]], tf)
+      nextEmit += stepNm
     }
   }
   if (!allBlobs.length) return null
@@ -648,42 +793,140 @@ export function computeImpactRaster(tracks, popData, opts = {}) {
   const gridW = aspect >= 1 ? rasterPx : Math.max(64, Math.round(rasterPx * aspect))
   const gridH = aspect >= 1 ? Math.max(64, Math.round(rasterPx / aspect)) : rasterPx
 
-  // Step 1: accumulate noise energy
+  // Step 1: accumulate noise energy (same as the baseline noise map)
   const energy = accumulate(allBlobs, gridW, gridH, latMin, latMax, lonMin, lonMax, directionalGain)
   if (!energy) return null
 
-  // Step 2: multiply each noise cell by a normalized population weight.
-  // Raw density values span 0–25000+ people/km², so we log-normalize them
-  // into a 0–1 weight: unpopulated cells → 0, dense urban → 1. This keeps
-  // the product in a range where the auto-range colorizer can discriminate
-  // between "noisy over suburbs" and "noisy over downtown" without the raw
-  // magnitude of dense-area counts overwhelming everything else.
-  const POP_LOG_FLOOR = Math.log(10)    // below 10 ppl/km² ≈ uninhabited
-  const POP_LOG_CEIL  = Math.log(15000) // dense urban saturates at 1.0
+  // Step 2: sample raw population density into a parallel grid.
+  // Log-normalize so dense urban (~15k ppl/km²) maps near 1.0 and rural
+  // (~10 ppl/km²) maps near 0. Uninhabited stays at 0.
+  const POP_LOG_FLOOR = Math.log(10)
+  const POP_LOG_CEIL = Math.log(15000)
   const popSpan = POP_LOG_CEIL - POP_LOG_FLOOR
-
-  const impact = new Float32Array(gridW * gridH)
+  const pop = new Float32Array(gridW * gridH)
   for (let row = 0; row < gridH; row++) {
     const lat = latMax - (row + 0.5) / gridH * (latMax - latMin)
     for (let col = 0; col < gridW; col++) {
       const lon = lonMin + (col + 0.5) / gridW * (lonMax - lonMin)
-      const e = energy[row * gridW + col]
-      if (e <= 0) continue
-      const pop = samplePopDensity(popData, lat, lon)
-      if (pop <= 0) continue
-      // Log-normalized population weight: 0 (rural) → 1 (dense urban)
-      const popWeight = Math.max(0, Math.min(1, (Math.log(pop) - POP_LOG_FLOOR) / popSpan))
-      impact[row * gridW + col] = e * popWeight
+      const p = samplePopDensity(popData, lat, lon)
+      if (p > 0) pop[row * gridW + col] = Math.max(0, Math.min(1,
+        (Math.log(p) - POP_LOG_FLOOR) / popSpan
+      ))
     }
   }
 
-  // Step 3: colorize with the impact palette
-  const result = colorize(impact, gridW, gridH, latMin, latMax, lonMin, lonMax, null, impactPaletteLookup)
+  // Step 3: blur the population grid with separable box blur (two passes).
+  // Smooths sharp block-group polygon edges so the alpha mask reads as a
+  // soft urban density gradient. Radius scales with grid size.
+  const blurRadiusPx = Math.max(2, Math.round(gridW / 80))
+  const popBlurred = boxBlur2D(pop, gridW, gridH, blurRadiusPx)
+
+  // Step 4: stretch blurred population to full 0-1 range (max → 1, min → 0).
+  // After blurring, peak values shrink — re-stretch so dense urban remains
+  // fully opaque and rural fades to transparent.
+  let popMax = 0
+  for (let i = 0; i < popBlurred.length; i++) if (popBlurred[i] > popMax) popMax = popBlurred[i]
+  if (popMax > 0) {
+    const inv = 1 / popMax
+    for (let i = 0; i < popBlurred.length; i++) popBlurred[i] *= inv
+  }
+
+  // Step 5: colorize using noise palette (energy → color), alpha from population.
+  // Cells with zero noise OR zero population are fully transparent.
+  const result = colorizeWithMaskAlpha(
+    energy, popBlurred, gridW, gridH, latMin, latMax, lonMin, lonMax,
+    paletteLookup, // noise palette — same as the baseline noise map
+  )
   if (result) {
     result.stats.tracks = tracks.length
     result.stats.decimation = decimation
+    result.stats.blurRadiusPx = blurRadiusPx
   }
   return result
+}
+
+// Separable box blur on a Float32 grid. Two 1D passes (horizontal then
+// vertical) — O(n) per pixel regardless of radius.
+function boxBlur2D(src, w, h, r) {
+  const tmp = new Float32Array(src.length)
+  const out = new Float32Array(src.length)
+  // Horizontal pass: tmp[row, col] = avg of src[row, col-r..col+r]
+  for (let y = 0; y < h; y++) {
+    const rowOff = y * w
+    let sum = 0
+    let n = 0
+    // Initialize window: cols [0..r]
+    for (let x = 0; x <= Math.min(r, w - 1); x++) { sum += src[rowOff + x]; n++ }
+    for (let x = 0; x < w; x++) {
+      tmp[rowOff + x] = sum / n
+      const addCol = x + r + 1
+      const dropCol = x - r
+      if (addCol < w) { sum += src[rowOff + addCol]; n++ }
+      if (dropCol >= 0) { sum -= src[rowOff + dropCol]; n-- }
+    }
+  }
+  // Vertical pass: out[row, col] = avg of tmp[row-r..row+r, col]
+  for (let x = 0; x < w; x++) {
+    let sum = 0
+    let n = 0
+    for (let y = 0; y <= Math.min(r, h - 1); y++) { sum += tmp[y * w + x]; n++ }
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = sum / n
+      const addRow = y + r + 1
+      const dropRow = y - r
+      if (addRow < h) { sum += tmp[addRow * w + x]; n++ }
+      if (dropRow >= 0) { sum -= tmp[dropRow * w + x]; n-- }
+    }
+  }
+  return out
+}
+
+// Color each cell by `energy` (using palFn), but use `mask` (0–1) to
+// modulate alpha. A cell with high energy in an unpopulated area becomes
+// fully transparent; a cell with high energy in dense population is solid.
+function colorizeWithMaskAlpha(energy, mask, gridW, gridH, latMin, latMax, lonMin, lonMax, palFn) {
+  // Auto-fit the noise palette to the energy distribution
+  const nonZero = []
+  for (let i = 0; i < energy.length; i++) if (energy[i] > 0) nonZero.push(energy[i])
+  nonZero.sort((x, y) => x - y)
+  const loObs = nonZero.length ? nonZero[Math.floor(nonZero.length * 0.01)] : 0
+  const hiObs = nonZero.length ? nonZero[Math.floor(nonZero.length * 0.99)] : 1
+  const loL = Math.log(Math.max(1e-12, loObs))
+  const hiL = Math.log(Math.max(1e-12, hiObs))
+  const span = Math.max(0.01, hiL - loL)
+  const LUT_SIZE = 256
+  const lutR = new Uint8Array(LUT_SIZE), lutG = new Uint8Array(LUT_SIZE), lutB = new Uint8Array(LUT_SIZE)
+  for (let k = 0; k < LUT_SIZE; k++) {
+    const [r, g2, b2] = palFn(k / (LUT_SIZE - 1))
+    lutR[k] = r; lutG[k] = g2; lutB[k] = b2
+  }
+  const canvas = document.createElement('canvas')
+  canvas.width = gridW; canvas.height = gridH
+  const ctx = canvas.getContext('2d')
+  const img = ctx.createImageData(gridW, gridH)
+  const data = img.data
+  for (let i = 0; i < energy.length; i++) {
+    const e = energy[i]
+    const m = mask[i]
+    if (e <= 0 || m <= 0) { data[i*4+3] = 0; continue }
+    let s = (Math.log(e) - loL) / span
+    if (s < 0) s = 0; else if (s > 1) s = 1
+    const k = (s * (LUT_SIZE - 1)) | 0
+    data[i*4] = lutR[k]; data[i*4+1] = lutG[k]; data[i*4+2] = lutB[k]
+    // Alpha = population mask × 255. Don't gate by noise intensity here —
+    // any noisy area over people should be fully visible.
+    data[i*4+3] = (m * 255) | 0
+  }
+  ctx.putImageData(img, 0, 0)
+  return {
+    dataUrl: canvas.toDataURL('image/png'),
+    latLngBounds: [[latMin, lonMin], [latMax, lonMax]],
+    stats: {
+      loLog10: Math.log10(Math.max(1e-12, loObs)),
+      hiLog10: Math.log10(Math.max(1e-12, hiObs)),
+      cells: nonZero.length, blobs: energy.length,
+    },
+  }
 }
 
 // ─── Hourly animation ───────────────────────────────────────────────────────

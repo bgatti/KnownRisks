@@ -92,21 +92,72 @@ Top aircraft/bases/schools ranked by clean flight distance.
 | days | int | 90 | Lookback window (1–3650) |
 | limit | int | 20 | Number of entries (1–100) |
 | by | string | tail | Group by: `tail`, `base`, or `school` |
+| homeBase | string | — | Restrict to aircraft whose **home base** is this airport, e.g. `homeBase=KBDU`. Ranks the based fleet among itself. Comma-separate for multiple (`KBDU,KLMO`). `base` is an accepted alias. |
+| origin | string | — | `local` or `transient` — per-flight geometric class (within vs beyond the local radius). |
+
+**"Based here" vs "operated here".** `homeBase` filters `tracks.base_airport`,
+the aircraft's home field — this is the "based at KBDU" filter the leaderboard
+needs. It is **not** an operating-airport filter: the backfill records each
+aircraft's home base, not the field a given flight operated at, so there is no
+operating-airport dimension to filter on. `homeBase` is consistent with the
+`base` param on `/api/noise/stats` and `/api/noise/tracks`, which already filter
+`base_airport`. (Before this change the leaderboard ignored `base` entirely,
+which is why `?base=KBDU` returned the global top-N rather than KBDU-based tails.)
+
+`origin` is a different axis from `homeBase`: a based aircraft can fly transient
+(cross-country), and a visitor can fly local. The `cube` in `/api/noise/stats`
+breaks flights down by `base_airport × origin` if you need both at once.
+
+The response echoes the applied filters as `home_base` and `origin`, alongside
+the existing `by` and `window`. Entry shape is unchanged — for `by=tail`:
+`name` (tail), `type`, `school`, `base` (home), `purpose`, `flights`,
+`total_nm`, `clean_nm`, `excursion_nm`, `red_nm`/`orange_nm`/`yellow_nm`, and
+the `*_pct` variants.
+
+```
+GET /api/noise/leaderboard?by=tail&homeBase=KBDU&days=3650&limit=8
+→ { "by":"tail", "home_base":"KBDU", "origin":null,
+    "window": { "days":3650, "from":"…", "to":"…" },
+    "entries": [ { "name":"N…", "base":"KBDU", "flights":…, "clean_pct":…, … } ] }
+```
 
 ### GET /api/noise/missions
 
-Today's live flight operations categorized by purpose.
+Completed flights categorized by purpose. A **flight** is a takeoff→landing
+cycle (a track with both a takeoff and a landing). Touch-and-goes and
+taxi-backs are not counted separately — consecutive cycles whose on-ground gap
+is under 10 minutes are merged into one flight. Counts are flights, not
+aircraft. Purpose is looked up per tail from the historical `tracks`
+classification (the 2023–24 backfill); aircraft with no classified history fall
+into `unknown`.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `days` | int | 1 | Window size in UTC days, ending today. `1` = today only. Clamped to 1–90. |
+
+Points for the same aircraft are concatenated across days before cycle
+extraction, so a flight crossing midnight UTC is counted once.
 
 ```json
 {
   "date": "2026-04-20",
-  "total": 305,
+  "days": 30,
+  "from": "2026-03-22",
+  "to": "2026-04-20",
+  "updated_at": "2026-04-20T21:16:00.000Z",
+  "days_loaded": 30,
+  "total": 412,
   "categories": {
-    "training": { "count": 42, "aircraft": [...] },
-    "private": { "count": 18, "aircraft": [...] }
+    "training": { "count": 380, "aircraft": [{ "tail": "N123AB", "type": "C172", "school": "...", "base": "KBDU", "flights": 41 }] },
+    "medivac":  { "count": 14,  "aircraft": [...] }
   }
 }
 ```
+
+`total` is the flight count across the window; each category `count` is its
+share. `days_loaded` is how many daily rows actually had capture data (may be
+less than `days` if the window pre-dates available history). Returns
+`total: 0` with empty `categories` when no capture data exists in the window.
 
 ---
 

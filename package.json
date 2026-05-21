@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "start": "vite --host 0.0.0.0 --mode production",
+    "dev:remote": "REMOTE_API=1 vite",
+    "start": "node --max-old-space-size=4096 ./node_modules/vite/bin/vite.js --host 0.0.0.0 --mode production",
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run",

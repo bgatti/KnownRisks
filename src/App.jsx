@@ -12,6 +12,7 @@ import NoiseImpactTest from './NoiseImpactTest.jsx'
 import DescentTest from './DescentTest.jsx'
 import { NoiseStudio as NoiseReportPage } from './NoiseReport.jsx'
 import NoiseHeatmap from './NoiseHeatmap.jsx'
+import KioskMap from './KioskMap.jsx'
 import React from 'react'
 
 class ErrorBoundary extends React.Component {
@@ -489,6 +490,9 @@ export default function App() {
   if (route === '/heatmap') {
     return <ErrorBoundary><NoiseHeatmap /></ErrorBoundary>
   }
+  if (route === '/kiosk') {
+    return <ErrorBoundary><KioskMap /></ErrorBoundary>
+  }
   if (route === '/yoy') return <YearOverYear />
   if (route === '/bases') return <BasesDiagnostic />
   if (route === '/thinning') return <ThinningTest />
@@ -504,7 +508,7 @@ function MapPage() {
   const [baseFilter, setBaseFilter] = useState('all') // 'all' or an airport code
   const [schoolFilter, setSchoolFilter] = useState('all') // 'all' or school name
   const [purposeFilter, setPurposeFilter] = useState('all') // 'all' or purpose category
-  const [offenderTab, setOffenderTab] = useState('pct') // 'pct' or 'len'
+  const [excursionTab, setExcursionTab] = useState('pct') // 'pct' or 'len'
   const [baseTab, setBaseTab] = useState('pct') // 'pct' or 'len'
   const [trendTab, setTrendTab] = useState('pct') // 'pct' or 'len'
   const [liveActive, setLiveActive] = useState(false)
@@ -671,11 +675,6 @@ function MapPage() {
   // DB-backed mode: auto-detect by checking if the API responds.
   // On local dev (vite), there's no /api/noise backend → falls back to files.
   const useServerApi = true
-  useEffect(() => {
-    fetch('/api/noise/stats').then(r => {
-      if (r.ok) setUseServerApi(true)
-    }).catch(() => {})
-  }, [])
   const [schoolsByTail, setSchoolsByTail] = useState(new Map())
   const [compose, setCompose] = useState(null) // { to, subject, body, school, tail }
 
@@ -747,6 +746,13 @@ function MapPage() {
     }
   }, [showHeatmap])
   const [onlyViolations, setOnlyViolations] = useState(false)
+  // Sampling mode for the rendered tracks:
+  //   'proportional' — subset gets `ceil(500 * subset/2000)` paths (default).
+  //                    Smaller filters render at lower density to keep visual
+  //                    weight comparable to the all-aircraft view.
+  //   'max'          — always render up to 300 paths regardless of filter,
+  //                    so a small subset shows full detail.
+  const [trackSampleMode, setTrackSampleMode] = useState('proportional')
   const [onlyTnG, setOnlyTnG] = useState(false)
   const [realImpact, setRealImpact] = useState(true)
   const [impactOpacity, setImpactOpacity] = useState(1.0)
@@ -858,12 +864,31 @@ function MapPage() {
     if (todFilter) { params.set('tod_start', todStart); params.set('tod_end', todEnd) }
     if (onlyTnG) params.set('tng_only', '1')
     else if (onlyViolations) params.set('violations_only', '1')
-    params.set('limit', '500')
-    params.set('_t', Date.now()) // cache bust
+    // Sampling target depends on mode:
+    //   proportional → ceil(MAX_LIMIT × subsetTotal / ASSUMED_TOTAL), cap MAX_LIMIT
+    //   max          → MAX_PATHS_CAP (always show up to that many)
+    const MAX_LIMIT = 500
+    const ASSUMED_TOTAL = 2000
+    const MAX_PATHS_CAP = 300
+    params.set('limit', String(MAX_LIMIT))
+    params.set('_t', Date.now())
     fetch(`/api/noise/tracks?${params}`)
       .then(r => { if (!r.ok) throw new Error(`tracks ${r.status}`); return r.json() })
       .then(data => {
-        console.log(`[noise-api] tracks loaded: ${data.tracks?.length}/${data.total}`)
+        const subsetTotal = data.total || 0
+        const targetCount = trackSampleMode === 'max'
+          ? Math.min(MAX_PATHS_CAP, data.tracks?.length || 0)
+          : Math.min(
+              MAX_LIMIT,
+              Math.max(1, Math.ceil(MAX_LIMIT * subsetTotal / ASSUMED_TOTAL))
+            )
+        if (data.tracks?.length > targetCount) {
+          const stride = data.tracks.length / targetCount
+          const sampled = []
+          for (let i = 0; i < targetCount; i++) sampled.push(data.tracks[Math.floor(i * stride)])
+          data.tracks = sampled
+        }
+        console.log(`[noise-api] tracks loaded: ${data.tracks?.length}/${data.total} (subset=${subsetTotal}, target=${targetCount}, mode=${trackSampleMode})`)
         setServerTracks(data)
         setServerLoading(false)
       })
@@ -871,25 +896,8 @@ function MapPage() {
         console.error('[noise-api] tracks error:', e)
         setServerLoading(false)
       })
-  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter, onlyViolations, onlyTnG, todFilter, todStart, todEnd, todAnimate])
+  }, [useServerApi, yearFilter, baseFilter, schoolFilter, purposeFilter, onlyViolations, onlyTnG, todFilter, todStart, todEnd, todAnimate, trackSampleMode])
 
-  // --- Fallback: load all tracks from file for local dev ---
-  useEffect(() => {
-    if (useServerApi) return
-    setLoadProgress({ loaded: 0, total: 0, status: 'Starting...' })
-    fetchTracksChunked(
-      (loaded, total) => setLoadProgress(p => ({ ...p, loaded, total })),
-      (status) => setLoadProgress(p => ({ ...p, status }))
-    )
-      .then((d) => {
-        setDatasets((s) => ({ ...s, yearly: d }))
-        setLoadProgress(null)
-      })
-      .catch((e) => {
-        setErrors((s) => ({ ...s, yearly: String(e) }))
-        setLoadProgress(p => ({ ...p, status: `FAILED: ${e.message}`, error: true }))
-      })
-  }, [useServerApi])
 
   // Precompute everything that depends on the FULL raw dataset. Heavy work
   // (classifying ~1.2M points) is chunked and yields to the main thread every
@@ -1394,7 +1402,7 @@ function MapPage() {
       const p = buildParams(block)
       const [statsRes, tracksRes] = await Promise.all([
         fetch(`/api/noise/stats?${p}`).then(r => r.json()),
-        fetch(`/api/noise/tracks?${p}&limit=500`).then(r => r.json()),
+        fetch(`/api/noise/tracks?${p}&limit=250`).then(r => r.json()),
       ])
       return { label: block.label, start: block.start, end: block.end, stats: statsRes, tracks: tracksRes }
     })).then(cached => {
@@ -1464,8 +1472,20 @@ function MapPage() {
     if (!tracks.length) { setImpactRaster(null); return }
     // TOD filtering is done server-side — tracks are already filtered,
     // so no need to pass todStart/todEnd to the raster computation.
+    // Single-aircraft mode: enable auto-range so the colorizer scales to
+    // this one track's energy distribution rather than the corridor-wide
+    // baseline. The distance-based densification (10 blobs/nm by default)
+    // already gives uniform spatial spacing.
+    const isSingle = tracks.length === 1
+    const opts = isSingle
+      ? { accumAutoRange: true, blobsPerNm: 2 }
+      // Multi-aircraft: 4× absolute intensity — shift colorize window
+      // down by log10(4) ≈ 0.60. Defaults are -6.90 / -0.60.
+      : { blobsPerNm: 1, accumLogLo: -7.50, accumLogHi: -1.20 }
+    if (typeof window !== 'undefined') window.__noiseDebug = { tracks, selectedTails, opts }
     const id = setTimeout(() => {
-      const result = computeNoiseRaster(tracks, {})
+      const result = computeNoiseRaster(tracks, opts)
+      if (typeof window !== 'undefined') window.__noiseDebug.result = result
       setImpactRaster(result)
     }, 0)
     return () => clearTimeout(id)
@@ -1562,13 +1582,13 @@ function MapPage() {
   // "highest %" and "most red length" based on the active tab.
   const byTailSorted = useMemo(() => {
     const copy = byTail.slice()
-    if (offenderTab === 'len') {
+    if (excursionTab === 'len') {
       copy.sort((a, b) => b.redFt - a.redFt || b.pctRed - a.pctRed)
     } else {
       copy.sort((a, b) => b.pctRed - a.pctRed || b.red - a.red)
     }
     return copy
-  }, [byTail, offenderTab])
+  }, [byTail, excursionTab])
 
   // Aggregate by based airport AND by flight school. Each aircraft is
   // attributed to every base in its set, plus its school (if known). The
@@ -1628,6 +1648,95 @@ function MapPage() {
     }
     return out
   }, [banded, selectedTails])
+
+  // Mile markers along the selected track(s) — visual proof that the
+  // arc-length walker emits at uniform intervals. Same algorithm as the
+  // noise raster's resampling loop, but emits one marker per nautical
+  // mile instead of one per (1/blobsPerNm) nm. If these dots look evenly
+  // spaced, the noise raster's blobs are too.
+  // Resample a polyline at uniform arc-length intervals.
+  // Inputs:
+  //   pts: [[lat, lon, ...], ...]
+  //   stepNm: distance between samples in nautical miles
+  // Returns: [{ index, lat, lon, distNm }, ...] starting at distNm=0.
+  // Algorithm: haversine for each segment (proper great-circle distance,
+  // no flat-earth approximation), monotonic walk, linear interpolation
+  // within each segment. No altitude, no gaps logic — just geometry.
+  const resampleByDistance = (pts, stepNm) => {
+    if (!pts || pts.length < 2 || stepNm <= 0) return []
+    const R_NM = 3440.065  // Earth radius in nautical miles
+    const toRad = (d) => d * Math.PI / 180
+    const haversineNm = (a, b) => {
+      const lat1 = toRad(a[0]), lat2 = toRad(b[0])
+      const dLat = lat2 - lat1
+      const dLon = toRad(b[1] - a[1])
+      const h = Math.sin(dLat / 2) ** 2 +
+                Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2
+      return 2 * R_NM * Math.asin(Math.min(1, Math.sqrt(h)))
+    }
+    // Drop consecutive duplicates so segLen is never zero
+    const clean = [pts[0]]
+    for (let i = 1; i < pts.length; i++) {
+      const p = pts[i], q = clean[clean.length - 1]
+      if (p[0] !== q[0] || p[1] !== q[1]) clean.push(p)
+    }
+    if (clean.length < 2) return []
+    // Per-segment distances
+    const segNm = new Float64Array(clean.length - 1)
+    let totalNm = 0
+    for (let i = 0; i < segNm.length; i++) {
+      segNm[i] = haversineNm(clean[i], clean[i + 1])
+      totalNm += segNm[i]
+    }
+    // Walk: emit a sample every stepNm of accumulated distance
+    const out = [{ index: 0, lat: clean[0][0], lon: clean[0][1], distNm: 0 }]
+    let segIdx = 0
+    let segStart = 0  // arc length at start of current segment
+    let nextEmit = stepNm
+    let n = 1
+    while (nextEmit <= totalNm) {
+      // Advance segIdx until nextEmit falls inside [segStart, segStart + segNm[segIdx]]
+      while (segIdx < segNm.length && segStart + segNm[segIdx] < nextEmit) {
+        segStart += segNm[segIdx]
+        segIdx++
+      }
+      if (segIdx >= segNm.length) break
+      const tf = (nextEmit - segStart) / segNm[segIdx]
+      const a = clean[segIdx], b = clean[segIdx + 1]
+      out.push({
+        index: n++,
+        lat: a[0] + (b[0] - a[0]) * tf,
+        lon: a[1] + (b[1] - a[1]) * tf,
+        distNm: nextEmit,
+      })
+      nextEmit += stepNm
+    }
+    return out
+  }
+
+  // Mile markers along the selected aircraft track(s).
+  const mileMarkers = useMemo(() => {
+    if (selectedOverlays.length === 0) return []
+    const all = []
+    for (const t of selectedOverlays) {
+      const pts = t.overlayPoints
+      if (!pts || pts.length < 2) continue
+      const samples = resampleByDistance(pts, 1.0) // 1 nm steps
+      const tail = t.call || t.reg || '?'
+      for (const s of samples) all.push({ tail, ...s })
+      if (typeof window !== 'undefined') {
+        window.__mileDebug = window.__mileDebug || {}
+        window.__mileDebug[tail] = {
+          rawPoints: pts.length,
+          markers: samples.length,
+          totalNm: samples.length ? samples[samples.length - 1].distNm : 0,
+          first3: samples.slice(0, 3),
+          last3: samples.slice(-3),
+        }
+      }
+    }
+    return all
+  }, [selectedOverlays])
 
   // Client-side heatmap for a single selected aircraft. When showHeatmap is
   // on AND exactly one plane is selected, compute its own footprint. This
@@ -2086,8 +2195,11 @@ function MapPage() {
               { label: 'Heatmap', active: realImpact, toggle: () => setRealImpact((v) => !v) },
               { label: 'Population', active: showPopDensity, toggle: () => setShowPopDensity((v) => !v) },
               { label: 'Impact', active: showImpact, toggle: () => setShowImpact((v) => !v) },
-              { label: 'Violators', active: onlyViolations, toggle: () => { setOnlyViolations((v) => !v); setOnlyTnG(false) } },
+              { label: 'Excursions', active: onlyViolations, toggle: () => { setOnlyViolations((v) => !v); setOnlyTnG(false) } },
               { label: 'T&G', active: onlyTnG, toggle: () => { setOnlyTnG((v) => !v); setOnlyViolations(false) } },
+              { label: 'Proportional',
+                active: trackSampleMode === 'proportional',
+                toggle: () => setTrackSampleMode((m) => m === 'proportional' ? 'max' : 'proportional') },
             ].map((b) => (
               <button
                 key={b.label}
@@ -2320,8 +2432,11 @@ function MapPage() {
               { label: 'Paths', active: showPaths, toggle: () => setShowPaths(v => !v) },
               { label: 'Zones', active: showZones, toggle: () => setShowZones(v => !v) },
               { label: 'Heatmap', active: realImpact, toggle: () => setRealImpact(v => !v) },
-              { label: 'Violators', active: onlyViolations, toggle: () => { setOnlyViolations(v => !v); setOnlyTnG(false) } },
+              { label: 'Excursions', active: onlyViolations, toggle: () => { setOnlyViolations(v => !v); setOnlyTnG(false) } },
               { label: 'T&G', active: onlyTnG, toggle: () => { setOnlyTnG(v => !v); setOnlyViolations(false) } },
+              { label: trackSampleMode === 'max' ? 'Max paths' : 'Proportional',
+                active: trackSampleMode === 'max',
+                toggle: () => setTrackSampleMode(m => m === 'max' ? 'proportional' : 'max') },
             ].map(b => (
               <button key={b.label} onClick={b.toggle}
                 className={`text-[10px] px-2 py-0.5 rounded-full border ${
@@ -2422,9 +2537,9 @@ function MapPage() {
             <div className="flex items-center justify-between mb-1 px-1 gap-2">
               <div className="flex items-center gap-0 rounded overflow-hidden border border-white/15">
                 <button
-                  onClick={() => setOffenderTab('pct')}
+                  onClick={() => setExcursionTab('pct')}
                   className={`px-2 py-0.5 text-[10px] ${
-                    offenderTab === 'pct'
+                    excursionTab === 'pct'
                       ? 'bg-cyan-500/30 text-white'
                       : 'text-white/60 hover:text-white'
                   }`}
@@ -2432,9 +2547,9 @@ function MapPage() {
                   Highest %
                 </button>
                 <button
-                  onClick={() => setOffenderTab('len')}
+                  onClick={() => setExcursionTab('len')}
                   className={`px-2 py-0.5 text-[10px] ${
-                    offenderTab === 'len'
+                    excursionTab === 'len'
                       ? 'bg-cyan-500/30 text-white'
                       : 'text-white/60 hover:text-white'
                   }`}
@@ -2472,7 +2587,7 @@ function MapPage() {
                         <td className="px-1 py-0.5 text-right tabular-nums text-red-400">
                           {a.pctRed.toFixed(0)}%
                         </td>
-                        {offenderTab === 'len' ? (
+                        {excursionTab === 'len' ? (
                           <td className="px-1 py-0.5 text-right tabular-nums text-red-300">
                             {a.redNm.toFixed(1)} nm
                           </td>
@@ -3003,9 +3118,10 @@ The team at Boulder Municipal Airport (KBDU)`
             />
           )}
 
-          {/* Impact raster — fades between frames during TOD animation */}
+          {/* Impact raster — fades between frames during TOD animation.
+              CSS filter blur is GPU-accelerated; cheap regardless of grid size. */}
           {realImpact && impactRaster && (
-            <Pane name="impact-pane" style={{ transition: 'opacity 0.6s ease-in-out', zIndex: 300, mixBlendMode: 'multiply' }}>
+            <Pane name="impact-pane" style={{ transition: 'opacity 0.6s ease-in-out', zIndex: 300, mixBlendMode: 'multiply', filter: 'blur(8px)' }}>
               <ImageOverlay
                 key={todFilter ? `tod-${todStart}-${todEnd}` : 'all'}
                 url={impactRaster.dataUrl}
@@ -3018,13 +3134,15 @@ The team at Boulder Municipal Airport (KBDU)`
 
           {/* Noise × population impact raster */}
           {showImpact && impactPopRaster && (
-            <ImageOverlay
-              key={todFilter ? `impact-${todStart}-${todEnd}` : 'impact-all'}
-              url={impactPopRaster.dataUrl}
-              bounds={impactPopRaster.latLngBounds}
-              opacity={impactPopOpacity}
-              interactive={false}
-            />
+            <Pane name="impact-pop-pane" style={{ zIndex: 301, filter: 'blur(8px)' }}>
+              <ImageOverlay
+                key={todFilter ? `impact-${todStart}-${todEnd}` : 'impact-all'}
+                url={impactPopRaster.dataUrl}
+                bounds={impactPopRaster.latLngBounds}
+                opacity={impactPopOpacity}
+                interactive={false}
+              />
+            </Pane>
           )}
 
           {/* Full-track overlay for the clicked aircraft — drawn last so it sits on top */}

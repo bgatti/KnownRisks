@@ -10,7 +10,7 @@ import { NOISE_ZONES } from './src/noiseZones.js'
 
 const CENTER = [40.0394, -105.2258]
 const RADIUS_NM = 15
-const POLL_MS = 2_000
+const POLL_MS = 5_000
 const ALT_MAX_FT = 10_000
 const SEVERITY = { yellow: 1, orange: 2, red: 3, purple: 4 }
 
@@ -25,12 +25,14 @@ function classifyTrackLive(points) {
     const p = points[i]
     const klass = classifyPoint(p[0], p[1], p[2], NOISE_ZONES)
     if (klass && (!worst || SEVERITY[klass] > SEVERITY[worst])) worst = klass
-    // Bands
+    // Bands — preserve the epoch-ms timestamp (p[3]) when present so
+    // downstream consumers can trim points to a time window.
+    const pt = p.length > 3 ? [p[0], p[1], p[2], p[3]] : [p[0], p[1], p[2]]
     if (cur && cur.klass === klass) {
-      cur.points.push([p[0], p[1], p[2]])
+      cur.points.push(pt)
     } else {
-      if (cur) { cur.points.push([p[0], p[1], p[2]]); bands.push(cur) }
-      cur = { klass, points: [[p[0], p[1], p[2]]] }
+      if (cur) { cur.points.push(pt); bands.push(cur) }
+      cur = { klass, points: [pt] }
     }
     // Segment stats
     if (i > 0) {

@@ -1,0 +1,1663 @@
+{
+  "generated": "2026-04-17",
+  "source": "tracks_yearly.json special-use classification",
+  "total": 172,
+  "by_use": {
+    "firefighting": 7,
+    "government": 7,
+    "helicopter_ops": 28,
+    "law_enforcement": 5,
+    "medivac": 48,
+    "medivac_possible": 8,
+    "military": 18,
+    "patrol": 17,
+    "science": 9,
+    "search_rescue": 18,
+    "survey": 7
+  },
+  "aircraft": [
+    {
+      "tail": "N328SF",
+      "use": "firefighting",
+      "description": "fire agency aircraft",
+      "owner": "STATE OF COLORADO, DEPARTMENT OF PUBLIC SAFETY, DIVISION OF FIRE",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 16
+    },
+    {
+      "tail": "N327SF",
+      "use": "firefighting",
+      "description": "fire agency aircraft",
+      "owner": "STATE OF COLORADO, DEPARTMENT OF PUBLIC SAFETY, DIVISION OF FIRE",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 13,
+      "hospitals": [
+        "Swedish Medical Englewood"
+      ]
+    },
+    {
+      "tail": "N125Z",
+      "use": "firefighting",
+      "description": "fire agency aircraft",
+      "owner": "USDA FOREST SERVICE, FIRE AND AVIATION",
+      "aircraft_type": "KODI",
+      "aircraft_desc": "DAHER Kodiak 100",
+      "track_count": 4
+    },
+    {
+      "tail": "N485DF",
+      "use": "firefighting",
+      "description": "fire agency aircraft",
+      "owner": "CALIFORNIA DEPT OF FORESTRY & FIRE PROTECTION",
+      "aircraft_type": "H60",
+      "aircraft_desc": "SIKORSKY UH-60 Black Hawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N492DF",
+      "use": "firefighting",
+      "description": "fire agency aircraft",
+      "owner": "CAL FIRE",
+      "aircraft_type": "",
+      "aircraft_desc": "",
+      "track_count": 1
+    },
+    {
+      "tail": "N55WJ",
+      "use": "firefighting",
+      "description": "fire agency aircraft",
+      "owner": "CO FIRE AVIATION LEASING INC",
+      "aircraft_type": "AC90",
+      "aircraft_desc": "NORTH AMERICAN ROCKWELL Turbo Commander 690/840",
+      "track_count": 1
+    },
+    {
+      "tail": "N803NZ",
+      "use": "firefighting",
+      "description": "fire agency aircraft",
+      "owner": "CO FIRE AVIATION INC",
+      "aircraft_type": "AT8T",
+      "aircraft_desc": "AIR TRACTOR AT-802",
+      "track_count": 1
+    },
+    {
+      "tail": "N205SP",
+      "use": "government",
+      "description": "state/federal government agency",
+      "owner": "STATE OF COLORADO",
+      "aircraft_type": "BE20",
+      "aircraft_desc": "BEECH 200 Super King Air",
+      "track_count": 14
+    },
+    {
+      "tail": "N617DE",
+      "use": "government",
+      "description": "state/federal government agency",
+      "owner": "US DEPARTMENT OF ENERGY, WESTERN AREA POWER ADMINISTRATION",
+      "aircraft_type": "B407",
+      "aircraft_desc": "BELL 407",
+      "track_count": 11
+    },
+    {
+      "tail": "N93827",
+      "use": "government",
+      "description": "state/federal government agency",
+      "owner": "STATE OF COLORADO DEPARTMENT OF NATURAL RESOURCES, DIVISION OF W",
+      "aircraft_type": "C185",
+      "aircraft_desc": "CESSNA 185 Skywagon",
+      "track_count": 8
+    },
+    {
+      "tail": "N48RF",
+      "use": "government",
+      "description": "state/federal government agency",
+      "owner": "UNITED STATES DEPARTMENT OF COMMERCE",
+      "aircraft_type": "DHC6",
+      "aircraft_desc": "DE HAVILLAND DHC-6 Twin Otter",
+      "track_count": 1
+    },
+    {
+      "tail": "N4211C",
+      "use": "government",
+      "description": "state/federal government agency",
+      "owner": "STATE OF COLORADO DEPARTMENT OF NATURAL RESOURCES, DIVISION OF W",
+      "aircraft_type": "C185",
+      "aircraft_desc": "CESSNA 185 Skywagon",
+      "track_count": 1
+    },
+    {
+      "tail": "N880DT",
+      "use": "government",
+      "description": "state/federal government agency",
+      "owner": "OKLAHOMA DEPARTMENT OF TRANSPORTATION",
+      "aircraft_type": "BE9L",
+      "aircraft_desc": "BEECH 90 King Air",
+      "track_count": 1
+    },
+    {
+      "tail": "N102WY",
+      "use": "government",
+      "description": "state/federal government agency",
+      "owner": "WYOMING DEPARTMENT OF TRANSPORTATION, AERONAUTICS DIVISION",
+      "aircraft_type": "C560",
+      "aircraft_desc": "CESSNA 560 Citation Ultra",
+      "track_count": 1
+    },
+    {
+      "tail": "N6UX",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "HELICOPTERS INC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 28
+    },
+    {
+      "tail": "N9862H",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "FALCON HELICOPTERS INC / TAF AERIAL SERVICES LLC",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "CESSNA T182 Turbo Skylane",
+      "track_count": 17
+    },
+    {
+      "tail": "N911UH",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "RAMPART HELICOPTER SERVICES LLC",
+      "aircraft_type": "UH1",
+      "aircraft_desc": "BELL UH-1 Huey",
+      "track_count": 15
+    },
+    {
+      "tail": "N42599",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "HAWKEYE HELICOPTER LLC",
+      "aircraft_type": "C182",
+      "aircraft_desc": "CESSNA 182 Skylane",
+      "track_count": 7
+    },
+    {
+      "tail": "N37GG",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "HAWKEYE HELICOPTER LLC",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "CESSNA T182 Turbo Skylane",
+      "track_count": 4
+    },
+    {
+      "tail": "N13819",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "HAWKEYE HELICOPTER LLC / SCOTT JOHN D",
+      "aircraft_type": "C177",
+      "aircraft_desc": "CESSNA  177 Cardinal",
+      "track_count": 4
+    },
+    {
+      "tail": "N154SH",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "SPITZER HELICOPTER LLC",
+      "aircraft_type": "R22",
+      "aircraft_desc": "ROBINSON R-22 Mariner",
+      "track_count": 3
+    },
+    {
+      "tail": "N182DD",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "GULF COAST HELICOPTERS INC",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "CESSNA T182 Turbo Skylane",
+      "track_count": 2
+    },
+    {
+      "tail": "N244MM",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "NOVEMBER ALPHA LLC DBA, TOUCHSTONE HELICOPTERS",
+      "aircraft_type": "R44",
+      "aircraft_desc": "ROBINSON R-44 Raven",
+      "track_count": 2
+    },
+    {
+      "tail": "N744WG",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "SPITZER HELICOPTER LLC",
+      "aircraft_type": "R44",
+      "aircraft_desc": "ROBINSON R-44 Raven",
+      "track_count": 2
+    },
+    {
+      "tail": "N5103N",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "GULF COAST HELICOPTERS INC",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 2
+    },
+    {
+      "tail": "N9661G",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "HAWKEYE HELICOPTER LLC",
+      "aircraft_type": "C182",
+      "aircraft_desc": "CESSNA 182 Skylane",
+      "track_count": 2
+    },
+    {
+      "tail": "N350MW",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "MOUNTAIN WEST HELICOPTERS LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 1
+    },
+    {
+      "tail": "N267AH",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "AIRBUS HELICOPTERS INC",
+      "aircraft_type": "EC45",
+      "aircraft_desc": "",
+      "track_count": 1
+    },
+    {
+      "tail": "N346HG",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "CONSTRUCTION HELICOPTERS INC",
+      "aircraft_type": "BE40",
+      "aircraft_desc": "BEECH 400 Beechjet",
+      "track_count": 1
+    },
+    {
+      "tail": "N2295F",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "COPTER LEASE LLC TRUSTEE",
+      "aircraft_type": "B06",
+      "aircraft_desc": "BELL 206 JetRanger",
+      "track_count": 1
+    },
+    {
+      "tail": "N5NU",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "HAWKEYE HELICOPTER LLC",
+      "aircraft_type": "B06",
+      "aircraft_desc": "BELL 206 JetRanger",
+      "track_count": 1
+    },
+    {
+      "tail": "N415RC",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "HAWKEYE HELICOPTER LLC",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "CESSNA T182 Turbo Skylane",
+      "track_count": 1
+    },
+    {
+      "tail": "N2431G",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "GULF COAST HELICOPTERS INC",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "CESSNA T182 Turbo Skylane",
+      "track_count": 1
+    },
+    {
+      "tail": "N133TH",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "TIMBERLINE HELICOPTERS INC",
+      "aircraft_type": "H60",
+      "aircraft_desc": "SIKORSKY UH-60 Black Hawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N79R",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "DRB HELICOPTERS LLC",
+      "aircraft_type": "GLAS",
+      "aircraft_desc": "Glasair",
+      "track_count": 1
+    },
+    {
+      "tail": "N43HX",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "HELICOPTER EXPRESS INC",
+      "aircraft_type": "KMAX",
+      "aircraft_desc": "KAMAN K-Max",
+      "track_count": 1
+    },
+    {
+      "tail": "N605BH",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "BLACK HILLS HELICOPTERS INC",
+      "aircraft_type": "R44",
+      "aircraft_desc": "ROBINSON R-44 Raven",
+      "track_count": 1
+    },
+    {
+      "tail": "N61MM",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "BEACH HELICOPTER SERVICES LLC",
+      "aircraft_type": "R44",
+      "aircraft_desc": "ROBINSON R-44 Raven",
+      "track_count": 1
+    },
+    {
+      "tail": "N262HQ",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "COPTER LEASE LLC TRUSTEE",
+      "aircraft_type": "UH1",
+      "aircraft_desc": "BELL UH-1 Huey",
+      "track_count": 1
+    },
+    {
+      "tail": "N64255",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "GULF COAST HELICOPTERS INC",
+      "aircraft_type": "C172",
+      "aircraft_desc": "",
+      "track_count": 1
+    },
+    {
+      "tail": "N127SL",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "GULF COAST HELICOPTERS INC",
+      "aircraft_type": "C82T",
+      "aircraft_desc": "CESSNA TR182 Turbo Skylane RG",
+      "track_count": 1
+    },
+    {
+      "tail": "N163AC",
+      "use": "helicopter_ops",
+      "description": "commercial helicopter operator (utility/charter)",
+      "owner": "HELICOPTER EXPRESS LLC",
+      "aircraft_type": "S64",
+      "aircraft_desc": "SIKORSKY S-64 Skycrane",
+      "track_count": 1
+    },
+    {
+      "tail": "N203SP",
+      "use": "law_enforcement",
+      "description": "law enforcement agency",
+      "owner": "COLORADO STATE PATROL",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "CESSNA T182 Turbo Skylane",
+      "track_count": 9,
+      "hospitals": [
+        "Castle Rock Adventist"
+      ]
+    },
+    {
+      "tail": "N959AF",
+      "use": "law_enforcement",
+      "description": "law enforcement agency",
+      "owner": "COLORADO STATE PATROL",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 4
+    },
+    {
+      "tail": "N202SP",
+      "use": "law_enforcement",
+      "description": "law enforcement agency",
+      "owner": "COLORADO STATE PATROL",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "CESSNA T182 Turbo Skylane",
+      "track_count": 3,
+      "hospitals": [
+        "Swedish Medical Englewood"
+      ]
+    },
+    {
+      "tail": "N201SP",
+      "use": "law_enforcement",
+      "description": "law enforcement agency",
+      "owner": "COLORADO STATE PATROL",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "CESSNA T182 Turbo Skylane",
+      "track_count": 2
+    },
+    {
+      "tail": "N148HP",
+      "use": "law_enforcement",
+      "description": "law enforcement agency",
+      "owner": "CALIFORNIA HIGHWAY PATROL OFFICE OF AIR OPERATIONS",
+      "aircraft_type": "GA8",
+      "aircraft_desc": "GIPPSAERO GA-8 Airvan",
+      "track_count": 1
+    },
+    {
+      "tail": "N775AL",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "B407",
+      "aircraft_desc": "BELL 407",
+      "track_count": 36,
+      "hospitals": [
+        "St Anthony Central"
+      ]
+    },
+    {
+      "tail": "N491LG",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC / KEYBANK NA ACTING THROUGH ITS DIVISION, KEY EQUIPMENT FINANCE IN",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 35,
+      "hospitals": [
+        "St Anthony Central"
+      ]
+    },
+    {
+      "tail": "N374AL",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "B407",
+      "aircraft_desc": "BELL 407",
+      "track_count": 31,
+      "hospitals": [
+        "Anschutz/UCH Aurora",
+        "Denver Health",
+        "St Anthony Central",
+        "Swedish Medical Englewood"
+      ]
+    },
+    {
+      "tail": "N912SM",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "BE20",
+      "aircraft_desc": "BEECH 200 Super King Air",
+      "track_count": 30,
+      "hospitals": [
+        "Centennial Medical Plaza"
+      ]
+    },
+    {
+      "tail": "N856MB",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "MED TRANS CORP",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 30,
+      "hospitals": [
+        "Boulder Community Broadway",
+        "Boulder Community Foothills"
+      ]
+    },
+    {
+      "tail": "N851MB",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "MED-TRANS CORP",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 28,
+      "hospitals": [
+        "Boulder Community Broadway",
+        "Boulder Community Foothills"
+      ]
+    },
+    {
+      "tail": "N853MB",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "MED-TRANS CORP",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 28,
+      "hospitals": [
+        "Anschutz/UCH Aurora"
+      ]
+    },
+    {
+      "tail": "N776AL",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC / FIFTH THIRD BANK NA",
+      "aircraft_type": "B407",
+      "aircraft_desc": "BELL 407",
+      "track_count": 26,
+      "hospitals": [
+        "Sky Ridge Medical",
+        "St Anthony Central",
+        "St Anthony North Westminster"
+      ]
+    },
+    {
+      "tail": "N934EM",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "REACH AIR MEDICAL SERVICES LLC / TVPX AIRCRAFT SOLUTIONS INC TRUSTEE",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 23
+    },
+    {
+      "tail": "N127CH",
+      "use": "medivac",
+      "description": "helicopter with repeated hospital landings",
+      "owner": "TVPX AIRCRAFT SOLUTIONS INC TRUSTEE",
+      "aircraft_type": "EC30",
+      "aircraft_desc": "AIRBUS HELICOPTERS EC-130",
+      "track_count": 21,
+      "hospitals": [
+        "Anschutz/UCH Aurora",
+        "Sky Ridge Medical",
+        "St Anthony Central"
+      ]
+    },
+    {
+      "tail": "N308NE",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "MED TRANS CORP",
+      "aircraft_type": "B407",
+      "aircraft_desc": "BELL 407",
+      "track_count": 21
+    },
+    {
+      "tail": "N783AL",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "BE20",
+      "aircraft_desc": "BEECH 200 Super King Air",
+      "track_count": 18,
+      "hospitals": [
+        "Denver Health"
+      ]
+    },
+    {
+      "tail": "N399LG",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 15
+    },
+    {
+      "tail": "N129JW",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 15
+    },
+    {
+      "tail": "N316PM",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORPORATION / AIR METHODS LLC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 14,
+      "hospitals": [
+        "Centennial Medical Plaza"
+      ]
+    },
+    {
+      "tail": "N773AL",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "B407",
+      "aircraft_desc": "BELL 407",
+      "track_count": 14
+    },
+    {
+      "tail": "N391LG",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 13,
+      "hospitals": [
+        "St Anthony Lakewood"
+      ]
+    },
+    {
+      "tail": "N782AL",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "BE20",
+      "aircraft_desc": "BEECH 200 Super King Air",
+      "track_count": 13
+    },
+    {
+      "tail": "N779AL",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "B407",
+      "aircraft_desc": "BELL 407",
+      "track_count": 12
+    },
+    {
+      "tail": "N863MB",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "REACH AIR MEDICAL SERVICES LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 11,
+      "hospitals": [
+        "Anschutz/UCH Aurora"
+      ]
+    },
+    {
+      "tail": "N854AL",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 10,
+      "hospitals": [
+        "Childrens Hospital CO",
+        "St Anthony North Westminster"
+      ]
+    },
+    {
+      "tail": "N881GT",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "REACH AIR MEDICAL SERVICES LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 8,
+      "hospitals": [
+        "Anschutz/UCH Aurora"
+      ]
+    },
+    {
+      "tail": "N959MA",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 7
+    },
+    {
+      "tail": "N942EM",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "REACH AIR MEDICAL SERVICES LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 5
+    },
+    {
+      "tail": "N63RX",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "REACH AIR MEDICAL SERVICES LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 5
+    },
+    {
+      "tail": "N866MB",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "REACH AIR MEDICAL SERVICES LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 4
+    },
+    {
+      "tail": "N642PC",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 4
+    },
+    {
+      "tail": "N65RX",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "M&T CAPITAL AND LEASING CORP / REACH AIR MEDICAL SERVICES LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 4,
+      "hospitals": [
+        "Anschutz/UCH Aurora"
+      ]
+    },
+    {
+      "tail": "N411FA",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS LLC",
+      "aircraft_type": "H60",
+      "aircraft_desc": "SIKORSKY UH-60 Black Hawk",
+      "track_count": 4
+    },
+    {
+      "tail": "N116SK",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 3
+    },
+    {
+      "tail": "N796PC",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 3
+    },
+    {
+      "tail": "N3811C",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC / DIVISION OF FIRE PREVENTION & CONTROL (DFPC), COLORADO DEPARTMEN",
+      "aircraft_type": "H60",
+      "aircraft_desc": "SIKORSKY UH-60 Black Hawk",
+      "track_count": 3
+    },
+    {
+      "tail": "N637PC",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 3
+    },
+    {
+      "tail": "N267AM",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 3
+    },
+    {
+      "tail": "N324AC",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 2
+    },
+    {
+      "tail": "N407CP",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "CLASSIC MEDICAL INC",
+      "aircraft_type": "B407",
+      "aircraft_desc": "BELL 407",
+      "track_count": 2
+    },
+    {
+      "tail": "N941AM",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "B407",
+      "aircraft_desc": "BELL 407",
+      "track_count": 2
+    },
+    {
+      "tail": "N299AM",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS CORP / AIR METHODS LLC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 2
+    },
+    {
+      "tail": "N91MF",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "ELITE MEDICAL AIR TRANSPORT LLC",
+      "aircraft_type": "BE20",
+      "aircraft_desc": "BEECH 200 Super King Air",
+      "track_count": 2
+    },
+    {
+      "tail": "N412FA",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS LLC",
+      "aircraft_type": "H60",
+      "aircraft_desc": "SIKORSKY UH-60 Black Hawk",
+      "track_count": 2
+    },
+    {
+      "tail": "N613RX",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "REACH AIR MEDICAL SERVICES LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 1
+    },
+    {
+      "tail": "N890WA",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "LIFE FLIGHT NETWORK LLC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 1
+    },
+    {
+      "tail": "N884GT",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "REACH AIR MEDICAL SERVICES LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 1
+    },
+    {
+      "tail": "N210PT",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "CLASSIC MEDICAL INC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 1,
+      "hospitals": [
+        "Swedish Medical Englewood"
+      ]
+    },
+    {
+      "tail": "N360SM",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "LYNX MEDICAL TRANSPORT II LLC",
+      "aircraft_type": "F2TH",
+      "aircraft_desc": "DASSAULT Falcon 2000",
+      "track_count": 1
+    },
+    {
+      "tail": "N724HF",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "AIR METHODS LLC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 1
+    },
+    {
+      "tail": "N661LF",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "LIFE FLIGHT NETWORK LLC",
+      "aircraft_type": "PC12",
+      "aircraft_desc": "PILATUS PC-12",
+      "track_count": 1
+    },
+    {
+      "tail": "N64RX",
+      "use": "medivac",
+      "description": "EMS helicopter operator",
+      "owner": "REACH AIR MEDICAL SERVICES LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 1
+    },
+    {
+      "tail": "N68RX",
+      "use": "medivac_possible",
+      "description": "helicopter seen near hospital",
+      "owner": "CUSTOMERS COMMERCIAL FINANCE LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 40,
+      "hospitals": [
+        "Anschutz/UCH Aurora"
+      ]
+    },
+    {
+      "tail": "N855MB",
+      "use": "medivac_possible",
+      "description": "helicopter seen near hospital",
+      "owner": "M&T CAPITAL AND LEASING CORP / PEOPLES CAPITAL AND LEASING CORP",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 17,
+      "hospitals": [
+        "Boulder Community Broadway",
+        "Boulder Community Foothills"
+      ]
+    },
+    {
+      "tail": "N5PW",
+      "use": "medivac_possible",
+      "description": "helicopter seen near hospital",
+      "owner": "CGP HOLDCO LLC / PPH145 LLC",
+      "aircraft_type": "EC45",
+      "aircraft_desc": "AIRBUS HELICOPTERS EC-145",
+      "track_count": 10,
+      "hospitals": [
+        "Sky Ridge Medical"
+      ]
+    },
+    {
+      "tail": "N509CH",
+      "use": "medivac_possible",
+      "description": "helicopter seen near hospital",
+      "owner": "METRO AVIATION INC",
+      "aircraft_type": "EC45",
+      "aircraft_desc": "AIRBUS HELICOPTERS EC-145",
+      "track_count": 7,
+      "hospitals": [
+        "Anschutz/UCH Aurora"
+      ]
+    },
+    {
+      "tail": "N61RX",
+      "use": "medivac_possible",
+      "description": "helicopter seen near hospital",
+      "owner": "PACIFIC WESTERN BANK",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 4,
+      "hospitals": [
+        "Denver Health"
+      ]
+    },
+    {
+      "tail": "N115AH",
+      "use": "medivac_possible",
+      "description": "helicopter seen near hospital",
+      "owner": "SALE REPORTED",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 3,
+      "hospitals": [
+        "Boulder Community Foothills"
+      ]
+    },
+    {
+      "tail": "N519FF",
+      "use": "medivac_possible",
+      "description": "helicopter seen near hospital",
+      "owner": "SKY HIGH LEASING LLC",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 2,
+      "hospitals": [
+        "Boulder Community Foothills"
+      ]
+    },
+    {
+      "tail": "N494LG",
+      "use": "medivac_possible",
+      "description": "helicopter seen near hospital",
+      "owner": "M&T CAPITAL AND LEASING CORP / PEOPLES CAPITAL & LEASING CORP",
+      "aircraft_type": "AS50",
+      "aircraft_desc": "AEROSPATIALE AS-350 Ecureuil",
+      "track_count": 2,
+      "hospitals": [
+        "St Anthony Central"
+      ]
+    },
+    {
+      "tail": "N7874N",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE OWNER, PETERSON AERO CLUB  OPERATOR / UNITED STATES AIR FORCE OWNER, PETERSON AERO CLUB OPERATOR",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 4
+    },
+    {
+      "tail": "N556PM",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "645 AERONAUTICAL SYSTEMS GROUP (AESG)",
+      "aircraft_type": "DH8B",
+      "aircraft_desc": "DE HAVILLAND DHC-8-200 Dash 8",
+      "track_count": 3
+    },
+    {
+      "tail": "N6601K",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "AIR FORCE ACADEMY AERO CLUB",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 2
+    },
+    {
+      "tail": "N7754L",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 2
+    },
+    {
+      "tail": "N7755L",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 2
+    },
+    {
+      "tail": "N7870N",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE OWNER, PETERSON AERO CLUB OPERATOR",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 2
+    },
+    {
+      "tail": "N986HA",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "645 AERONAUTICAL SYSTEMS GROUP (AESG)",
+      "aircraft_type": "DH8B",
+      "aircraft_desc": "DE HAVILLAND DHC-8-200 Dash 8",
+      "track_count": 1
+    },
+    {
+      "tail": "N7882N",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE, KIRTLAND AFB AERO CLUB OPERATOR",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N7887N",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE, KIRTLAND AFB AERO CLUB",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N557SH",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE, UNITED STATES AIR FORCE ACADEMY",
+      "aircraft_type": "C150",
+      "aircraft_desc": "CESSNA 150",
+      "track_count": 1
+    },
+    {
+      "tail": "N557TH",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE",
+      "aircraft_type": "C150",
+      "aircraft_desc": "CESSNA 150",
+      "track_count": 1
+    },
+    {
+      "tail": "N7909N",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE OWNER, PETERSON AERO CLUB  OPERATOR",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N66MJ",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE (OWNER), USAF ACADEMY AERO CLUB (OPERATO",
+      "aircraft_type": "C182",
+      "aircraft_desc": "CESSNA 182 Skylane",
+      "track_count": 1
+    },
+    {
+      "tail": "N1370U",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE AERO CLUB",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N7899N",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE OWNER, PETERSON AERO CLUB  OPERATOR",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N1401E",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "UNITED STATES AIR FORCE AERO CLUB",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "10-0109",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "U.S. Air Force Academy",
+      "aircraft_type": "SR20",
+      "aircraft_desc": "",
+      "track_count": 1
+    },
+    {
+      "tail": "N991HA",
+      "use": "military",
+      "description": "US military aircraft",
+      "owner": "645 AERONAUTICAL SYSTEMS GROUP (AESG)",
+      "aircraft_type": "DH8B",
+      "aircraft_desc": "DE HAVILLAND DHC-8-200 Dash 8",
+      "track_count": 1
+    },
+    {
+      "tail": "N3397R",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "KCSI AERIAL PATROL INC",
+      "aircraft_type": "C182",
+      "aircraft_desc": "CESSNA 182 Skylane",
+      "track_count": 7
+    },
+    {
+      "tail": "N2983X",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "EAGLE SKY PATROL INC",
+      "aircraft_type": "C177",
+      "aircraft_desc": "CESSNA  177 Cardinal",
+      "track_count": 4
+    },
+    {
+      "tail": "N21598",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "KCSI AERIAL PATROL INC",
+      "aircraft_type": "C182",
+      "aircraft_desc": "CESSNA 182 Skylane",
+      "track_count": 3
+    },
+    {
+      "tail": "N62876",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "AMERICAN PATROLS INC",
+      "aircraft_type": "C172",
+      "aircraft_desc": "",
+      "track_count": 3
+    },
+    {
+      "tail": "N8409S",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "KCSI AERIAL PATROL INC / KCSI TEXAS INC",
+      "aircraft_type": "C182",
+      "aircraft_desc": "CESSNA 182 Skylane",
+      "track_count": 3
+    },
+    {
+      "tail": "N916WC",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "BARR AIR PATROL LLC",
+      "aircraft_type": "T206",
+      "aircraft_desc": "CESSNA T206 Turbo Stationair",
+      "track_count": 2
+    },
+    {
+      "tail": "N917WC",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "BARR AIR PATROL LLC",
+      "aircraft_type": "T206",
+      "aircraft_desc": "CESSNA T206 Turbo Stationair",
+      "track_count": 1
+    },
+    {
+      "tail": "N5480K",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "AMERICAN PATROLS INC",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N12955",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "AMERICAN PATROLS INC",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N3112S",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "KCSI AERIAL PATROL INC",
+      "aircraft_type": "C182",
+      "aircraft_desc": "CESSNA 182 Skylane",
+      "track_count": 1
+    },
+    {
+      "tail": "N4855L",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "EAGLE SKY PATROL INC",
+      "aircraft_type": "P28A",
+      "aircraft_desc": "PIPER PA-28-140/150/160/180",
+      "track_count": 1
+    },
+    {
+      "tail": "N62694",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "AMERICAN PATROLS INC",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N61672",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "AMERICAN PATROLS INC",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N2153A",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "ACUNA EDWARD DBA, 1ST CAV AIR PATROL",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N53822",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "AMERICAN PATROLS INC",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N71220",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "KCSI AERIAL PATROL INC",
+      "aircraft_type": "C182",
+      "aircraft_desc": "CESSNA 182 Skylane",
+      "track_count": 1
+    },
+    {
+      "tail": "N65614",
+      "use": "patrol",
+      "description": "aerial patrol (pipeline/powerline)",
+      "owner": "AMERICAN PATROLS INC",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N611XY",
+      "use": "science",
+      "description": "research/science agency",
+      "owner": "NOAA",
+      "aircraft_type": "",
+      "aircraft_desc": "",
+      "track_count": 3
+    },
+    {
+      "tail": "N7875E",
+      "use": "science",
+      "description": "research/science agency",
+      "owner": "UNIVERSITY RESEARCH FOUNDATION",
+      "aircraft_type": "C402",
+      "aircraft_desc": "CESSNA 402 Businessliner",
+      "track_count": 2
+    },
+    {
+      "tail": "N350XJ",
+      "use": "science",
+      "description": "research/science agency",
+      "owner": "GENERAL ATOMICS AERONAUTICAL SYSTEMS INC",
+      "aircraft_type": "CL30",
+      "aircraft_desc": "BOMBARDIER BD-100 Challenger 300",
+      "track_count": 2
+    },
+    {
+      "tail": "N350XK",
+      "use": "science",
+      "description": "research/science agency",
+      "owner": "GENERAL ATOMICS AERONAUTICAL SYSTEMS INC",
+      "aircraft_type": "CL30",
+      "aircraft_desc": "BOMBARDIER BD-100 Challenger 300",
+      "track_count": 2
+    },
+    {
+      "tail": "N46RF",
+      "use": "science",
+      "description": "research/science agency",
+      "owner": "UNITED STATES DEPARTMENT OF COMMERCE, NOAA AIRCRAFT OPERATIONS C",
+      "aircraft_type": "DHC6",
+      "aircraft_desc": "DE HAVILLAND DHC-6 Twin Otter",
+      "track_count": 1
+    },
+    {
+      "tail": "N154KF",
+      "use": "science",
+      "description": "research/science agency",
+      "owner": "GENERAL ATOMICS AERONAUTICAL SYSTEMS INC",
+      "aircraft_type": "BE30",
+      "aircraft_desc": "BEECH 300 Super King Air",
+      "track_count": 1
+    },
+    {
+      "tail": "N130AR",
+      "use": "science",
+      "description": "research/science agency",
+      "owner": "NATIONAL SCIENCE FOUNDATION",
+      "aircraft_type": "C130",
+      "aircraft_desc": "LOCKHEED C-130 Hercules",
+      "track_count": 1
+    },
+    {
+      "tail": "N628G",
+      "use": "science",
+      "description": "research/science agency",
+      "owner": "GENERAL DYNAMICS MISSION SYSTEMS INC",
+      "aircraft_type": "G280",
+      "aircraft_desc": "GULFSTREAM G280",
+      "track_count": 1
+    },
+    {
+      "tail": "N677F",
+      "use": "science",
+      "description": "research/science agency",
+      "owner": "NATIONAL SCIENCE FOUNDATION",
+      "aircraft_type": "GLF5",
+      "aircraft_desc": "GULFSTREAM 5",
+      "track_count": 1
+    },
+    {
+      "tail": "N594CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C182,C82T",
+      "aircraft_desc": "CESSNA 182 Skylane / CESSNA TR182 Turbo Skylane RG",
+      "track_count": 17
+    },
+    {
+      "tail": "N434CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C82T",
+      "aircraft_desc": "CESSNA TR182 Turbo Skylane RG",
+      "track_count": 16
+    },
+    {
+      "tail": "N9559X",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL INC",
+      "aircraft_type": "C182,C82R",
+      "aircraft_desc": "CESSNA 182 Skylane / CESSNA R182 Skylane RG",
+      "track_count": 9
+    },
+    {
+      "tail": "N948CA",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "CESSNA T182 Turbo Skylane",
+      "track_count": 8
+    },
+    {
+      "tail": "N846CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C172",
+      "aircraft_desc": "",
+      "track_count": 7
+    },
+    {
+      "tail": "N582CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "CESSNA T182 Turbo Skylane",
+      "track_count": 7
+    },
+    {
+      "tail": "N196CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "T206",
+      "aircraft_desc": "CESSNA T206 Turbo Stationair",
+      "track_count": 6
+    },
+    {
+      "tail": "N765CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "CESSNA T182 Turbo Skylane",
+      "track_count": 6
+    },
+    {
+      "tail": "N9846A",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL INC",
+      "aircraft_type": "C82R",
+      "aircraft_desc": "CESSNA R182 Skylane RG",
+      "track_count": 4
+    },
+    {
+      "tail": "N74CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL / TEXTRON AVIATION INC",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "",
+      "track_count": 4
+    },
+    {
+      "tail": "N652CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C82S",
+      "aircraft_desc": "CESSNA T182 Turbo Skylane",
+      "track_count": 3
+    },
+    {
+      "tail": "N243CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 3
+    },
+    {
+      "tail": "N826CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C82T",
+      "aircraft_desc": "CESSNA TR182 Turbo Skylane RG",
+      "track_count": 2
+    },
+    {
+      "tail": "N610CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "GA8",
+      "aircraft_desc": "GIPPSAERO GA-8 Airvan",
+      "track_count": 2
+    },
+    {
+      "tail": "N975CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C82T",
+      "aircraft_desc": "CESSNA TR182 Turbo Skylane RG",
+      "track_count": 1
+    },
+    {
+      "tail": "N897CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C82T",
+      "aircraft_desc": "CESSNA TR182 Turbo Skylane RG",
+      "track_count": 1
+    },
+    {
+      "tail": "N738CP",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C82T",
+      "aircraft_desc": "CESSNA TR182 Turbo Skylane RG",
+      "track_count": 1
+    },
+    {
+      "tail": "N99750",
+      "use": "search_rescue",
+      "description": "Civil Air Patrol search & rescue",
+      "owner": "CIVIL AIR PATROL",
+      "aircraft_type": "C172",
+      "aircraft_desc": "CESSNA 172 Skyhawk",
+      "track_count": 1
+    },
+    {
+      "tail": "N98869",
+      "use": "survey",
+      "description": "aerial survey operator",
+      "owner": "KEYSTONE AERIAL SURVEYS INC",
+      "aircraft_type": "C310",
+      "aircraft_desc": "CESSNA 310",
+      "track_count": 11
+    },
+    {
+      "tail": "N1008A",
+      "use": "survey",
+      "description": "aerial survey operator",
+      "owner": "AERIAL SURVEYS INTERNATIONAL LLC",
+      "aircraft_type": "C402",
+      "aircraft_desc": "CESSNA 402 Businessliner",
+      "track_count": 2
+    },
+    {
+      "tail": "N87WS",
+      "use": "survey",
+      "description": "aerial survey operator",
+      "owner": "KEYSTONE AERIAL SURVEYS INC",
+      "aircraft_type": "C441",
+      "aircraft_desc": "CESSNA 441 Conquest",
+      "track_count": 2
+    },
+    {
+      "tail": "N194SM",
+      "use": "survey",
+      "description": "aerial survey operator",
+      "owner": "SURVEYING AND MAPPING LLC",
+      "aircraft_type": "C208",
+      "aircraft_desc": "CESSNA 208 Caravan",
+      "track_count": 2
+    },
+    {
+      "tail": "N101CG",
+      "use": "survey",
+      "description": "aerial survey operator",
+      "owner": "COSTAR FIELD RESEARCH LLC",
+      "aircraft_type": "C208",
+      "aircraft_desc": "CESSNA 208 Caravan",
+      "track_count": 1
+    },
+    {
+      "tail": "N310MW",
+      "use": "survey",
+      "description": "aerial survey operator",
+      "owner": "KEYSTONE AERIAL SURVEYS INC",
+      "aircraft_type": "C310",
+      "aircraft_desc": "CESSNA 310",
+      "track_count": 1
+    },
+    {
+      "tail": "N989DE",
+      "use": "survey",
+      "description": "aerial survey operator",
+      "owner": "AERIAL SURVEYS INTERNATIONAL LLC",
+      "aircraft_type": "T206",
+      "aircraft_desc": "CESSNA T206 Turbo Stationair",
+      "track_count": 1
+    }
+  ]
+}

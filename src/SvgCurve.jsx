@@ -22,6 +22,8 @@ export default function SvgCurve({
   tension = 0.5,          // 0..1 — cardinal-spline tightness for cubic bezier
   chaikinIterations = 3,  // 1..5 — corner-cut passes for chaikin mode
   dashArray = null,
+  className = null,       // optional CSS class on the <path> (e.g. drop-shadow)
+  shadow = null,          // optional inline CSS filter, e.g. an altitude-driven drop-shadow
 }) {
   const map = useMap()
   const pathRef = useRef(null)
@@ -31,6 +33,8 @@ export default function SvgCurve({
     const svgRoot = map.getPanes().overlayPane.querySelector('svg')
     if (!svgRoot) return
     const path = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+    if (className) path.setAttribute('class', className)
+    if (shadow) path.style.filter = shadow
     path.setAttribute('fill', 'none')
     path.setAttribute('stroke', color)
     path.setAttribute('stroke-width', weight)
@@ -114,7 +118,7 @@ export default function SvgCurve({
       }
       pathRef.current = null
     }
-  }, [map, points, color, weight, opacity, curveType, tension, chaikinIterations, dashArray])
+  }, [map, points, color, weight, opacity, curveType, tension, chaikinIterations, dashArray, className, shadow])
 
   return null
 }
