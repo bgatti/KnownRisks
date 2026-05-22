@@ -3,6 +3,8 @@ import react from '@vitejs/plugin-react'
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
+import { loadPopGrid, impactSegments, POP_KERNEL } from './src/popGrid.js'
+import { distFt } from './src/geo.js'
 
 // Load .env.local into process.env BEFORE importing db.js (which reads
 // DATABASE_URL at module load). Lets local dev point at Railway's Postgres
@@ -24,6 +26,94 @@ import path from 'path'
 }
 const db = await import('./db.js')
 const adsb = await import('./adsb.js')
+
+// ── Shared aircraft + airport reference data ──
+// ICAO type code → human-readable description. Module-scope so both the
+// flight-ops classifier (descOf) and the /api/excursions/boot enrichment use
+// the same table.
+const TYPE_DESC = {
+  C152: 'Cessna 152', C172: 'Cessna Skyhawk 172', C72R: 'Cessna 172R Skyhawk',
+  C182: 'Cessna Skylane 182', C206: 'Cessna Stationair 206', C210: 'Cessna Centurion 210',
+  P28A: 'Piper Cherokee/Warrior PA-28', P28B: 'Piper Cherokee 180', PA28: 'Piper Cherokee PA-28',
+  P28R: 'Piper Arrow PA-28R', PA46: 'Piper Malibu/Mirage', PA44: 'Piper Seminole',
+  PA25: 'Piper Pawnee (tow plane)', PA18: 'Piper Super Cub (tow plane)',
+  DV20: 'Diamond Katana DV20', DA20: 'Diamond Katana DA20', DA40: 'Diamond Diamond Star',
+  DA42: 'Diamond Twin Star',
+  SR20: 'Cirrus SR20', SR22: 'Cirrus SR22', S22T: 'Cirrus SR22T',
+  M20P: 'Mooney M20P', M20J: 'Mooney M20J', M20K: 'Mooney M20K',
+  BE33: 'Beechcraft Bonanza 33', BE35: 'Beechcraft Bonanza V35', BE36: 'Beechcraft Bonanza A36',
+  BE55: 'Beechcraft Baron 55', BE58: 'Beechcraft Baron 58', BE76: 'Beechcraft Duchess',
+  BE9L: 'Beechcraft King Air', BE95: 'Beechcraft Travel Air', BE40: 'Beechjet 400',
+  C25A: 'Cessna Citation CJ2', C25B: 'Cessna Citation CJ3', C25C: 'Cessna Citation CJ4',
+  C501: 'Cessna Citation I/SP', C525: 'Cessna CitationJet', C551: 'Cessna Citation II/SP',
+  C560: 'Cessna Citation V', C56X: 'Cessna Citation Excel', C680: 'Cessna Citation Sovereign',
+  C68A: 'Cessna Citation Latitude', C750: 'Cessna Citation X',
+  CL30: 'Bombardier Challenger 300', CL35: 'Bombardier Challenger 350',
+  CL60: 'Bombardier Challenger 600',
+  GALX: 'Gulfstream G200', G200: 'Gulfstream G200', H25B: 'Hawker 800',
+  LJ40: 'Learjet 40', LJ60: 'Learjet 60',
+  E55P: 'Embraer Phenom 300', E50P: 'Embraer Phenom 100', SF50: 'Cirrus Vision Jet',
+  TBM7: 'Daher TBM 700', TBM8: 'Daher TBM 850', TBM9: 'Daher TBM 900',
+  PC12: 'Pilatus PC-12', PC24: 'Pilatus PC-24', DHC6: 'De Havilland Twin Otter',
+  R22: 'Robinson R22', R44: 'Robinson R44', R66: 'Robinson R66',
+  AS50: 'Airbus AS350 Écureuil', AS55: 'Airbus AS355 Écureuil 2',
+  AS65: 'Airbus AS365 Dauphin', AS21: 'Schleicher ASK 21 (glider)',
+  EC20: 'Airbus EC120 Colibri', EC30: 'Airbus EC130', EC35: 'Airbus EC135', EC45: 'Airbus EC145',
+  B06: 'Bell 206 JetRanger', B407: 'Bell 407', B429: 'Bell 429',
+  H500: 'Hughes/MD 500', S76: 'Sikorsky S-76', S92: 'Sikorsky S-92',
+  BD7T: 'Bonanza V35 Turbo', BDOG: 'Beagle Bulldog', VL3: 'JMB VL-3',
+  LGEZ: 'Rutan Long-EZ', LONG: 'Rutan Long-EZ', LANCAIR: 'Lancair',
+  RV6: "Van's RV-6", RV7: "Van's RV-7", RV8: "Van's RV-8", RV10: "Van's RV-10",
+  RV12: "Van's RV-12", RV14: "Van's RV-14",
+  GLID: 'Glider', VENT: 'Schempp-Hirth Ventus', NIMB: 'Schempp-Hirth Nimbus',
+  DISC: 'Schempp-Hirth Discus', JS1J: 'Jonker JS1', ASTR: 'Astir glider',
+  DG10: 'DG-100 (glider)', DG15: 'DG-150 (glider)', DG80: 'DG-800 (glider)',
+  DG1T: 'DG-1000T (glider)',
+  B738: 'Boeing 737-800', B739: 'Boeing 737-900', B38M: 'Boeing 737 MAX 8',
+  B39M: 'Boeing 737 MAX 9', B78X: 'Boeing 787-10',
+  A319: 'Airbus A319', A320: 'Airbus A320', A321: 'Airbus A321', A20N: 'Airbus A320neo',
+  A21N: 'Airbus A321neo',
+  CRJ2: 'Bombardier CRJ-200', CRJ7: 'Bombardier CRJ-700', CRJ9: 'Bombardier CRJ-900',
+  E170: 'Embraer E-170', E75L: 'Embraer E-175 (long wing)', E190: 'Embraer E-190',
+  E195: 'Embraer E-195',
+  MD83: 'McDonnell Douglas MD-83', MD88: 'McDonnell Douglas MD-88',
+  H60: 'Sikorsky UH-60 Black Hawk', GYRO: 'Gyroplane',
+}
+function expandType(type) {
+  if (!type) return null
+  return TYPE_DESC[String(type).toUpperCase()] || type
+}
+
+// Population grid for the leaderboard's pop-impact explainer (computed live, so
+// it works before the backfill column is populated). Optional.
+let POPGRID = null
+try { POPGRID = loadPopGrid('public/population_density.json') } catch { POPGRID = null }
+const POP_SCALE = 1000 // pop_impact-per-ft that maps to impact_index = 1 (keep in sync with leaderboard)
+// Airports near the field (code/lat/lon/field-elevation ft) for origin/dest
+// inference and on-ground detection in boot enrichment.
+const ENRICH_AP = [
+  { code: 'KBDU', lat: 40.0394, lon: -105.2258, elev: 5288 },
+  { code: 'KBJC', lat: 39.9088, lon: -105.1172, elev: 5673 },
+  { code: 'KEIK', lat: 40.0098, lon: -105.0488, elev: 5130 },
+  { code: 'KLMO', lat: 40.1636, lon: -105.1636, elev: 5055 },
+  { code: 'KAPA', lat: 39.5701, lon: -104.8493, elev: 5885 },
+  { code: 'KGXY', lat: 40.4348, lon: -104.6331, elev: 4697 },
+  { code: 'KFNL', lat: 40.4518, lon: -105.0166, elev: 5016 },
+  { code: 'KDEN', lat: 39.8617, lon: -104.6731, elev: 5434 },
+]
+function distNmAp(la1, lo1, la2, lo2) {
+  const dLat = (la1 - la2) * 60
+  const dLon = (lo1 - lo2) * 60 * Math.cos(((la1 + la2) / 2) * Math.PI / 180)
+  return Math.hypot(dLat, dLon)
+}
+function nearestAp(lat, lon) {
+  let best = null, bestD = Infinity
+  for (const ap of ENRICH_AP) {
+    const d = distNmAp(lat, lon, ap.lat, ap.lon)
+    if (d < bestD) { bestD = d; best = ap }
+  }
+  return { ...best, dist: bestD }
+}
 
 // JSON file-backed ledger store. Each instance owns one file (e.g.
 // data/reports.json) and serializes concurrent mutations through a single
@@ -381,57 +471,8 @@ function excursionsApiPlugin() {
             if (/PA44|DA42|BE58|BE55|BE76/.test(type)) return 'ga_twin'
             return 'ga_single'
           }
-          // ICAO type code → human-readable description. Used as a
-          // fallback when neither the schools file nor special-use
-          // registry has a description for the tail.
-          const TYPE_DESC = {
-            C152: 'Cessna 152', C172: 'Cessna Skyhawk 172', C72R: 'Cessna 172R Skyhawk',
-            C182: 'Cessna Skylane 182', C206: 'Cessna Stationair 206', C210: 'Cessna Centurion 210',
-            P28A: 'Piper Cherokee/Warrior PA-28', P28B: 'Piper Cherokee 180', PA28: 'Piper Cherokee PA-28',
-            P28R: 'Piper Arrow PA-28R', PA46: 'Piper Malibu/Mirage', PA44: 'Piper Seminole',
-            PA25: 'Piper Pawnee (tow plane)', PA18: 'Piper Super Cub (tow plane)',
-            DV20: 'Diamond Katana DV20', DA20: 'Diamond Katana DA20', DA40: 'Diamond Diamond Star',
-            DA42: 'Diamond Twin Star',
-            SR20: 'Cirrus SR20', SR22: 'Cirrus SR22', S22T: 'Cirrus SR22T',
-            M20P: 'Mooney M20P', M20J: 'Mooney M20J', M20K: 'Mooney M20K',
-            BE33: 'Beechcraft Bonanza 33', BE35: 'Beechcraft Bonanza V35', BE36: 'Beechcraft Bonanza A36',
-            BE55: 'Beechcraft Baron 55', BE58: 'Beechcraft Baron 58', BE76: 'Beechcraft Duchess',
-            BE9L: 'Beechcraft King Air', BE95: 'Beechcraft Travel Air', BE40: 'Beechjet 400',
-            C25A: 'Cessna Citation CJ2', C25B: 'Cessna Citation CJ3', C25C: 'Cessna Citation CJ4',
-            C501: 'Cessna Citation I/SP', C525: 'Cessna CitationJet', C551: 'Cessna Citation II/SP',
-            C560: 'Cessna Citation V', C56X: 'Cessna Citation Excel', C680: 'Cessna Citation Sovereign',
-            C68A: 'Cessna Citation Latitude', C750: 'Cessna Citation X',
-            CL30: 'Bombardier Challenger 300', CL35: 'Bombardier Challenger 350',
-            CL60: 'Bombardier Challenger 600',
-            GALX: 'Gulfstream G200', G200: 'Gulfstream G200', H25B: 'Hawker 800',
-            LJ40: 'Learjet 40', LJ60: 'Learjet 60',
-            E55P: 'Embraer Phenom 300', E50P: 'Embraer Phenom 100', SF50: 'Cirrus Vision Jet',
-            TBM7: 'Daher TBM 700', TBM8: 'Daher TBM 850', TBM9: 'Daher TBM 900',
-            PC12: 'Pilatus PC-12', PC24: 'Pilatus PC-24', DHC6: 'De Havilland Twin Otter',
-            R22: 'Robinson R22', R44: 'Robinson R44', R66: 'Robinson R66',
-            AS50: 'Airbus AS350 Écureuil', AS55: 'Airbus AS355 Écureuil 2',
-            AS65: 'Airbus AS365 Dauphin', AS21: 'Schleicher ASK 21 (glider)',
-            EC20: 'Airbus EC120 Colibri', EC30: 'Airbus EC130', EC35: 'Airbus EC135', EC45: 'Airbus EC145',
-            B06: 'Bell 206 JetRanger', B407: 'Bell 407', B429: 'Bell 429',
-            H500: 'Hughes/MD 500', S76: 'Sikorsky S-76', S92: 'Sikorsky S-92',
-            BD7T: 'Bonanza V35 Turbo', BDOG: 'Beagle Bulldog', VL3: 'JMB VL-3',
-            LGEZ: 'Rutan Long-EZ', LONG: 'Rutan Long-EZ', LANCAIR: 'Lancair',
-            RV6: "Van's RV-6", RV7: "Van's RV-7", RV8: "Van's RV-8", RV10: "Van's RV-10",
-            RV12: "Van's RV-12", RV14: "Van's RV-14",
-            GLID: 'Glider', VENT: 'Schempp-Hirth Ventus', NIMB: 'Schempp-Hirth Nimbus',
-            DISC: 'Schempp-Hirth Discus', JS1J: 'Jonker JS1', ASTR: 'Astir glider',
-            DG10: 'DG-100 (glider)', DG15: 'DG-150 (glider)', DG80: 'DG-800 (glider)',
-            DG1T: 'DG-1000T (glider)',
-            B738: 'Boeing 737-800', B739: 'Boeing 737-900', B38M: 'Boeing 737 MAX 8',
-            B39M: 'Boeing 737 MAX 9', B78X: 'Boeing 787-10',
-            A319: 'Airbus A319', A320: 'Airbus A320', A321: 'Airbus A321', A20N: 'Airbus A320neo',
-            A21N: 'Airbus A321neo',
-            CRJ2: 'Bombardier CRJ-200', CRJ7: 'Bombardier CRJ-700', CRJ9: 'Bombardier CRJ-900',
-            E170: 'Embraer E-170', E75L: 'Embraer E-175 (long wing)', E190: 'Embraer E-190',
-            E195: 'Embraer E-195',
-            MD83: 'McDonnell Douglas MD-83', MD88: 'McDonnell Douglas MD-88',
-            H60: 'Sikorsky UH-60 Black Hawk', GYRO: 'Gyroplane',
-          }
+          // ICAO type code → human-readable description lives at module scope
+          // (shared TYPE_DESC); descOf falls back to it below.
           const descOf = (type, tail) => {
             if (specialUseMap.get(tail)?.aircraft_desc) return specialUseMap.get(tail).aircraft_desc
             if (schoolAcDesc.get(tail)) return schoolAcDesc.get(tail)
@@ -1083,6 +1124,65 @@ function excursionsApiPlugin() {
               }
             }
           } catch (e) { console.error('[excursions-boot] live error:', e.message) }
+
+          // ── Enrich live tracks for the kiosk Impact / Welcome slides ──
+          // base/purpose/school/desc from the per-tail backfill classification
+          // (tracks table, latest row per call); origin/dest/landed/on_ground_min
+          // from the flight's own band geometry. A visitor with no history keeps
+          // base=null (⇒ not KBDU-based) and still gets an expanded type from
+          // the shared TYPE_DESC map.
+          try {
+            const liveTails = [...new Set(liveTracks.map((t) => t.call).filter((c) => c && c !== '?'))]
+            const tailInfo = new Map()
+            if (liveTails.length) {
+              // Pick the latest NON-NULL value for each field independently —
+              // purpose/base/desc are sparse, so the most-recent row may lack
+              // a value other rows have.
+              const infoRes = await db.queryDb(
+                `SELECT call,
+                   (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base,
+                   (array_agg(purpose      ORDER BY date DESC) FILTER (WHERE purpose      IS NOT NULL))[1] AS purpose,
+                   (array_agg(school       ORDER BY date DESC) FILTER (WHERE school       IS NOT NULL))[1] AS school,
+                   (array_agg(desc_text    ORDER BY date DESC) FILTER (WHERE desc_text    IS NOT NULL))[1] AS descr
+                 FROM tracks WHERE call = ANY($1) GROUP BY call`,
+                [liveTails],
+              )
+              for (const r of infoRes.rows) tailInfo.set(r.call, r)
+            }
+            const GROUND_AGL = 200 // ft above field elevation still counts as "on ground"
+            const NEAR_NM = 2.5    // a track end this close to a field = a landing there
+            for (const t of liveTracks) {
+              const info = tailInfo.get(t.call)
+              t.base = info?.base || null
+              t.purpose = info?.purpose || null
+              t.school = info?.school || t.school || null
+              t.desc = info?.descr || expandType(t.type) // expanded aircraft type
+              t.origin = null; t.dest = null; t.landed = false; t.on_ground_min = null
+              const pts = (t.bands || []).flatMap((b) => b.points || [])
+              if (pts.length >= 2) {
+                const p0 = pts[0], pN = pts[pts.length - 1]
+                const o = nearestAp(p0[0], p0[1]); if (o.dist <= 3) t.origin = o.code
+                const d = nearestAp(pN[0], pN[1])
+                if (d.dist <= NEAR_NM) {
+                  t.dest = d.code
+                  const groundCeil = d.elev + GROUND_AGL
+                  if (pN[2] != null && pN[2] <= groundCeil) {
+                    // Walk back over consecutive trailing on-ground points near the field
+                    let i = pts.length - 1
+                    while (i > 0) {
+                      const p = pts[i - 1]
+                      if (p[2] != null && p[2] <= groundCeil && nearestAp(p[0], p[1]).dist <= NEAR_NM) i--
+                      else break
+                    }
+                    const start = pts[i]
+                    const hasTs = pN.length > 3 && start.length > 3
+                    t.on_ground_min = hasTs ? Math.max(0, (pN[3] - start[3]) / 60000) : null
+                    t.landed = t.on_ground_min != null ? t.on_ground_min >= 5 : true
+                  }
+                }
+              }
+            }
+          } catch (e) { console.error('[excursions-boot] enrich error:', e.message) }
 
           // ── Merge live tracks into per-tail active aggregation ──
           // The active SQL above only scans the historical `tracks` table,
@@ -2576,29 +2676,47 @@ function noiseApiPlugin() {
       })
 
       // GET /api/noise/leaderboard?days=90&limit=20&by=tail|base|school
-      //                            [&homeBase=KBDU][&origin=local|transient]
+      //                            [&airport=KBDU][&origin=local|transient]
       //
-      // Public leaderboard API. Returns top entities ranked by clean flight
-      // miles (total miles minus excursion miles) over the last N days.
+      // Public leaderboard API. Ranks entities by a Good-Neighbor composite
+      // score over the last N days that rewards flying OFTEN while staying clean
+      // and low-impact over the (populated) noise-abatement zones:
+      //
+      //   score = flights × (1 − excursion_rate) × 1/(1 + K·impact_per_nm)
+      //     flights        — frequency reward (more flights ranks higher)
+      //     excursion_rate — excursion miles / total miles (least excursions)
+      //     impact_per_nm  — severity-weighted excursion miles (red×3, orange×2,
+      //                      yellow×1) per mile flown = impact over populated
+      //                      areas per path length (the VNAP zones are the
+      //                      protected residential areas)
       //
       // Filters (all optional, combinable):
-      //   homeBase — restrict to aircraft whose HOME base (tracks.base_airport)
-      //              is this airport, e.g. ?homeBase=KBDU returns only KBDU-based
-      //              tails, ranked among themselves. Comma-separates for multiple.
-      //              This is the "based here" filter; it is NOT an operating-
-      //              airport filter — the backfill records each aircraft's home
-      //              field, not the field a given flight operated at.
+      //   airport  — restrict to aircraft whose HOME base (tracks.base_airport)
+      //              is this airport, e.g. ?airport=KBDU. Comma-separates for
+      //              multiple. Aliases: homeBase, base. This is the "based here"
+      //              filter — the backfill records each aircraft's home field.
       //   origin   — local | transient. Per-flight geometric classification
-      //              (within vs beyond the local radius). Distinct from homeBase:
+      //              (within vs beyond the local radius). Distinct from airport:
       //              a based aircraft can fly transient, a visitor can fly local.
       //
       // Response shape:
-      //   { generated_at, window: {days, from, to}, by, home_base, origin,
-      //     entries: [{ name, flights, total_nm, clean_nm, excursion_nm,
-      //       clean_pct, red_pct, orange_pct, yellow_pct }] }
+      //   { generated_at, window: {days, from, to}, by, airport, home_base,
+      //     origin, scoring, entries: [{ rank, name, flights, total_nm, clean_nm,
+      //       excursion_nm, weighted_exc_nm, clean_pct, red_pct, orange_pct,
+      //       yellow_pct, excursion_rate, pop_impact, impact_basis, impact_index,
+      //       score, score_pct }] }
+      // impact_basis is 'population' once the pop_impact backfill has run, else
+      // 'zone_proxy' (severity-weighted abatement-zone excursion per mile).
+      let popColEnsured = false
       server.middlewares.use('/api/noise/leaderboard', async (req, res, next) => {
         if (req.method !== 'GET') return next()
         try {
+          // Ensure the pop_impact column exists so SUM(pop_impact) is safe even
+          // before the backfill recompute has run (it reads NULL → zone_proxy).
+          if (!popColEnsured) {
+            await db.queryDb('ALTER TABLE tracks ADD COLUMN IF NOT EXISTS pop_impact REAL').catch(() => {})
+            popColEnsured = true
+          }
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const days = Math.min(3650, Math.max(1, parseInt(u.searchParams.get('days') || '90')))
           const limit = Math.min(100, Math.max(1, parseInt(u.searchParams.get('limit') || '20')))
@@ -2615,7 +2733,8 @@ function noiseApiPlugin() {
           // (buildFilters) `base` already filters tracks.base_airport (the home
           // field), so the leaderboard now matches. There is no operating-
           // airport dimension in the backfill to filter on.
-          const homeBaseRaw = u.searchParams.get('homeBase') || u.searchParams.get('base')
+          // `airport` is the preferred name; `homeBase`/`base` kept as aliases.
+          const homeBaseRaw = u.searchParams.get('airport') || u.searchParams.get('homeBase') || u.searchParams.get('base')
           if (homeBaseRaw) {
             const bases = homeBaseRaw.split(',').map(b => b.trim()).filter(Boolean)
             if (bases.length === 1) { params.push(bases[0]); extra.push(`base_airport = $${params.length}`) }
@@ -2625,7 +2744,10 @@ function noiseApiPlugin() {
           const origin = (originRaw === 'local' || originRaw === 'transient') ? originRaw : null
           if (origin) { params.push(origin); extra.push(`origin = $${params.length}`) }
           const extraSql = extra.length ? ' AND ' + extra.join(' AND ') : ''
-          params.push(limit)
+          // Fetch a wide candidate set so the JS composite score (below) isn't
+          // pre-truncated by the SQL pre-sort; we slice to `limit` after scoring.
+          const candidateLimit = Math.max(limit, 500)
+          params.push(candidateLimit)
           const limP = `$${params.length}`
 
           let sql
@@ -2638,7 +2760,10 @@ function noiseApiPlugin() {
                      round((SUM(len_red_ft + len_orange_ft + len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS excursion_nm,
                      round((SUM(len_red_ft) / ${FT_PER_NM})::numeric, 1) AS red_nm,
                      round((SUM(len_orange_ft) / ${FT_PER_NM})::numeric, 1) AS orange_nm,
-                     round((SUM(len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS yellow_nm
+                     round((SUM(len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS yellow_nm,
+                     round((SUM(3 * len_red_ft + 2 * len_orange_ft + len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS weighted_exc_nm,
+                     SUM(pop_impact) AS pop_impact_sum,
+                     SUM(len_total_ft) AS len_total_ft_sum
               FROM tracks
               WHERE date >= $1 AND len_total_ft > 0 AND base_airport IS NOT NULL${extraSql}
               GROUP BY base_airport
@@ -2655,7 +2780,10 @@ function noiseApiPlugin() {
                      round((SUM(len_red_ft + len_orange_ft + len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS excursion_nm,
                      round((SUM(len_red_ft) / ${FT_PER_NM})::numeric, 1) AS red_nm,
                      round((SUM(len_orange_ft) / ${FT_PER_NM})::numeric, 1) AS orange_nm,
-                     round((SUM(len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS yellow_nm
+                     round((SUM(len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS yellow_nm,
+                     round((SUM(3 * len_red_ft + 2 * len_orange_ft + len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS weighted_exc_nm,
+                     SUM(pop_impact) AS pop_impact_sum,
+                     SUM(len_total_ft) AS len_total_ft_sum
               FROM tracks
               WHERE date >= $1 AND len_total_ft > 0 AND school IS NOT NULL${extraSql}
               GROUP BY school
@@ -2674,7 +2802,10 @@ function noiseApiPlugin() {
                      round((SUM(len_red_ft + len_orange_ft + len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS excursion_nm,
                      round((SUM(len_red_ft) / ${FT_PER_NM})::numeric, 1) AS red_nm,
                      round((SUM(len_orange_ft) / ${FT_PER_NM})::numeric, 1) AS orange_nm,
-                     round((SUM(len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS yellow_nm
+                     round((SUM(len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS yellow_nm,
+                     round((SUM(3 * len_red_ft + 2 * len_orange_ft + len_yellow_ft) / ${FT_PER_NM})::numeric, 1) AS weighted_exc_nm,
+                     SUM(pop_impact) AS pop_impact_sum,
+                     SUM(len_total_ft) AS len_total_ft_sum
               FROM tracks
               WHERE date >= $1 AND len_total_ft > 0${extraSql}
               GROUP BY call
@@ -2685,12 +2816,64 @@ function noiseApiPlugin() {
           }
 
           const r = await db.queryDb(sql, params)
-          const entries = r.rows.map(row => ({
-            ...row,
-            clean_pct: row.total_nm > 0 ? Math.round(row.clean_nm / row.total_nm * 1000) / 10 : 0,
-            red_pct: row.total_nm > 0 ? Math.round(row.red_nm / row.total_nm * 1000) / 10 : 0,
-            orange_pct: row.total_nm > 0 ? Math.round(row.orange_nm / row.total_nm * 1000) / 10 : 0,
-            yellow_pct: row.total_nm > 0 ? Math.round(row.yellow_nm / row.total_nm * 1000) / 10 : 0,
+
+          // ── Good-Neighbor composite score ──
+          // Rank biases toward aircraft that fly OFTEN while staying clean and
+          // low-impact over the (populated) abatement zones:
+          //   score = flights × cleanliness × impactFactor
+          //     flights      — frequency reward (linear: more flights ranks higher)
+          //     cleanliness  — 1 − excursion_rate (fraction of path length clean)
+          //     impactFactor — 1 / (1 + K · impact_per_nm), where impact_per_nm is
+          //                    severity-weighted excursion miles (red×3, orange×2,
+          //                    yellow×1) per mile flown — "impact over populated
+          //                    areas per path length".
+          // impact_index feeds impactFactor = 1/(1+impact_index). Two bases:
+          //   population — real people-weighted noise per ft (pop_impact column),
+          //                normalized by POP_SCALE. Used once backfill populates it.
+          //   zone_proxy — severity-weighted excursion nm per nm flown × ZONE_K.
+          //                Fallback before pop_impact is computed.
+          const POP_SCALE = 1000 // pop_impact-per-ft that maps to impact_index = 1
+          const ZONE_K = 12
+          const scored = r.rows.map(row => {
+            const total = Number(row.total_nm) || 0
+            const exc = Number(row.excursion_nm) || 0
+            const wexc = Number(row.weighted_exc_nm) || 0
+            const lenFt = Number(row.len_total_ft_sum) || 0
+            const popImpact = row.pop_impact_sum == null ? null : Number(row.pop_impact_sum)
+            const excursion_rate = total > 0 ? exc / total : 0
+            let impact_index, impact_basis
+            if (popImpact != null && lenFt > 0) {
+              impact_index = (popImpact / lenFt) / POP_SCALE
+              impact_basis = 'population'
+            } else {
+              impact_index = ZONE_K * (total > 0 ? wexc / total : 0)
+              impact_basis = 'zone_proxy'
+            }
+            const cleanliness = 1 - Math.min(1, excursion_rate)
+            const impactFactor = 1 / (1 + impact_index)
+            const score = (Number(row.flights) || 0) * cleanliness * impactFactor
+            return {
+              ...row,
+              clean_pct: total > 0 ? Math.round(row.clean_nm / total * 1000) / 10 : 0,
+              red_pct: total > 0 ? Math.round(row.red_nm / total * 1000) / 10 : 0,
+              orange_pct: total > 0 ? Math.round(row.orange_nm / total * 1000) / 10 : 0,
+              yellow_pct: total > 0 ? Math.round(row.yellow_nm / total * 1000) / 10 : 0,
+              excursion_rate: Math.round(excursion_rate * 1000) / 10, // %
+              pop_impact: popImpact == null ? null : Math.round(popImpact),
+              impact_basis,
+              impact_index: Math.round(impact_index * 1000) / 1000,
+              score: Math.round(score * 100) / 100,
+            }
+          })
+          // Sort by composite score (desc), then flights as a tiebreak.
+          scored.sort((a, b) => b.score - a.score || b.flights - a.flights)
+          const top = scored.slice(0, limit)
+          // Normalize to a 0–100 leaderboard score relative to the top entry.
+          const maxScore = top.length ? top[0].score : 0
+          const entries = top.map((e, i) => ({
+            rank: i + 1,
+            ...e,
+            score_pct: maxScore > 0 ? Math.round(e.score / maxScore * 1000) / 10 : 0,
           }))
 
           const now = new Date()
@@ -2701,12 +2884,80 @@ function noiseApiPlugin() {
             generated_at: now.toISOString(),
             window: { days, from: cutoff, to: now.toISOString().slice(0, 10) },
             by,
-            home_base: homeBaseRaw || null,
+            airport: homeBaseRaw || null,
+            home_base: homeBaseRaw || null, // alias, back-compat
             origin: origin || null,
+            scoring: {
+              formula: 'flights × (1 − excursion_rate) × 1/(1 + impact_index)',
+              impact_index: 'population basis: people-weighted noise per ft / POP_SCALE; ' +
+                'else zone_proxy: ZONE_K × severity-weighted excursion nm (red×3, orange×2, yellow×1) per nm',
+              impact_basis: entries.length ? entries[0].impact_basis : null,
+              sort: 'score desc, flights desc',
+            },
             entries,
           }))
         } catch (e) {
           console.error('[noise-api] /leaderboard error', e)
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: String(e) }))
+        }
+      })
+
+      // GET /api/noise/impact-explain?tail=N3547L[&days=30][&limit=12]
+      // Per-flight, per-SEGMENT population-noise impact for one tail, computed
+      // live from the population grid + stored geometry (works before the
+      // pop_impact backfill). Drives the single-tail explainer map: each
+      // segment's `contribution` = length_ft × people/km² × (REF_AGL/AGL)².
+      server.middlewares.use('/api/noise/impact-explain', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const tail = (u.searchParams.get('tail') || '').trim().toUpperCase()
+          const days = Math.min(365, Math.max(1, parseInt(u.searchParams.get('days') || '30')))
+          const limit = Math.min(50, Math.max(1, parseInt(u.searchParams.get('limit') || '12')))
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          if (!tail) { res.statusCode = 400; return res.end(JSON.stringify({ error: 'tail required' })) }
+          if (!POPGRID) { res.statusCode = 503; return res.end(JSON.stringify({ error: 'population grid unavailable' })) }
+          const cutoff = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10)
+          const q = await db.queryDb(
+            `SELECT id, date, type, base_airport AS base, points
+             FROM tracks WHERE call = $1 AND date >= $2 AND points IS NOT NULL
+             ORDER BY date DESC LIMIT $3`,
+            [tail, cutoff, limit],
+          )
+          let sumImpact = 0, sumLen = 0, maxContribution = 0
+          const flights = q.rows.map((row) => {
+            const pts = (row.points || []).map((p) => [p[0], p[1], p[2]])
+            const { total, lenFt, segments } = impactSegments(pts, POPGRID.popAt, distFt)
+            sumImpact += total; sumLen += lenFt
+            for (const s of segments) if (s.contribution > maxContribution) maxContribution = s.contribution
+            return {
+              id: row.id, date: row.date, type: row.type, type_desc: expandType(row.type), base: row.base,
+              points: pts,
+              contributions: segments.map((s) => s.contribution),
+              segments,
+              len_ft: Math.round(lenFt),
+              pop_impact: Math.round(total),
+              impact_index: lenFt > 0 ? Math.round((total / lenFt) / POP_SCALE * 1000) / 1000 : 0,
+            }
+          })
+          res.setHeader('Cache-Control', 'public, max-age=120')
+          res.end(JSON.stringify({
+            tail, days, window: { from: cutoff, to: new Date().toISOString().slice(0, 10) },
+            pop_scale: POP_SCALE, kernel: POP_KERNEL,
+            totals: {
+              flights: flights.length,
+              len_ft: Math.round(sumLen),
+              pop_impact: Math.round(sumImpact),
+              impact_index: sumLen > 0 ? Math.round((sumImpact / sumLen) / POP_SCALE * 1000) / 1000 : 0,
+              max_contribution: maxContribution,
+            },
+            flights,
+          }))
+        } catch (e) {
+          console.error('[noise-api] /impact-explain error', e)
           res.statusCode = 500
           res.setHeader('Content-Type', 'application/json')
           res.end(JSON.stringify({ error: String(e) }))

@@ -14,6 +14,18 @@ import pg from 'pg'
 import { classifyPoint, distFt } from './src/geo.js'
 import { NOISE_ZONES } from './src/noiseZones.js'
 import { nearestAirport, nmFrom, KBDU, LOCAL_RADIUS_NM } from './src/airports.js'
+import { loadPopGrid, trackPopImpact } from './src/popGrid.js'
+
+// Population grid for per-track population-noise impact. Optional — if the file
+// is missing, pop_impact is left null and the leaderboard falls back to its
+// zone-severity proxy.
+let POP = null
+try {
+  POP = loadPopGrid('public/population_density.json')
+  console.log('[backfill] population grid loaded for pop_impact')
+} catch (e) {
+  console.warn('[backfill] population grid NOT loaded — pop_impact skipped:', e.message)
+}
 
 const VIOLATION_RADIUS_NM = 6
 const MAP_RADIUS_NM = 6
@@ -108,6 +120,7 @@ async function migrate() {
     ['in_ring', 'BOOLEAN DEFAULT false'],
     ['school', 'TEXT'],
     ['bands', 'JSONB'],
+    ['pop_impact', 'REAL'], // population-weighted noise impact (nullable until computed)
   ]
   for (const [name, type] of cols) {
     await pool.query(`ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ${name} ${type}`).catch(() => {})
@@ -158,6 +171,7 @@ function classifyTrack(points, call, src, schoolMap) {
       len_total_ft: 0, len_red_ft: 0, len_orange_ft: 0, len_yellow_ft: 0,
       in_ring: false, school: schoolMap.get(call) || null,
       bands: [],
+      pop_impact: 0,
     }
   }
 
@@ -264,6 +278,7 @@ function classifyTrack(points, call, src, schoolMap) {
     in_ring,
     school: schoolMap.get(call) || null,
     bands: bands.map(b => ({ klass: b.k, points: b.p })),
+    pop_impact: POP ? trackPopImpact(allPts, POP.popAt, distFt) : null,
   }
 }
 
@@ -301,13 +316,13 @@ async function main() {
             year=$2, date=$3, base_airport=$4, origin=$5, worst_class=$6,
             seg_total=$7, seg_red=$8, seg_orange=$9, seg_yellow=$10, seg_purple=$11,
             len_total_ft=$12, len_red_ft=$13, len_orange_ft=$14, len_yellow_ft=$15, len_purple_ft=$16,
-            in_ring=$17, school=$18, bands=$19
+            in_ring=$17, school=$18, bands=$19, pop_impact=$20
           WHERE id=$1
         `, [
           id, stats.year, stats.date, stats.base_airport, stats.origin, stats.worst_class,
           stats.seg_total, stats.seg_red, stats.seg_orange, stats.seg_yellow, stats.seg_purple,
           stats.len_total_ft, stats.len_red_ft, stats.len_orange_ft, stats.len_yellow_ft, stats.len_purple_ft,
-          stats.in_ring, stats.school, JSON.stringify(stats.bands),
+          stats.in_ring, stats.school, JSON.stringify(stats.bands), stats.pop_impact,
         ])
       }
       await client.query('COMMIT')
@@ -324,6 +339,41 @@ async function main() {
       const remaining = await pool.query('SELECT count(*)::int AS n FROM tracks WHERE year IS NULL')
       console.log(`[backfill] ${processed} done, ${remaining.rows[0].n} remaining`)
     }
+  }
+
+  // --- Recompute pop_impact for already-backfilled rows missing it ---
+  // (Backfill above only touches year-IS-NULL rows; this populates the new
+  // pop_impact column on existing history without rewriting other columns.)
+  if (POP) {
+    let popDone = 0
+    while (true) {
+      const res = await pool.query(
+        'SELECT id, points FROM tracks WHERE pop_impact IS NULL AND points IS NOT NULL ORDER BY id LIMIT $1',
+        [BATCH]
+      )
+      if (res.rows.length === 0) break
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        for (const row of res.rows) {
+          const impact = trackPopImpact(row.points || [], POP.popAt, distFt)
+          await client.query('UPDATE tracks SET pop_impact=$2 WHERE id=$1', [row.id, impact])
+        }
+        await client.query('COMMIT')
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {})
+        console.error('[backfill] pop_impact batch error, retrying...', e.message)
+        client.release()
+        continue
+      }
+      client.release()
+      popDone += res.rows.length
+      if (popDone % 5000 < BATCH) {
+        const rem = await pool.query('SELECT count(*)::int n FROM tracks WHERE pop_impact IS NULL AND points IS NOT NULL')
+        console.log(`[backfill] pop_impact: ${popDone} done, ${rem.rows[0].n} remaining`)
+      }
+    }
+    console.log(`[backfill] pop_impact recompute complete (${popDone} rows)`)
   }
 
   // Final stats

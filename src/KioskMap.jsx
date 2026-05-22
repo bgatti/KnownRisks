@@ -220,7 +220,7 @@ function EnsureOverlaySvg() {
 // Population iso-contours as true cubic-bezier SVG paths (Catmull-Rom → C
 // commands, closed). One <path> per density level, drawn into a dedicated
 // blend pane. fill-rule evenodd lets a level's nested loops cut holes.
-function ContourLayer({ levels }) {
+export function ContourLayer({ levels }) {
   const map = useMap()
   useEffect(() => {
     if (!levels.length) return
