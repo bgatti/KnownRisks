@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
-import { loadPopGrid, impactSegments, POP_KERNEL } from './src/popGrid.js'
+import { loadPopGrid, impactSegments, pointImpact, POP_KERNEL } from './src/popGrid.js'
 import { distFt, classifyPoint } from './src/geo.js'
 import { NOISE_ZONES } from './src/noiseZones.js'
 
@@ -112,11 +112,35 @@ function purposeOf(type, tail, isSchoolFleet, specialUse) {
   return 'ga_single'
 }
 
-// Use the stored (curated) purpose when it's meaningful; otherwise fall back to
-// the type-based classifier so tow planes / gliders / GA aren't left "unknown".
-// (Stored purpose already encodes school→training and special-use, so the
-// fallback only needs the type heuristic.)
+// Special-use registry (medivac/firefighting/military/science/etc.) loaded at
+// module scope so resolvePurpose can use it as the authoritative override —
+// e.g. NEON's Twin Otters and Scientific Aviation's Mooneys flagged as 'science'
+// even when the historical tracks.purpose says ga_single/unknown.
+let SPECIAL_USE_MAP = new Map()
+try {
+  const sud = JSON.parse(fs.readFileSync('public/special_use_aircraft.json', 'utf8'))
+  for (const ac of sud.aircraft || []) if (ac.tail && ac.use) SPECIAL_USE_MAP.set(ac.tail.toUpperCase(), ac.use)
+} catch { /* optional */ }
+
+// Resolve a tail's purpose:
+//   1. Special-use registry (curated overrides) — wins over everything.
+//   2. PA25/PA18 type → always tow_plane (the airframe IS a tow plane even when
+//      it's in a glider-school fleet; the pilot may be training, but the
+//      aircraft's purpose is tow).
+//   3. Stored (curated) purpose on the tracks row when meaningful.
+//   4. Type-based classifier fallback so gliders / GA aren't "unknown".
 function resolvePurpose(stored, type, tail) {
+  const su = tail ? SPECIAL_USE_MAP.get(String(tail).toUpperCase()) : null
+  if (su) return purposeOf(type, tail, false, su)
+  const T = String(type || '').toUpperCase()
+  // Type-unambiguous airframes always win over school-fleet membership:
+  //   PA25/PA18 = Pawnee / Super Cub → tow planes (even at glider schools).
+  //   PIAT/PC6  = Pilatus Porter      → tow plane (SSB's tow).
+  //   GLID/AS2x/DG*/VENT/NIMB/DISC/SGS/ASTR/JS1J = gliders → glider purpose
+  //   even when in a school's fleet (the airframe IS a glider; the student
+  //   pilot's training context doesn't change that).
+  if (/^(PA25|PA18|PIAT|PC6)$/.test(T)) return 'tow_plane'
+  if (/^(GLID|VENT|NIMB|DISC|SGS|ASTR|JS1J|JS\d|LS\d|PIK|ASW|SZD)/.test(T) || /^AS\d/.test(T) || /^DG\d/.test(T)) return 'glider'
   if (stored && stored !== 'unknown') return stored
   return purposeOf(type, tail, false, null)
 }
@@ -238,19 +262,36 @@ function impactGrade(score) {
   return 'F'
 }
 
-// Build classified bands (klass + points) from a slice of points by walking
-// them through classifyPoint(NOISE_ZONES). Used to attach geometry to each
-// recent-landings cycle so the kiosk can still draw colored tracks.
-function bandsFromPoints(pts) {
+// Build classified bands from a slice of points. When `popAt` is provided,
+// each point is a 4-tuple [lat, lon, alt, impact] where impact is the
+// per-point population-noise intensity (same kernel family as impact_index;
+// pre-purpose). Each band also carries an aggregate `impact` (sum over its
+// points) and `impact_share` (fraction of the track total) so kiosks that
+// don't autoscale per-point can still color whole bands relatively. Points
+// stay backwards-compatible: legacy clients reading p[0..2] keep working.
+function bandsFromPoints(pts, popAt) {
   const out = []
   let cur = null
+  let trackTotal = 0
   for (const p of pts) {
     const klass = classifyPoint(p[0], p[1], p[2], NOISE_ZONES)
-    const pt = [p[0], p[1], p[2]]
-    if (cur && cur.klass === klass) cur.points.push(pt)
-    else { if (cur) out.push(cur); cur = { klass, points: [pt] } }
+    let imp = null
+    if (popAt) {
+      imp = Math.round(pointImpact(p[0], p[1], p[2], popAt))
+      trackTotal += imp
+    }
+    const pt = imp != null ? [p[0], p[1], p[2], imp] : [p[0], p[1], p[2]]
+    if (cur && cur.klass === klass) { cur.points.push(pt); if (imp != null) cur.impact += imp }
+    else {
+      if (cur) out.push(cur)
+      cur = { klass, points: [pt] }
+      if (imp != null) cur.impact = imp
+    }
   }
   if (cur) out.push(cur)
+  if (popAt && trackTotal > 0) {
+    for (const b of out) b.impact_share = Math.round((b.impact / trackTotal) * 1000) / 1000
+  }
   return out
 }
 
@@ -3245,9 +3286,9 @@ function noiseApiPlugin() {
       // Recent full-stop landings at `airport`, each with its population-noise
       // impact computed from the SAME kernel as the leaderboard / impact-explain
       // (no separate Lmax model), plus classified bands[] and authoritative
-      // visitor-gating values (airborne_min, origin_dist_nm). The training ×2
-      // weighting is baked into impact_score server-side so the kiosk never
-      // double-counts it; impact_index stays the pure population value.
+      // visitor-gating values (airborne_min, origin_dist_nm). impact_score is
+      // an alias of impact_index — purpose-aware weighting (training ×2, slide
+      // cadence) is a caller concern; this API returns the physical measurement.
       server.middlewares.use('/api/noise/recent-landings', async (req, res, next) => {
         if (req.method !== 'GET') return next()
         try {
@@ -3290,8 +3331,13 @@ function noiseApiPlugin() {
           const minutesMs = minutes * 60000
           const LANDING_NEAR_NM = 4 // last fix can be a few nm out when ADS-B drops near ground
           const TNG_GAP_MS = 5 * 60000 // consecutive cycles closer than this = touch-and-go, same flight
+          const SESSION_GAP_MS = 30 * 60000 // a gap > 30 min in the track ends a "session" (next fix starts a new flight)
+          const MIN_AIRBORNE_MIN = 3 // anything shorter is sensor noise (spurious blip), not a real flight
           const out = []
           for (const t of tracks) {
+            // Skip ADSBExchange anonymized tails (~hex) — these are PIA/TIS-B
+            // relays that often shadow real aircraft and produce phantom cycles.
+            if ((t.call || '').trim().startsWith('~')) continue
             const pts = (t.points || []).slice().sort((a, b) => (a[3] || 0) - (b[3] || 0))
             if (pts.length < 5) continue
             // 1. Extract cycles, keeping only those whose final fix is at THIS
@@ -3312,7 +3358,9 @@ function noiseApiPlugin() {
               atAirport.push({ takeoff_ts: f.takeoff_ts, landing_ts: f.landing_ts, tMs, lMs })
             }
             // 2. Sort by takeoff and merge T&Gs at THIS field: consecutive cycles
-            //    whose ground gap is < TNG_GAP_MS collapse into one flight.
+            //    whose ground gap is < TNG_GAP_MS collapse into one flight. (A
+            //    busy tow session collapsing into one row is expected — pilots
+            //    don't shut down between tows.)
             atAirport.sort((a, b) => a.tMs - b.tMs)
             const merged = []
             for (const f of atAirport) {
@@ -3323,8 +3371,11 @@ function noiseApiPlugin() {
             // 3. Fallback for sparse tracks: extractTowCycles needs enough points
             //    to detect phases — sparse day-tracks (just a few fixes) yield 0
             //    cycles even when the aircraft clearly ended at the airport.
-            //    If so, and the LAST fix is within LANDING_NEAR_NM at low altitude
-            //    (≤ field elev + 1500 ft) and within the window, infer one landing.
+            //    Walk backward from the last fix to find the START of the
+            //    most-recent contiguous session (gap > SESSION_GAP_MS ends it).
+            //    Using first-airborne-of-day produced impossible 15-hour
+            //    "flights" for aircraft that flew morning AND afternoon with
+            //    a tracking blackout between.
             if (merged.length === 0) {
               const last = pts[pts.length - 1]
               const tdAlt = ap.elev + 1500
@@ -3332,15 +3383,30 @@ function noiseApiPlugin() {
               if (last && last[3] != null && (nowMs - last[3]) <= minutesMs
                   && last[2] != null && last[2] <= tdAlt
                   && distNmAp(last[0], last[1], ap.lat, ap.lon) <= LANDING_NEAR_NM) {
+                // Walk backward: find the start of the last contiguous session.
+                let sessionStart = pts.length - 1
+                for (let i = pts.length - 1; i > 0; i--) {
+                  const gap = (pts[i][3] || 0) - (pts[i - 1][3] || 0)
+                  if (gap > SESSION_GAP_MS) { sessionStart = i; break }
+                  sessionStart = i - 1
+                }
+                // Within that session, find the first airborne fix (the takeoff).
                 let firstAir = null
-                for (const p of pts) { if (p[2] != null && p[2] > groundCeil) { firstAir = p; break } }
-                const tMs = (firstAir?.[3]) || pts[0][3] || last[3]
+                for (let i = sessionStart; i < pts.length; i++) {
+                  const p = pts[i]
+                  if (p[2] != null && p[2] > groundCeil) { firstAir = p; break }
+                }
+                const tMs = (firstAir?.[3]) || pts[sessionStart][3] || last[3]
                 const lMs = last[3]
                 merged.push({ takeoff_ts: new Date(tMs).toISOString(), landing_ts: new Date(lMs).toISOString(), tMs, lMs })
               }
             }
             for (const cy of merged) {
               const tMs = cy.tMs, lMs = cy.lMs
+              // Drop sub-MIN_AIRBORNE_MIN "flights" — these come from sensor
+              // blips and corrupt the impact ranking with grade=F entries that
+              // never really flew.
+              if ((lMs - tMs) < MIN_AIRBORNE_MIN * 60000) continue
               const cyclePts = pts.filter(p => p[3] >= tMs && p[3] <= lMs)
               if (cyclePts.length < 3) continue
 
@@ -3351,7 +3417,11 @@ function noiseApiPlugin() {
               const purpose = resolvePurpose(inf.purpose, t.type, tail)
               const { total, lenFt } = impactSegments(cyclePts, POPGRID.popAt, distFt)
               const impact_index = lenFt > 0 ? (total / lenFt) / POP_SCALE : 0
-              const impact_score = Math.round(impact_index * (purpose === 'training' ? 2 : 1) * 1000) / 1000
+              // impact_score is now an alias of impact_index — no purpose
+              // multiplier here. Behaviour over people is a physical measurement;
+              // purpose-aware weighting (training ×2, slide cadence, etc.) is a
+              // caller concern (badges, sort order, slide rotation).
+              const impact_score = Math.round(impact_index * 1000) / 1000
               out.push({
                 tail, type: t.type || null, desc: inf.descr || expandType(t.type),
                 icon_url: aircraftIconUrl(t.type, tail),
@@ -3365,7 +3435,7 @@ function noiseApiPlugin() {
                 impact_index: Math.round(impact_index * 1000) / 1000,
                 impact_score, impact_grade: impactGrade(impact_score),
                 pop_impact: Math.round(total),
-                bands: bandsFromPoints(cyclePts),
+                bands: bandsFromPoints(cyclePts, POPGRID.popAt),
               })
             }
           }
@@ -3375,8 +3445,8 @@ function noiseApiPlugin() {
             airport, minutes, pop_scale: POP_SCALE,
             scoring: {
               impact_index: 'population-noise per ft / POP_SCALE (same kernel as leaderboard & impact-explain)',
-              impact_score: 'impact_index × purpose weight (training ×2, baked in here — do NOT re-apply)',
-              impact_grade: 'A<0.3 B<0.6 C<1.2 D<2.0 F (on impact_score)',
+              impact_score: 'alias of impact_index (no purpose multiplier — purpose-aware ranking is a caller concern)',
+              impact_grade: 'A<0.3 B<0.6 C<1.2 D<2.0 F',
             },
             count: out.length,
             landings: out,
@@ -3408,7 +3478,7 @@ function noiseApiPlugin() {
         try {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const daysRaw = parseInt(u.searchParams.get('days') || '1', 10)
-          const days = Number.isFinite(daysRaw) ? Math.min(Math.max(daysRaw, 1), 90) : 1
+          const days = Number.isFinite(daysRaw) ? Math.min(Math.max(daysRaw, 1), 1825) : 1
           // Scope: ?airport / ?operatedAt → "operated" (origin|dest|base == airport,
           // i.e. the field's own activity incl. visitors). ?homeBase / ?base →
           // "based" (home-field only). none → "all" (whole corridor).
@@ -3416,6 +3486,13 @@ function noiseApiPlugin() {
           const baseRaw = (u.searchParams.get('homeBase') || u.searchParams.get('base') || '').trim().toUpperCase()
           const scopeAirport = opRaw || baseRaw || null
           const scope = opRaw ? 'operated' : baseRaw ? 'based' : 'all'
+          // Source: 'combined' (default) merges live_tracks (recent, real flight
+          // cycles) with the historic `tracks` table (older, surfaces rare
+          // categories like firefighting/science that live's 38-day window misses).
+          // 'live' = live_tracks only (old default). 'historic' = tracks only.
+          const sourceParam = (u.searchParams.get('source') || 'combined').toLowerCase()
+          const wantLive = sourceParam !== 'historic'
+          const wantHist = sourceParam !== 'live'
 
           const fmtDay = (d) => d.toISOString().slice(0, 10)
           const today = new Date()
@@ -3429,99 +3506,177 @@ function noiseApiPlugin() {
           res.setHeader('Cache-Control', 'public, max-age=300')
 
           // 5-min result cache — cycle extraction over the window is heavy.
-          const ckey = `${days}|${scope}|${scopeAirport || ''}`
+          const ckey = `${days}|${scope}|${scopeAirport || ''}|${sourceParam}`
           const cc = missionsCache.get(ckey)
           if (cc && Date.now() - cc.ts < 300000) return res.end(cc.body)
 
-          const range = await db.loadLiveFromDbByDateRange(fromDate, toDate)
-          const tracks = range.tracks || []
           const respond = (obj) => { const b = JSON.stringify(obj); missionsCache.set(ckey, { ts: Date.now(), body: b }); res.end(b) }
-          if (!tracks.length) {
-            return respond({ date: toDate, days, from: fromDate, to: toDate, airport: scopeAirport, scope, total: 0, categories: {} })
-          }
 
-          // Merge same-aircraft point sets across days, sorted by timestamp.
+          // ── LIVE: gather tracks + build byHex (cycle-based flight counts later)
+          let range = null
           const byHex = new Map()
-          for (const t of tracks) {
-            const hex = t.hex || t.call
-            if (!hex || !Array.isArray(t.points) || !t.points.length) continue
-            if (!byHex.has(hex)) {
-              byHex.set(hex, { hex, call: t.call || hex, reg: t.reg || '', type: t.type || '', points: [] })
+          if (wantLive) {
+            range = await db.loadLiveFromDbByDateRange(fromDate, toDate)
+            for (const t of (range.tracks || [])) {
+              const hex = t.hex || t.call
+              if (!hex || !Array.isArray(t.points) || !t.points.length) continue
+              if (!byHex.has(hex)) byHex.set(hex, { hex, call: t.call || hex, reg: t.reg || '', type: t.type || '', points: [] })
+              const g = byHex.get(hex)
+              for (const p of t.points) g.points.push(p)
             }
-            const g = byHex.get(hex)
-            for (const p of t.points) g.points.push(p)
           }
 
-          // base/purpose/school per tail (latest non-null) from the tracks
-          // classification — needed for both scope filtering and categorizing.
-          const allCalls = [...new Set([...byHex.values()].map((g) => g.call).filter(Boolean))]
+          // ── HISTORIC: aggregate per-tail flight counts from the tracks table
+          //    (surfaces rare categories — firefighting, science, search_rescue —
+          //    that the ~38-day live store misses). Scope on historic is base-only
+          //    (no per-flight geometry in the aggregate), so an "operated" scope
+          //    falls back to base_airport=airport for the historic slice.
+          let histRows = []
+          if (wantHist) {
+            const where = ['date >= $1', 'date <= $2', 'seg_total > 0']
+            const params = [fromDate, toDate]
+            if (scope !== 'all') {
+              params.push(scopeAirport)
+              where.push(`base_airport = $${params.length}`)
+            }
+            const r = await db.queryDb(
+              `SELECT call, MAX(type) AS type, MAX(school) AS school, MAX(base_airport) AS base,
+                 MAX(purpose) AS purpose, count(*)::int AS flights
+               FROM tracks WHERE ${where.join(' AND ')}
+               GROUP BY call`, params)
+            histRows = r.rows || []
+          }
+
+          // ── One info lookup for LIVE tails (historic rows carry their own
+          //    classification columns — use them directly).
           const info = new Map()
-          if (allCalls.length) {
+          const liveCalls = [...new Set([...byHex.values()].map((g) => g.call).filter(Boolean))]
+          if (liveCalls.length) {
             const r = await db.queryDb(
               `SELECT call,
                  (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base,
                  (array_agg(purpose      ORDER BY date DESC) FILTER (WHERE purpose      IS NOT NULL))[1] AS purpose,
                  (array_agg(school       ORDER BY date DESC) FILTER (WHERE school       IS NOT NULL))[1] AS school
-               FROM tracks WHERE call = ANY($1) GROUP BY call`, [allCalls])
+               FROM tracks WHERE call = ANY($1) GROUP BY call`, [liveCalls])
             for (const row of r.rows) info.set(row.call, row)
           }
 
-          // Apply scope BEFORE the expensive cycle extraction. "operated" =
-          // origin|dest (nearest field to first/last fix) or home base == airport.
-          const candidates = []
-          for (const g of byHex.values()) {
-            g.points.sort((a, b) => (a[3] || 0) - (b[3] || 0))
-            const base = info.get(g.call)?.base || null
-            if (scope === 'all') { candidates.push(g); continue }
-            if (scope === 'based') { if (base === scopeAirport) candidates.push(g); continue }
-            const first = g.points[0], last = g.points[g.points.length - 1]
-            const o = nearestAp(first[0], first[1]), d = nearestAp(last[0], last[1])
-            const originCode = o.dist <= 3 ? o.code : null
-            const destCode = d.dist <= 3 ? d.code : null
-            if (originCode === scopeAirport || destCode === scopeAirport || base === scopeAirport) candidates.push(g)
+          // ── LIVE: scope filter + cycle extraction → per-aircraft flight count
+          const perTail = new Map() // tail -> { tail, type, school, base, storedPurpose, live, hist }
+          let liveTotal = 0
+          if (wantLive && byHex.size) {
+            const zoneConfig = await adsb.loadZones()
+            const gapMs = MISSION_GROUND_GAP_MIN * 60_000
+            const candidates = []
+            for (const g of byHex.values()) {
+              g.points.sort((a, b) => (a[3] || 0) - (b[3] || 0))
+              const base = info.get(g.call)?.base || null
+              if (scope === 'all') { candidates.push(g); continue }
+              if (scope === 'based') { if (base === scopeAirport) candidates.push(g); continue }
+              const first = g.points[0], last = g.points[g.points.length - 1]
+              const o = nearestAp(first[0], first[1]), d = nearestAp(last[0], last[1])
+              const originCode = o.dist <= 3 ? o.code : null
+              const destCode = d.dist <= 3 ? d.code : null
+              if (originCode === scopeAirport || destCode === scopeAirport || base === scopeAirport) candidates.push(g)
+            }
+            for (const g of candidates) {
+              const cycles = adsb.extractTowCycles(g.hex, g.call, g.points, zoneConfig)
+                .filter(f => f.takeoff_ts && f.landing_ts)
+                .sort((a, b) => new Date(a.takeoff_ts) - new Date(b.takeoff_ts))
+              const merged = []
+              for (const f of cycles) {
+                const prev = merged[merged.length - 1]
+                if (prev && (new Date(f.takeoff_ts) - new Date(prev.landing_ts)) < gapMs) prev.landing_ts = f.landing_ts
+                else merged.push({ takeoff_ts: f.takeoff_ts, landing_ts: f.landing_ts })
+              }
+              if (!merged.length) continue
+              const inf = info.get(g.call) || {}
+              const tail = g.call || g.reg || g.hex
+              const p = perTail.get(tail) || { tail, type: g.type || inf.type || '', school: inf.school || null, base: inf.base || null, storedPurpose: inf.purpose || null, live: 0, hist: 0 }
+              p.live += merged.length
+              liveTotal += merged.length
+              perTail.set(tail, p)
+            }
           }
 
-          const zoneConfig = await adsb.loadZones()
-          const gapMs = MISSION_GROUND_GAP_MIN * 60_000
-          const flightsByHex = new Map()
-          let totalFlights = 0
-          for (const g of candidates) {
-            const cycles = adsb.extractTowCycles(g.hex, g.call, g.points, zoneConfig)
-              .filter(f => f.takeoff_ts && f.landing_ts)
-              .sort((a, b) => new Date(a.takeoff_ts) - new Date(b.takeoff_ts))
-            const merged = []
-            for (const f of cycles) {
-              const prev = merged[merged.length - 1]
-              if (prev && (new Date(f.takeoff_ts) - new Date(prev.landing_ts)) < gapMs) prev.landing_ts = f.landing_ts
-              else merged.push({ takeoff_ts: f.takeoff_ts, landing_ts: f.landing_ts })
+          // ── HISTORIC: merge per-tail counts into perTail
+          let histTotal = 0
+          for (const row of histRows) {
+            const tail = row.call
+            if (!tail) continue
+            let p = perTail.get(tail)
+            if (!p) {
+              p = { tail, type: row.type || '', school: row.school || null, base: row.base || null, storedPurpose: row.purpose || null, live: 0, hist: 0 }
+              perTail.set(tail, p)
+            } else {
+              if (!p.type && row.type) p.type = row.type
+              if (!p.school && row.school) p.school = row.school
+              if (!p.base && row.base) p.base = row.base
+              if (!p.storedPurpose && row.purpose) p.storedPurpose = row.purpose
             }
-            if (merged.length) {
-              flightsByHex.set(g.hex, { tail: g.call || g.reg || g.hex, type: g.type, flights: merged.length })
-              totalFlights += merged.length
-            }
+            p.hist += row.flights
+            histTotal += row.flights
           }
 
-          // Categorize by purpose; count = flights, not aircraft
+          // ── CATEGORIZE by purpose; each aircraft shows live + hist breakdown
           const categories = {}
-          for (const v of flightsByHex.values()) {
-            const inf = info.get(v.tail)
-            const purpose = resolvePurpose(inf?.purpose, v.type, v.tail)
+          for (const p of perTail.values()) {
+            const purpose = resolvePurpose(p.storedPurpose, p.type, p.tail)
             if (!categories[purpose]) categories[purpose] = { count: 0, aircraft: [] }
-            categories[purpose].count += v.flights
+            const flights = p.live + p.hist
+            categories[purpose].count += flights
             categories[purpose].aircraft.push({
-              tail: v.tail, type: v.type || '', school: inf?.school || null, base: inf?.base || null, flights: v.flights,
+              tail: p.tail, type: p.type, school: p.school, base: p.base,
+              flights, live: p.live, hist: p.hist,
             })
           }
           const sorted = Object.entries(categories).filter(([, v]) => v.count > 0).sort((a, b) => b[1].count - a[1].count)
           const result = {}
-          for (const [k, v] of sorted) result[k] = v
+          for (const [k, v] of sorted) { v.aircraft.sort((a, b) => b.flights - a.flights); result[k] = v }
+
+          // ── Editorial rollup for the kiosk: five buckets, overlapping on
+          // purpose (school-tow gliders count in BOTH training and glider).
+          //   training = direct school flights + 2× school-tow (the gliders
+          //              schools tow up are training events too).
+          //   glider   = 2× ALL tow_plane (each tow ≈ one glider release, but
+          //              ADS-B-equipped tow planes are visible while many
+          //              pure gliders aren't — the ×2 corrects the gap) +
+          //              observed pure-glider flights.
+          //   med_fire_rescue = medevac + firefighting + search_rescue +
+          //                     helicopter_ops (based med helo + CAP SAR fold in).
+          //   research = science + patrol (CAP).
+          //   other    = everything else (ga_single, ga_twin, biz_jet,
+          //              helicopter, turboprop, experimental, unknown, …).
+          // The five sums do NOT equal `total` — they're an overlapping VIEW.
+          const cnt = (k) => result[k]?.count || 0
+          const towAcft = result.tow_plane?.aircraft || []
+          const schoolTow = towAcft.filter(a => a.school).reduce((s, a) => s + a.flights, 0)
+          const ROLLUP_OWNED = new Set(['training', 'tow_plane', 'glider', 'medevac', 'medivac', 'medivac_possible', 'firefighting', 'search_rescue', 'helicopter_ops', 'science', 'patrol'])
+          const otherCount = Object.entries(result).reduce((s, [k, v]) => s + (ROLLUP_OWNED.has(k) ? 0 : v.count), 0)
+          const rollup = {
+            training: { count: cnt('training') + 2 * schoolTow,
+              includes: `direct school flights (${cnt('training')}) + 2× school-tow (${schoolTow}) — gliders trained at schools` },
+            glider: { count: 2 * cnt('tow_plane') + cnt('glider'),
+              includes: `2× tow_plane (${cnt('tow_plane')}) + observed pure-glider (${cnt('glider')}) — ×2 corrects for non-ADS-B gliders` },
+            med_fire_rescue: { count: cnt('medevac') + cnt('medivac') + cnt('medivac_possible') + cnt('firefighting') + cnt('search_rescue') + cnt('helicopter_ops') + cnt('patrol'),
+              includes: `medevac (${cnt('medevac')}) + firefighting (${cnt('firefighting')}) + search_rescue (${cnt('search_rescue')}) + helicopter_ops (${cnt('helicopter_ops')}) + patrol/CAP (${cnt('patrol')})` },
+            research: { count: cnt('science'),
+              includes: `science (${cnt('science')}) — NEON / Scientific Aviation` },
+            other: { count: otherCount,
+              includes: 'ga_single + ga_twin + biz_jet + helicopter + turboprop + experimental + unknown + everything not in the four above' },
+            note: 'Overlapping editorial view (school-tow gliders count in BOTH training and glider). Sum ≠ total.',
+          }
 
           respond({
             date: toDate, days, from: fromDate, to: toDate,
-            airport: scopeAirport, scope,
-            updated_at: range.updated_at || new Date().toISOString(),
-            days_loaded: range.days_loaded ?? null,
-            total: totalFlights, categories: result,
+            airport: scopeAirport, scope, source: sourceParam,
+            updated_at: range?.updated_at || new Date().toISOString(),
+            days_loaded: range?.days_loaded ?? null,
+            sources: {
+              live: { flights: liveTotal, days_loaded: range?.days_loaded ?? null, note: 'cycle-based, operated/based/all scope via geometry' },
+              historic: { flights: histTotal, from: fromDate, to: toDate, note: 'tracks-table per-row; non-all scope filters by base_airport only' },
+            },
+            total: liveTotal + histTotal, categories: result, rollup,
           })
         } catch (e) {
           console.error('[noise-api] /missions error', e)
