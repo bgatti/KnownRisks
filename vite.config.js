@@ -4,7 +4,8 @@ import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import { loadPopGrid, impactSegments, POP_KERNEL } from './src/popGrid.js'
-import { distFt } from './src/geo.js'
+import { distFt, classifyPoint } from './src/geo.js'
+import { NOISE_ZONES } from './src/noiseZones.js'
 
 // Load .env.local into process.env BEFORE importing db.js (which reads
 // DATABASE_URL at module load). Lets local dev point at Railway's Postgres
@@ -84,11 +85,299 @@ function expandType(type) {
   return TYPE_DESC[String(type).toUpperCase()] || type
 }
 
+// Purpose classifier: special-use → school → type-code heuristic → GA default.
+// Mirrors the flight-ops endpoint's classifier; module-scope so the leaderboard,
+// recent-landings, boot, and missions all classify consistently.
+function purposeOf(type, tail, isSchoolFleet, specialUse) {
+  if (specialUse) {
+    const m = {
+      medivac: 'medevac', medivac_possible: 'medevac', firefighting: 'firefighting',
+      law_enforcement: 'law_enforcement', military: 'military', government: 'government',
+      patrol: 'patrol', science: 'science', survey: 'survey', search_rescue: 'search_rescue',
+      helicopter_ops: 'helicopter_ops',
+    }
+    if (m[specialUse]) return m[specialUse]
+  }
+  if (isSchoolFleet) return 'training'
+  if (!type) return 'unknown'
+  const T = String(type).toUpperCase()
+  if (/PA25|PA18/.test(T)) return 'tow_plane'
+  if (/GLID|VENT|AS2|DG\d|NIMB|DISC|SGS/.test(T)) return 'glider'
+  if (/R22|R44|R66|AS50|EC\d|B06|B407|H500|S76/.test(T)) return 'helicopter'
+  if (/B73|B38|B78|A3[12]|A2[01]|CRJ|E7[05]|E19|MD[89]/.test(T)) return 'airline'
+  if (/C25|C5[0-6]|C6[89]|C750|CL[36]|LJ\d|GL[AX]|H25|E55P|E50P|SF50/.test(T)) return 'biz_jet'
+  if (/PC12|TBM|DHC6/.test(T)) return 'turboprop'
+  if (/RV[78]|LGEZ|VL3|LONG|LANCAIR/.test(T)) return 'experimental'
+  if (/PA44|DA42|BE58|BE55|BE76/.test(T)) return 'ga_twin'
+  return 'ga_single'
+}
+
+// Use the stored (curated) purpose when it's meaningful; otherwise fall back to
+// the type-based classifier so tow planes / gliders / GA aren't left "unknown".
+// (Stored purpose already encodes school→training and special-use, so the
+// fallback only needs the type heuristic.)
+function resolvePurpose(stored, type, tail) {
+  if (stored && stored !== 'unknown') return stored
+  return purposeOf(type, tail, false, null)
+}
+
+// Aircraft icon URL — placeholder-now, upgradable-later. Resolution order:
+//   1. per-tail override   (public/aircraft_icons.json → { "byTail": { "N123": url } })
+//   2. per-type override   (… → { "byType": { "C172": url } })  (a bare map also works)
+//   3. reserved convention /aircraft-icons/<TYPE>.png  (file may not exist yet;
+//      the UI should fall back to the type label on load error)
+// To upgrade later: drop real URLs into public/aircraft_icons.json, or repoint
+// the convention at a CDN here — no consumer change needed.
+let AIRCRAFT_ICONS = { byType: {}, byTail: {} }
+try {
+  const j = JSON.parse(fs.readFileSync('public/aircraft_icons.json', 'utf8'))
+  AIRCRAFT_ICONS = { byType: j.byType || (j.byTail ? {} : j) || {}, byTail: j.byTail || {} }
+} catch { /* optional registry */ }
+function aircraftIconUrl(type, tail) {
+  const T = (type || '').toUpperCase()
+  const N = (tail || '').toUpperCase()
+  if (N && AIRCRAFT_ICONS.byTail[N]) return AIRCRAFT_ICONS.byTail[N]
+  if (T && AIRCRAFT_ICONS.byType[T]) return AIRCRAFT_ICONS.byType[T]
+  return T ? `/aircraft-icons/${T}` : null
+}
+
+// Resolve a real aircraft PHOTO URL for a type code via Wikipedia page images
+// (same source as NoiseReport.jsx), keyed by the expanded type name. Cached;
+// negative results cached briefly so we don't hammer the API.
+const PHOTO_CACHE = new Map() // TYPE -> { ts, url|null }
+const PHOTO_TTL = 7 * 24 * 3600 * 1000
+const PHOTO_NEG_TTL = 6 * 3600 * 1000
+async function resolveAircraftPhoto(type) {
+  const key = (type || '').toUpperCase()
+  if (!key) return null
+  const c = PHOTO_CACHE.get(key)
+  if (c && Date.now() - c.ts < (c.url ? PHOTO_TTL : PHOTO_NEG_TTL)) return c.url
+  let url = null
+  try {
+    const q = `${expandType(key) || key} aircraft`
+    const api = 'https://en.wikipedia.org/w/api.php?action=query&format=json&prop=pageimages' +
+      '&piprop=thumbnail&pithumbsize=200&generator=search&gsrlimit=1&gsrsearch=' + encodeURIComponent(q)
+    const ctrl = new AbortController()
+    const to = setTimeout(() => ctrl.abort(), 3500)
+    const r = await fetch(api, { signal: ctrl.signal, headers: { 'User-Agent': 'FlightSafe-Noise/1.0 (aircraft icon resolver)' } })
+    clearTimeout(to)
+    if (r.ok) {
+      const d = await r.json()
+      const pages = d?.query?.pages
+      const first = pages ? Object.values(pages)[0] : null
+      url = first?.thumbnail?.source || null
+    }
+  } catch { /* network/timeout → negative cache */ }
+  PHOTO_CACHE.set(key, { ts: Date.now(), url })
+  return url
+}
+
+// Last-resort placeholder (plane glyph + type label) when no photo resolves.
+function placeholderIconSvg(type) {
+  const t = String(type || '?').toUpperCase().slice(0, 5)
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="12" fill="#0f172a"/>
+  <path d="M32 7 L35.5 29 L55 33 L35.5 37 L33.5 53 L32 44 L30.5 53 L28.5 37 L9 33 L28.5 29 Z" fill="#38bdf8" fill-opacity="0.9"/>
+  <text x="32" y="60" text-anchor="middle" font-family="ui-sans-serif,system-ui,sans-serif" font-size="10" font-weight="600" fill="#e2e8f0">${t}</text>
+</svg>`
+}
+
+// Serves /aircraft-icons/<name> as a real image — an uploaded file from
+// public/aircraft-icons/ if present, else a generated SVG placeholder.
+// Registered as a middleware so it intercepts before the SPA HTML catch-all
+// (which was returning index.html for these paths).
+function aircraftIconsPlugin() {
+  return {
+    name: 'aircraft-icons',
+    configureServer(server) {
+      server.middlewares.use('/aircraft-icons', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const name = decodeURIComponent((req.url || '').split('?')[0].replace(/^\/+/, ''))
+          if (!name || name.includes('/') || name.includes('..')) return next()
+          const dir = path.resolve('public/aircraft-icons')
+          const stem = name.replace(/\.(svg|png|jpg|jpeg)$/i, '')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          // 1. A real uploaded file wins (per-type image drop-in).
+          for (const c of [name, `${stem}.png`, `${stem}.jpg`, `${stem}.svg`]) {
+            const fp = path.join(dir, c)
+            if (fp.startsWith(dir) && fs.existsSync(fp)) {
+              const ext = c.split('.').pop().toLowerCase()
+              res.setHeader('Content-Type', ext === 'svg' ? 'image/svg+xml' : ext === 'png' ? 'image/png' : 'image/jpeg')
+              res.setHeader('Cache-Control', 'public, max-age=86400')
+              return res.end(fs.readFileSync(fp))
+            }
+          }
+          // 2. A real aircraft photo for the type (Wikipedia, cached) → redirect.
+          const photo = await resolveAircraftPhoto(stem)
+          if (photo) {
+            res.statusCode = 302
+            res.setHeader('Location', photo)
+            res.setHeader('Cache-Control', 'public, max-age=86400')
+            return res.end()
+          }
+          // 3. Last resort: generated placeholder (rare — obscure/unmatched type).
+          res.setHeader('Content-Type', 'image/svg+xml')
+          res.setHeader('Cache-Control', 'public, max-age=3600')
+          return res.end(placeholderIconSvg(stem))
+        } catch { return next() }
+      })
+      console.log('[aircraft-icons] registered /aircraft-icons/<TYPE> (file → photo redirect → placeholder)')
+    },
+  }
+}
+
+// Letter grade from an impact_score (population impact_index × purpose weight).
+// Lower impact = better grade. Thresholds are tunable.
+function impactGrade(score) {
+  if (score == null) return null
+  if (score < 0.3) return 'A'
+  if (score < 0.6) return 'B'
+  if (score < 1.2) return 'C'
+  if (score < 2.0) return 'D'
+  return 'F'
+}
+
+// Build classified bands (klass + points) from a slice of points by walking
+// them through classifyPoint(NOISE_ZONES). Used to attach geometry to each
+// recent-landings cycle so the kiosk can still draw colored tracks.
+function bandsFromPoints(pts) {
+  const out = []
+  let cur = null
+  for (const p of pts) {
+    const klass = classifyPoint(p[0], p[1], p[2], NOISE_ZONES)
+    const pt = [p[0], p[1], p[2]]
+    if (cur && cur.klass === klass) cur.points.push(pt)
+    else { if (cur) out.push(cur); cur = { klass, points: [pt] } }
+  }
+  if (cur) out.push(cur)
+  return out
+}
+
 // Population grid for the leaderboard's pop-impact explainer (computed live, so
 // it works before the backfill column is populated). Optional.
 let POPGRID = null
 try { POPGRID = loadPopGrid('public/population_density.json') } catch { POPGRID = null }
 const POP_SCALE = 1000 // pop_impact-per-ft that maps to impact_index = 1 (keep in sync with leaderboard)
+const LEADERBOARD_FLIGHT_EXP = 1.5 // super-linear frequency emphasis
+const LEADERBOARD_ZONE_K = 12      // zone-proxy impact scaling (pre-population fallback)
+const missionsCache = new Map()    // key `${days}|${scope}|${airport}` → { ts, body } (5-min TTL)
+
+// Build the leaderboard from the LIVE store (live_tracks), which is the current
+// per-day capture — the historical `tracks` table lags real time. Flights are
+// real takeoff→landing cycles (touch-and-goes merged), base/purpose come from
+// the call→tracks classification, and impact uses the population grid. Returns
+// the response object, or null if the live store has no data for the window.
+async function buildLiveLeaderboard({ days, limit, by, homeBaseRaw }) {
+  const FT_PER_NM = 6076
+  const today = new Date()
+  const toDate = today.toISOString().slice(0, 10)
+  const fromD = new Date(today); fromD.setUTCDate(fromD.getUTCDate() - (days - 1))
+  const fromDate = fromD.toISOString().slice(0, 10)
+  const range = await db.loadLiveFromDbByDateRange(fromDate, toDate)
+  const tracks = range.tracks || []
+  if (!tracks.length) return null
+
+  // Merge each aircraft's points across days; sum the per-day stored lengths.
+  const byHex = new Map()
+  for (const t of tracks) {
+    const hex = t.hex || t.call
+    if (!hex) continue
+    let g = byHex.get(hex)
+    if (!g) { g = { hex, call: t.call || hex, type: t.type || '', points: [], lt: 0, lr: 0, lo: 0, ly: 0 }; byHex.set(hex, g) }
+    if (Array.isArray(t.points)) for (const p of t.points) g.points.push(p)
+    g.lt += t.len_total_ft || 0; g.lr += t.len_red_ft || 0; g.lo += t.len_orange_ft || 0; g.ly += t.len_yellow_ft || 0
+  }
+
+  const zoneConfig = await adsb.loadZones()
+  const gapMs = 10 * 60000 // touch-and-go / taxi-back merge threshold
+  const perTail = []
+  for (const g of byHex.values()) {
+    g.points.sort((a, b) => (a[3] || 0) - (b[3] || 0))
+    const cycles = adsb.extractTowCycles(g.hex, g.call, g.points, zoneConfig)
+      .filter(f => f.takeoff_ts && f.landing_ts)
+      .sort((a, b) => new Date(a.takeoff_ts) - new Date(b.takeoff_ts))
+    let flights = 0, lastLand = null
+    for (const f of cycles) {
+      if (lastLand && (new Date(f.takeoff_ts) - new Date(lastLand)) < gapMs) { lastLand = f.landing_ts; continue }
+      flights++; lastLand = f.landing_ts
+    }
+    if (flights === 0) continue
+    const popImpact = POPGRID ? impactSegments(g.points, POPGRID.popAt, distFt).total : null
+    perTail.push({ tail: g.call, type: g.type, flights, lt: g.lt, lr: g.lr, lo: g.lo, ly: g.ly, popImpact })
+  }
+  if (!perTail.length) return null
+
+  // call → base / purpose / school (latest non-null) from the tracks classification.
+  const tails = perTail.map(t => t.tail).filter(Boolean)
+  const info = new Map()
+  if (tails.length) {
+    const r = await db.queryDb(
+      `SELECT call,
+        (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base,
+        (array_agg(purpose ORDER BY date DESC) FILTER (WHERE purpose IS NOT NULL))[1] AS purpose,
+        (array_agg(school ORDER BY date DESC) FILTER (WHERE school IS NOT NULL))[1] AS school
+       FROM tracks WHERE call = ANY($1) GROUP BY call`, [tails])
+    for (const row of r.rows) info.set(row.call, row)
+  }
+
+  const bases = homeBaseRaw ? homeBaseRaw.split(',').map(b => b.trim().toUpperCase()).filter(Boolean) : null
+  const groups = new Map()
+  for (const t of perTail) {
+    const i = info.get(t.tail)
+    const base = i?.base || null
+    if (bases && !(base && bases.includes(base.toUpperCase()))) continue
+    const key = by === 'base' ? base : by === 'school' ? (i?.school || null) : t.tail
+    if (key == null) continue
+    let g = groups.get(key)
+    if (!g) { g = { name: key, flights: 0, lt: 0, lr: 0, lo: 0, ly: 0, popImpact: 0, popKnown: false, type: t.type, school: i?.school || null, base, purpose: resolvePurpose(i?.purpose, t.type, t.tail) }; groups.set(key, g) }
+    g.flights += t.flights; g.lt += t.lt; g.lr += t.lr; g.lo += t.lo; g.ly += t.ly
+    if (t.popImpact != null) { g.popImpact += t.popImpact; g.popKnown = true }
+  }
+  if (!groups.size) return null
+
+  const scored = [...groups.values()].map(g => {
+    const exc_ft = g.lr + g.lo + g.ly
+    const excursion_rate = g.lt > 0 ? exc_ft / g.lt : 0
+    let impact_index, impact_basis
+    if (g.popKnown && g.lt > 0) { impact_index = (g.popImpact / g.lt) / POP_SCALE; impact_basis = 'population' }
+    else { impact_index = LEADERBOARD_ZONE_K * (g.lt > 0 ? (3 * g.lr + 2 * g.lo + g.ly) / g.lt : 0); impact_basis = 'zone_proxy' }
+    const cleanliness = 1 - Math.min(1, excursion_rate)
+    const score = Math.pow(g.flights, LEADERBOARD_FLIGHT_EXP) * cleanliness * (1 / (1 + impact_index))
+    return {
+      name: g.name, type: g.type, school: g.school, base: g.base, purpose: g.purpose,
+      flights: g.flights,
+      total_nm: Math.round(g.lt / FT_PER_NM * 10) / 10,
+      clean_nm: Math.round((g.lt - exc_ft) / FT_PER_NM * 10) / 10,
+      excursion_nm: Math.round(exc_ft / FT_PER_NM * 10) / 10,
+      excursion_rate: Math.round(excursion_rate * 1000) / 10,
+      pop_impact: g.popKnown ? Math.round(g.popImpact) : null,
+      impact_basis, impact_index: Math.round(impact_index * 1000) / 1000,
+      score: Math.round(score * 100) / 100,
+    }
+  })
+  scored.sort((a, b) => b.score - a.score || b.flights - a.flights)
+  const top = scored.slice(0, limit)
+  const maxScore = top.length ? top[0].score : 0
+  const entries = top.map((e, i) => ({
+    rank: i + 1, ...e,
+    icon_url: by === 'tail' ? aircraftIconUrl(e.type, e.name) : null,
+    score_pct: maxScore > 0 ? Math.round(e.score / maxScore * 1000) / 10 : 0,
+  }))
+  return {
+    generated_at: new Date().toISOString(),
+    window: { days, from: fromDate, to: toDate },
+    by, airport: homeBaseRaw || null, home_base: homeBaseRaw || null, origin: null,
+    source: 'live_tracks', days_loaded: range.days_loaded ?? null,
+    scoring: {
+      formula: 'flights^1.5 × (1 − excursion_rate) × 1/(1 + impact_index)',
+      flights_exponent: LEADERBOARD_FLIGHT_EXP,
+      impact_basis: entries.length ? entries[0].impact_basis : null,
+      sort: 'score desc, flights desc',
+    },
+    entries,
+  }
+}
 // Airports near the field (code/lat/lon/field-elevation ft) for origin/dest
 // inference and on-ground detection in boot enrichment.
 const ENRICH_AP = [
@@ -441,36 +730,7 @@ function excursionsApiPlugin() {
           //   2. School fleet membership → 'training'
           //   3. Type-code heuristic (tow_plane, glider, airline, biz_jet, …)
           //   4. Default 'ga_single' / 'ga_twin'
-          const purposeOf = (type, tail, isSchoolFleet, specialUse) => {
-            if (specialUse) {
-              // Map special_use values to a normalized purpose label
-              const m = {
-                medivac: 'medevac',
-                medivac_possible: 'medevac',
-                firefighting: 'firefighting',
-                law_enforcement: 'law_enforcement',
-                military: 'military',
-                government: 'government',
-                patrol: 'patrol',
-                science: 'science',
-                survey: 'survey',
-                search_rescue: 'search_rescue',
-                helicopter_ops: 'helicopter_ops',
-              }
-              if (m[specialUse]) return m[specialUse]
-            }
-            if (isSchoolFleet) return 'training'
-            if (!type) return 'unknown'
-            if (/PA25|PA18/.test(type)) return 'tow_plane'
-            if (/GLID|VENT|AS2|DG\d|NIMB|DISC|SGS/.test(type)) return 'glider'
-            if (/R22|R44|R66|AS50|EC\d|B06|B407|H500|S76/.test(type)) return 'helicopter'
-            if (/B73|B38|B78|A3[12]|A2[01]|CRJ|E7[05]|E19|MD[89]/.test(type)) return 'airline'
-            if (/C25|C5[0-6]|C6[89]|C750|CL[36]|LJ\d|GL[AX]|H25|E55P|E50P|SF50/.test(type)) return 'biz_jet'
-            if (/PC12|TBM|DHC6/.test(type)) return 'turboprop'
-            if (/RV[78]|LGEZ|VL3|LONG|LANCAIR/.test(type)) return 'experimental'
-            if (/PA44|DA42|BE58|BE55|BE76/.test(type)) return 'ga_twin'
-            return 'ga_single'
-          }
+          // (`purposeOf` lives at module scope — shared with the leaderboard etc.)
           // ICAO type code → human-readable description lives at module scope
           // (shared TYPE_DESC); descOf falls back to it below.
           const descOf = (type, tail) => {
@@ -1154,7 +1414,7 @@ function excursionsApiPlugin() {
             for (const t of liveTracks) {
               const info = tailInfo.get(t.call)
               t.base = info?.base || null
-              t.purpose = info?.purpose || null
+              t.purpose = resolvePurpose(info?.purpose, t.type, t.call)
               t.school = info?.school || t.school || null
               t.desc = info?.descr || expandType(t.type) // expanded aircraft type
               t.origin = null; t.dest = null; t.landed = false; t.on_ground_min = null
@@ -2735,6 +2995,22 @@ function noiseApiPlugin() {
           // airport dimension in the backfill to filter on.
           // `airport` is the preferred name; `homeBase`/`base` kept as aliases.
           const homeBaseRaw = u.searchParams.get('airport') || u.searchParams.get('homeBase') || u.searchParams.get('base')
+
+          // Primary source: the LIVE store (current daily captures). The
+          // historical `tracks` SQL below is the fallback for windows the live
+          // store doesn't cover. ?source=tracks forces the historical path.
+          if (u.searchParams.get('source') !== 'tracks') {
+            const live = await buildLiveLeaderboard({ days, limit, by, homeBaseRaw }).catch((e) => {
+              console.error('[noise-api] /leaderboard live agg failed:', e.message); return null
+            })
+            if (live && live.entries.length) {
+              res.setHeader('Content-Type', 'application/json')
+              res.setHeader('Access-Control-Allow-Origin', '*')
+              res.setHeader('Cache-Control', 'public, max-age=300')
+              return res.end(JSON.stringify(live))
+            }
+          }
+
           if (homeBaseRaw) {
             const bases = homeBaseRaw.split(',').map(b => b.trim()).filter(Boolean)
             if (bases.length === 1) { params.push(bases[0]); extra.push(`base_airport = $${params.length}`) }
@@ -2873,6 +3149,7 @@ function noiseApiPlugin() {
           const entries = top.map((e, i) => ({
             rank: i + 1,
             ...e,
+            icon_url: by === 'tail' ? aircraftIconUrl(e.type, e.name) : null,
             score_pct: maxScore > 0 ? Math.round(e.score / maxScore * 1000) / 10 : 0,
           }))
 
@@ -2964,6 +3241,154 @@ function noiseApiPlugin() {
         }
       })
 
+      // GET /api/noise/recent-landings?airport=KBDU&minutes=30
+      // Recent full-stop landings at `airport`, each with its population-noise
+      // impact computed from the SAME kernel as the leaderboard / impact-explain
+      // (no separate Lmax model), plus classified bands[] and authoritative
+      // visitor-gating values (airborne_min, origin_dist_nm). The training ×2
+      // weighting is baked into impact_score server-side so the kiosk never
+      // double-counts it; impact_index stays the pure population value.
+      server.middlewares.use('/api/noise/recent-landings', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const airport = (u.searchParams.get('airport') || 'KBDU').trim().toUpperCase()
+          const minutes = Math.min(720, Math.max(1, parseInt(u.searchParams.get('minutes') || '30')))
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.setHeader('Cache-Control', 'public, max-age=20')
+          const ap = ENRICH_AP.find((a) => a.code === airport)
+          if (!ap) { res.statusCode = 400; return res.end(JSON.stringify({ error: `unknown airport ${airport}` })) }
+          if (!POPGRID) { res.statusCode = 503; return res.end(JSON.stringify({ error: 'population grid unavailable' })) }
+
+          const today = new Date().toISOString().slice(0, 10)
+          const range = await db.loadLiveFromDbByDateRange(today, today)
+          const tracks = range.tracks || []
+
+          // call → base/purpose/school/desc from the historical classification
+          const tails = [...new Set(tracks.map((t) => (t.call || '').trim()).filter(Boolean))]
+          const info = new Map()
+          if (tails.length) {
+            const r = await db.queryDb(
+              `SELECT call,
+                 (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base,
+                 (array_agg(purpose      ORDER BY date DESC) FILTER (WHERE purpose      IS NOT NULL))[1] AS purpose,
+                 (array_agg(school       ORDER BY date DESC) FILTER (WHERE school       IS NOT NULL))[1] AS school,
+                 (array_agg(desc_text    ORDER BY date DESC) FILTER (WHERE desc_text    IS NOT NULL))[1] AS descr
+               FROM tracks WHERE call = ANY($1) GROUP BY call`, [tails])
+            for (const row of r.rows) info.set(row.call, row)
+          }
+
+          const nowMs = Date.now()
+          // Detect cycles the same way /missions does (extractTowCycles), so a
+          // recent landing is found even when ADS-B drops out before touchdown
+          // (common at small GA fields like KBDU — the old on-ground dwell
+          // check returned 0 for those). Override field_elevation_ft so cycle
+          // detection works for non-KBDU airports too.
+          const baseZones = await adsb.loadZones()
+          const zoneConfig = { ...baseZones, field_elevation_ft: ap.elev }
+          const minutesMs = minutes * 60000
+          const LANDING_NEAR_NM = 4 // last fix can be a few nm out when ADS-B drops near ground
+          const TNG_GAP_MS = 5 * 60000 // consecutive cycles closer than this = touch-and-go, same flight
+          const out = []
+          for (const t of tracks) {
+            const pts = (t.points || []).slice().sort((a, b) => (a[3] || 0) - (b[3] || 0))
+            if (pts.length < 5) continue
+            // 1. Extract cycles, keeping only those whose final fix is at THIS
+            //    airport (extractTowCycles with KBDU's threshold also detects
+            //    cycles at neighboring fields like KEIK/KLMO — filter those out
+            //    by landing location, not just time).
+            const atAirport = []
+            for (const f of adsb.extractTowCycles(t.hex, t.call, pts, zoneConfig)) {
+              if (!f.takeoff_ts || !f.landing_ts) continue
+              const tMs = Date.parse(f.takeoff_ts), lMs = Date.parse(f.landing_ts)
+              if (!Number.isFinite(tMs) || !Number.isFinite(lMs)) continue
+              if ((nowMs - lMs) > minutesMs) continue
+              // Endpoint of this cycle (last fix at or before landing_ts).
+              let endPt = null
+              for (const p of pts) { if (p[3] != null && p[3] <= lMs) endPt = p; else if (p[3] > lMs) break }
+              if (!endPt) continue
+              if (distNmAp(endPt[0], endPt[1], ap.lat, ap.lon) > LANDING_NEAR_NM) continue
+              atAirport.push({ takeoff_ts: f.takeoff_ts, landing_ts: f.landing_ts, tMs, lMs })
+            }
+            // 2. Sort by takeoff and merge T&Gs at THIS field: consecutive cycles
+            //    whose ground gap is < TNG_GAP_MS collapse into one flight.
+            atAirport.sort((a, b) => a.tMs - b.tMs)
+            const merged = []
+            for (const f of atAirport) {
+              const prev = merged[merged.length - 1]
+              if (prev && (f.tMs - prev.lMs) < TNG_GAP_MS) { prev.landing_ts = f.landing_ts; prev.lMs = f.lMs }
+              else merged.push({ ...f })
+            }
+            // 3. Fallback for sparse tracks: extractTowCycles needs enough points
+            //    to detect phases — sparse day-tracks (just a few fixes) yield 0
+            //    cycles even when the aircraft clearly ended at the airport.
+            //    If so, and the LAST fix is within LANDING_NEAR_NM at low altitude
+            //    (≤ field elev + 1500 ft) and within the window, infer one landing.
+            if (merged.length === 0) {
+              const last = pts[pts.length - 1]
+              const tdAlt = ap.elev + 1500
+              const groundCeil = ap.elev + 200
+              if (last && last[3] != null && (nowMs - last[3]) <= minutesMs
+                  && last[2] != null && last[2] <= tdAlt
+                  && distNmAp(last[0], last[1], ap.lat, ap.lon) <= LANDING_NEAR_NM) {
+                let firstAir = null
+                for (const p of pts) { if (p[2] != null && p[2] > groundCeil) { firstAir = p; break } }
+                const tMs = (firstAir?.[3]) || pts[0][3] || last[3]
+                const lMs = last[3]
+                merged.push({ takeoff_ts: new Date(tMs).toISOString(), landing_ts: new Date(lMs).toISOString(), tMs, lMs })
+              }
+            }
+            for (const cy of merged) {
+              const tMs = cy.tMs, lMs = cy.lMs
+              const cyclePts = pts.filter(p => p[3] >= tMs && p[3] <= lMs)
+              if (cyclePts.length < 3) continue
+
+              const p0 = cyclePts[0]
+              const o = nearestAp(p0[0], p0[1])
+              const tail = (t.call || '').trim()
+              const inf = info.get(tail) || {}
+              const purpose = resolvePurpose(inf.purpose, t.type, tail)
+              const { total, lenFt } = impactSegments(cyclePts, POPGRID.popAt, distFt)
+              const impact_index = lenFt > 0 ? (total / lenFt) / POP_SCALE : 0
+              const impact_score = Math.round(impact_index * (purpose === 'training' ? 2 : 1) * 1000) / 1000
+              out.push({
+                tail, type: t.type || null, desc: inf.descr || expandType(t.type),
+                icon_url: aircraftIconUrl(t.type, tail),
+                base: inf.base || null, purpose, school: inf.school || null,
+                origin: o.dist <= 3 ? o.code : null, dest: airport,
+                origin_dist_nm: Math.round(distNmAp(p0[0], p0[1], ap.lat, ap.lon) * 10) / 10,
+                landed: true,
+                landed_at: new Date(lMs).toISOString(),
+                on_ground_min: Math.round(Math.max(0, (nowMs - lMs) / 60000) * 10) / 10,
+                airborne_min: Math.round(Math.max(0, (lMs - tMs) / 60000) * 10) / 10,
+                impact_index: Math.round(impact_index * 1000) / 1000,
+                impact_score, impact_grade: impactGrade(impact_score),
+                pop_impact: Math.round(total),
+                bands: bandsFromPoints(cyclePts),
+              })
+            }
+          }
+          out.sort((a, b) => (b.landed_at || '').localeCompare(a.landed_at || ''))
+          res.end(JSON.stringify({
+            generated_at: new Date(nowMs).toISOString(),
+            airport, minutes, pop_scale: POP_SCALE,
+            scoring: {
+              impact_index: 'population-noise per ft / POP_SCALE (same kernel as leaderboard & impact-explain)',
+              impact_score: 'impact_index × purpose weight (training ×2, baked in here — do NOT re-apply)',
+              impact_grade: 'A<0.3 B<0.6 C<1.2 D<2.0 F (on impact_score)',
+            },
+            count: out.length,
+            landings: out,
+          }))
+        } catch (e) {
+          console.error('[noise-api] /recent-landings error', e)
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: String(e) }))
+        }
+      })
+
       // GET /api/noise/missions[?days=N]
       // Completed flights from live capture, categorized by purpose.
       //
@@ -2984,8 +3409,14 @@ function noiseApiPlugin() {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const daysRaw = parseInt(u.searchParams.get('days') || '1', 10)
           const days = Number.isFinite(daysRaw) ? Math.min(Math.max(daysRaw, 1), 90) : 1
+          // Scope: ?airport / ?operatedAt → "operated" (origin|dest|base == airport,
+          // i.e. the field's own activity incl. visitors). ?homeBase / ?base →
+          // "based" (home-field only). none → "all" (whole corridor).
+          const opRaw = (u.searchParams.get('airport') || u.searchParams.get('operatedAt') || '').trim().toUpperCase()
+          const baseRaw = (u.searchParams.get('homeBase') || u.searchParams.get('base') || '').trim().toUpperCase()
+          const scopeAirport = opRaw || baseRaw || null
+          const scope = opRaw ? 'operated' : baseRaw ? 'based' : 'all'
 
-          // UTC date window [fromDate .. toDate]
           const fmtDay = (d) => d.toISOString().slice(0, 10)
           const today = new Date()
           const toDate = fmtDay(today)
@@ -2993,21 +3424,23 @@ function noiseApiPlugin() {
           fromD.setUTCDate(fromD.getUTCDate() - (days - 1))
           const fromDate = fmtDay(fromD)
 
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.setHeader('Cache-Control', 'public, max-age=300')
+
+          // 5-min result cache — cycle extraction over the window is heavy.
+          const ckey = `${days}|${scope}|${scopeAirport || ''}`
+          const cc = missionsCache.get(ckey)
+          if (cc && Date.now() - cc.ts < 300000) return res.end(cc.body)
+
           const range = await db.loadLiveFromDbByDateRange(fromDate, toDate)
           const tracks = range.tracks || []
+          const respond = (obj) => { const b = JSON.stringify(obj); missionsCache.set(ckey, { ts: Date.now(), body: b }); res.end(b) }
           if (!tracks.length) {
-            res.setHeader('Content-Type', 'application/json')
-            res.setHeader('Access-Control-Allow-Origin', '*')
-            res.end(JSON.stringify({
-              date: toDate, days, from: fromDate, to: toDate, total: 0, categories: {},
-            }))
-            return
+            return respond({ date: toDate, days, from: fromDate, to: toDate, airport: scopeAirport, scope, total: 0, categories: {} })
           }
 
-          const zoneConfig = await adsb.loadZones()
-
-          // Merge same-aircraft point sets across days (tracks repeat per day),
-          // sorted by timestamp, so cross-midnight cycles connect.
+          // Merge same-aircraft point sets across days, sorted by timestamp.
           const byHex = new Map()
           for (const t of tracks) {
             const hex = t.hex || t.call
@@ -3019,26 +3452,48 @@ function noiseApiPlugin() {
             for (const p of t.points) g.points.push(p)
           }
 
-          // Extract takeoff→landing cycles, then collapse touch-and-go /
-          // taxi-back: consecutive completed cycles whose ground gap is under
-          // the threshold become a single flight.
-          const gapMs = MISSION_GROUND_GAP_MIN * 60_000
-          const flightsByHex = new Map() // hex -> { tail, type, flights }
-          let totalFlights = 0
+          // base/purpose/school per tail (latest non-null) from the tracks
+          // classification — needed for both scope filtering and categorizing.
+          const allCalls = [...new Set([...byHex.values()].map((g) => g.call).filter(Boolean))]
+          const info = new Map()
+          if (allCalls.length) {
+            const r = await db.queryDb(
+              `SELECT call,
+                 (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base,
+                 (array_agg(purpose      ORDER BY date DESC) FILTER (WHERE purpose      IS NOT NULL))[1] AS purpose,
+                 (array_agg(school       ORDER BY date DESC) FILTER (WHERE school       IS NOT NULL))[1] AS school
+               FROM tracks WHERE call = ANY($1) GROUP BY call`, [allCalls])
+            for (const row of r.rows) info.set(row.call, row)
+          }
+
+          // Apply scope BEFORE the expensive cycle extraction. "operated" =
+          // origin|dest (nearest field to first/last fix) or home base == airport.
+          const candidates = []
           for (const g of byHex.values()) {
             g.points.sort((a, b) => (a[3] || 0) - (b[3] || 0))
+            const base = info.get(g.call)?.base || null
+            if (scope === 'all') { candidates.push(g); continue }
+            if (scope === 'based') { if (base === scopeAirport) candidates.push(g); continue }
+            const first = g.points[0], last = g.points[g.points.length - 1]
+            const o = nearestAp(first[0], first[1]), d = nearestAp(last[0], last[1])
+            const originCode = o.dist <= 3 ? o.code : null
+            const destCode = d.dist <= 3 ? d.code : null
+            if (originCode === scopeAirport || destCode === scopeAirport || base === scopeAirport) candidates.push(g)
+          }
+
+          const zoneConfig = await adsb.loadZones()
+          const gapMs = MISSION_GROUND_GAP_MIN * 60_000
+          const flightsByHex = new Map()
+          let totalFlights = 0
+          for (const g of candidates) {
             const cycles = adsb.extractTowCycles(g.hex, g.call, g.points, zoneConfig)
-            const complete = cycles
               .filter(f => f.takeoff_ts && f.landing_ts)
               .sort((a, b) => new Date(a.takeoff_ts) - new Date(b.takeoff_ts))
             const merged = []
-            for (const f of complete) {
+            for (const f of cycles) {
               const prev = merged[merged.length - 1]
-              if (prev && (new Date(f.takeoff_ts) - new Date(prev.landing_ts)) < gapMs) {
-                prev.landing_ts = f.landing_ts // touch-and-go / taxi-back → same flight
-              } else {
-                merged.push({ takeoff_ts: f.takeoff_ts, landing_ts: f.landing_ts })
-              }
+              if (prev && (new Date(f.takeoff_ts) - new Date(prev.landing_ts)) < gapMs) prev.landing_ts = f.landing_ts
+              else merged.push({ takeoff_ts: f.takeoff_ts, landing_ts: f.landing_ts })
             }
             if (merged.length) {
               flightsByHex.set(g.hex, { tail: g.call || g.reg || g.hex, type: g.type, flights: merged.length })
@@ -3046,56 +3501,28 @@ function noiseApiPlugin() {
             }
           }
 
-          // Look up purpose per tail from the historical tracks table
-          const tails = Array.from(flightsByHex.values()).map(v => v.tail).filter(Boolean)
-          const purposeRes = tails.length ? await db.queryDb(
-            `SELECT DISTINCT ON (call) call, purpose, school, type, base_airport
-             FROM tracks WHERE call = ANY($1) AND purpose IS NOT NULL
-             ORDER BY call, id DESC`,
-            [tails]
-          ) : { rows: [] }
-          const purposeMap = new Map()
-          for (const r of purposeRes.rows) {
-            purposeMap.set(r.call, { purpose: r.purpose, school: r.school, type: r.type, base: r.base_airport })
-          }
-
           // Categorize by purpose; count = flights, not aircraft
           const categories = {}
           for (const v of flightsByHex.values()) {
-            const info = purposeMap.get(v.tail)
-            const purpose = info?.purpose || 'unknown'
+            const inf = info.get(v.tail)
+            const purpose = resolvePurpose(inf?.purpose, v.type, v.tail)
             if (!categories[purpose]) categories[purpose] = { count: 0, aircraft: [] }
             categories[purpose].count += v.flights
             categories[purpose].aircraft.push({
-              tail: v.tail,
-              type: v.type || info?.type || '',
-              school: info?.school || null,
-              base: info?.base || null,
-              flights: v.flights,
+              tail: v.tail, type: v.type || '', school: inf?.school || null, base: inf?.base || null, flights: v.flights,
             })
           }
-
-          // Drop empties, sort categories by flight count desc
-          const sorted = Object.entries(categories)
-            .filter(([, v]) => v.count > 0)
-            .sort((a, b) => b[1].count - a[1].count)
+          const sorted = Object.entries(categories).filter(([, v]) => v.count > 0).sort((a, b) => b[1].count - a[1].count)
           const result = {}
           for (const [k, v] of sorted) result[k] = v
 
-          const now = new Date()
-          res.setHeader('Content-Type', 'application/json')
-          res.setHeader('Access-Control-Allow-Origin', '*')
-          res.setHeader('Cache-Control', 'public, max-age=60')
-          res.end(JSON.stringify({
-            date: toDate,
-            days,
-            from: fromDate,
-            to: toDate,
-            updated_at: range.updated_at || now.toISOString(),
+          respond({
+            date: toDate, days, from: fromDate, to: toDate,
+            airport: scopeAirport, scope,
+            updated_at: range.updated_at || new Date().toISOString(),
             days_loaded: range.days_loaded ?? null,
-            total: totalFlights,
-            categories: result,
-          }))
+            total: totalFlights, categories: result,
+          })
         } catch (e) {
           console.error('[noise-api] /missions error', e)
           res.statusCode = 500
@@ -4604,6 +5031,7 @@ export default defineConfig({
     livePositionsPlugin(),
     adsbApiPlugin(),
     flightImpactPlugin(),
+    aircraftIconsPlugin(),
     noiseZonesApiPlugin(),
     discoverPlugin(),
     // On Railway, strip the @vite/client HMR script from HTML to prevent

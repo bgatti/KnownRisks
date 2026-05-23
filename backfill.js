@@ -344,12 +344,27 @@ async function main() {
   // --- Recompute pop_impact for already-backfilled rows missing it ---
   // (Backfill above only touches year-IS-NULL rows; this populates the new
   // pop_impact column on existing history without rewriting other columns.)
+  // Scoped to the last POP_RECOMPUTE_DAYS — that's the leaderboard window we
+  // care about and keeps the one-time write small. Older rows stay NULL and the
+  // leaderboard falls back to its zone proxy for them.
+  const POP_RECOMPUTE_DAYS = Number(process.env.POP_RECOMPUTE_DAYS) || 30
+  // Anchor the window to the most recent flight DATA, not today's calendar —
+  // the tracks table can lag real time, so "last 30 days" means the 30 days up
+  // to the newest track, otherwise the window can miss all the data.
+  let popCutoff = new Date(Date.now() - POP_RECOMPUTE_DAYS * 86400000).toISOString().slice(0, 10)
   if (POP) {
+    try {
+      const mx = await pool.query('SELECT max(date) AS mx FROM tracks WHERE date IS NOT NULL')
+      const maxDate = mx.rows[0]?.mx
+      if (maxDate) popCutoff = new Date(new Date(maxDate + 'T00:00:00Z').getTime() - POP_RECOMPUTE_DAYS * 86400000).toISOString().slice(0, 10)
+      console.log(`[backfill] pop_impact: latest track date = ${maxDate || 'n/a'}`)
+    } catch (e) { console.warn('[backfill] max(date) lookup failed:', e.message) }
+    console.log(`[backfill] pop_impact recompute scoped to date >= ${popCutoff} (last ${POP_RECOMPUTE_DAYS}d of data)`)
     let popDone = 0
     while (true) {
       const res = await pool.query(
-        'SELECT id, points FROM tracks WHERE pop_impact IS NULL AND points IS NOT NULL ORDER BY id LIMIT $1',
-        [BATCH]
+        'SELECT id, points FROM tracks WHERE pop_impact IS NULL AND points IS NOT NULL AND date >= $2 ORDER BY id LIMIT $1',
+        [BATCH, popCutoff]
       )
       if (res.rows.length === 0) break
       const client = await pool.connect()
@@ -369,7 +384,10 @@ async function main() {
       client.release()
       popDone += res.rows.length
       if (popDone % 5000 < BATCH) {
-        const rem = await pool.query('SELECT count(*)::int n FROM tracks WHERE pop_impact IS NULL AND points IS NOT NULL')
+        const rem = await pool.query(
+          'SELECT count(*)::int n FROM tracks WHERE pop_impact IS NULL AND points IS NOT NULL AND date >= $1',
+          [popCutoff]
+        )
         console.log(`[backfill] pop_impact: ${popDone} done, ${rem.rows[0].n} remaining`)
       }
     }

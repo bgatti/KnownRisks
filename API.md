@@ -85,41 +85,168 @@ Returns available years in the database.
 
 ### GET /api/noise/leaderboard
 
-Top aircraft/bases/schools ranked by clean flight distance.
+"Good-Neighbor" ranking of aircraft / bases / schools. Biases toward flying
+**often** while staying clean and **low-impact over populated areas**.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| days | int | 90 | Lookback window (1–3650) |
-| limit | int | 20 | Number of entries (1–100) |
-| by | string | tail | Group by: `tail`, `base`, or `school` |
-| homeBase | string | — | Restrict to aircraft whose **home base** is this airport, e.g. `homeBase=KBDU`. Ranks the based fleet among itself. Comma-separate for multiple (`KBDU,KLMO`). `base` is an accepted alias. |
-| origin | string | — | `local` or `transient` — per-flight geometric class (within vs beyond the local radius). |
+| `airport` | string | — | Restrict to aircraft whose **home base** is this field, e.g. `airport=KBDU`. Comma-separate for multiple (`KBDU,KLMO`). Aliases: `homeBase`, `base`. |
+| `days` | int | 90 | Lookback window in days, ending today (1–3650). |
+| `limit` | int | 20 | Number of entries returned, after scoring (1–100). |
+| `by` | string | `tail` | Group by `tail`, `base`, or `school`. |
+| `source` | string | — | `tracks` forces the historical-table path; default uses the live store. |
+| `origin` | string | — | `local`/`transient` — only applied on the historical fallback. |
 
-**"Based here" vs "operated here".** `homeBase` filters `tracks.base_airport`,
-the aircraft's home field — this is the "based at KBDU" filter the leaderboard
-needs. It is **not** an operating-airport filter: the backfill records each
-aircraft's home base, not the field a given flight operated at, so there is no
-operating-airport dimension to filter on. `homeBase` is consistent with the
-`base` param on `/api/noise/stats` and `/api/noise/tracks`, which already filter
-`base_airport`. (Before this change the leaderboard ignored `base` entirely,
-which is why `?base=KBDU` returned the global top-N rather than KBDU-based tails.)
+**Data source.** By default the board aggregates the **live capture store**
+(`live_tracks`, the current per-day captures) over the window — this is the
+fresh data. The historical `tracks` table is an automatic fallback (and is
+forced by `?source=tracks`). `source` in the response says which was used.
 
-`origin` is a different axis from `homeBase`: a based aircraft can fly transient
-(cross-country), and a visitor can fly local. The `cube` in `/api/noise/stats`
-breaks flights down by `base_airport × origin` if you need both at once.
-
-The response echoes the applied filters as `home_base` and `origin`, alongside
-the existing `by` and `window`. Entry shape is unchanged — for `by=tail`:
-`name` (tail), `type`, `school`, `base` (home), `purpose`, `flights`,
-`total_nm`, `clean_nm`, `excursion_nm`, `red_nm`/`orange_nm`/`yellow_nm`, and
-the `*_pct` variants.
+**Scoring.**
 
 ```
-GET /api/noise/leaderboard?by=tail&homeBase=KBDU&days=3650&limit=8
-→ { "by":"tail", "home_base":"KBDU", "origin":null,
-    "window": { "days":3650, "from":"…", "to":"…" },
-    "entries": [ { "name":"N…", "base":"KBDU", "flights":…, "clean_pct":…, … } ] }
+score = flights^1.5 × (1 − excursion_rate) × 1 / (1 + impact_index)
 ```
+- `flights` — real takeoff→landing **cycles** (touch-and-goes/taxi-backs merged
+  when the on-ground gap < 10 min). Super-linear, so frequent flyers rank higher.
+- `excursion_rate` — fraction of path length inside the noise-abatement (VNAP) zones.
+- `impact_index` — population-noise impact **per foot flown**, normalized: each
+  segment = length × people/km² beneath it × (1000 ft / AGL)² (louder when lower
+  over more people). `impact_basis` is `population` (real grid) or, as a fallback,
+  `zone_proxy` (severity-weighted zone excursion per mile).
+
+Higher score = better neighbor. Sort: `score` desc, then `flights` desc.
+
+Response (CORS `*`, `Cache-Control: 300`):
+```json
+{
+  "generated_at": "…", "source": "live_tracks", "days_loaded": 30,
+  "by": "tail", "airport": "KBDU", "home_base": "KBDU", "origin": null,
+  "window": { "days": 30, "from": "2026-04-23", "to": "2026-05-22" },
+  "scoring": {
+    "formula": "flights^1.5 × (1 − excursion_rate) × 1/(1 + impact_index)",
+    "flights_exponent": 1.5, "impact_basis": "population",
+    "sort": "score desc, flights desc"
+  },
+  "entries": [{
+    "rank": 1, "name": "N4593Y", "type": "PA25", "icon_url": "/aircraft-icons/PA25",
+    "school": null, "base": "KBDU", "purpose": "tow_plane",
+    "flights": 26, "total_nm": 1548.4, "clean_nm": 1525.2, "excursion_nm": 23.2,
+    "excursion_rate": 1.5, "pop_impact": 412000000, "impact_basis": "population",
+    "impact_index": 0.266, "score": 103.19, "score_pct": 100
+  }]
+}
+```
+Per-entry fields: `name` is the tail (`by=tail`) / airport (`by=base`) / school
+(`by=school`). `excursion_rate` is a percent. `pop_impact` is the raw weighted
+sum (`null` under `zone_proxy`). `impact_index` lower = better. `score_pct` is
+0–100 vs the top entry. **`icon_url`** is the aircraft image URL (`by=tail`
+only; `null` for aggregates) — see "Aircraft icons" below; render with a
+fallback to the `type` label on load error.
+
+```
+GET /api/noise/leaderboard?airport=KBDU&days=30&by=tail&limit=10
+```
+
+#### Aircraft icons
+
+`icon_url` is a per-tail override or per-type override from optional
+`public/aircraft_icons.json` (`{ "byTail": {...}, "byType": {...} }`), else the
+convention path **`/aircraft-icons/<TYPE>`**.
+
+`GET /aircraft-icons/<TYPE>` returns a **real aircraft photo** for the type:
+- an uploaded file in `public/aircraft-icons/<TYPE>.{png,jpg,svg}` if present, else
+- a **302 redirect** to a type photo resolved from Wikipedia page-images (by the
+  expanded type name; cached server-side), else
+- a generated SVG placeholder (plane glyph + type label) for unmatched types.
+
+So an `<img src={icon_url}>` shows the aircraft photo with no client logic.
+`icon_url` is `null` for `by=base`/`by=school` aggregates. To pin a specific
+image, drop a file in `public/aircraft-icons/` or add it to `aircraft_icons.json`.
+
+### GET /api/noise/impact-explain
+
+Per-flight, per-**segment** population-noise breakdown for one tail — the
+auditable detail behind the leaderboard's `impact_index`. Computed live from the
+population grid + stored geometry. Backs the `/impact-explain?tail=…` map.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tail` | string | — | **Required.** Tail/callsign, e.g. `N3547L`. |
+| `days` | int | 30 | Lookback window (1–365). |
+| `limit` | int | 12 | Max flights returned (1–50). |
+
+```json
+{
+  "tail": "N3547L", "days": 90, "window": { "from": "…", "to": "…" },
+  "pop_scale": 1000, "kernel": { "GROUND_REF_FT": 5300, "REF_AGL_FT": 1000, "MIN_AGL_FT": 300 },
+  "totals": { "flights": 5, "len_ft": 9200998, "pop_impact": 5375269356, "impact_index": 0.584, "max_contribution": 107925771 },
+  "flights": [{
+    "id": 123, "date": "2026-04-10", "type": "C172", "type_desc": "Cessna Skyhawk 172", "base": "KBDU",
+    "points": [[40.04, -105.22, 6500], …],
+    "contributions": [80119953, …],
+    "segments": [{ "ft": 3868, "alt": 5600, "agl": 300, "pop": 1864, "atten": 11.11, "contribution": 80119953 }],
+    "len_ft": 1953986, "pop_impact": 1144555273, "impact_index": 0.586
+  }]
+}
+```
+`contributions[i]` is the impact of segment `points[i]→points[i+1]` (so length =
+`points.length − 1`); `segments[i]` is its full breakdown. Use them to heat-color
+the path and label AGL at population peaks.
+
+### GET /api/noise/recent-landings
+
+Recent **full-stop landings** at an airport, each with its population-noise
+impact (the **same kernel** as the leaderboard / impact-explain — no separate
+Lmax model), classified `bands[]`, and authoritative visitor-gating values.
+Drives the RealImpact / Welcome kiosk: render `impact_grade`/`impact_score` and
+draw `bands[]` — no client-side scoring needed.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `airport` | ICAO | `KBDU` | Field to report landings at (must be a known field). |
+| `minutes` | int | 30 | Touchdown within the last N minutes (1–720). |
+
+A landing qualifies when the track ends on the ground (≤ field elev + 200 ft)
+within 2.5 nm of the field, has ≥ 5 min wheels-down, and touched down within the
+window. Sourced from the live store (`live_tracks`), most-recent first.
+
+```json
+{
+  "generated_at": "2026-05-22T16:24:00.000Z",
+  "airport": "KBDU", "minutes": 30, "pop_scale": 1000,
+  "scoring": {
+    "impact_index": "population-noise per ft / POP_SCALE (same kernel as leaderboard & impact-explain)",
+    "impact_score": "impact_index × purpose weight (training ×2, baked in here — do NOT re-apply)",
+    "impact_grade": "A<0.3 B<0.6 C<1.2 D<2.0 F (on impact_score)"
+  },
+  "count": 1,
+  "landings": [{
+    "tail": "N4345G", "type": "P28A", "desc": "Piper Cherokee/Warrior PA-28",
+    "icon_url": "/aircraft-icons/P28A",
+    "base": "KBJC", "purpose": "training", "school": "…",
+    "origin": "KBJC", "dest": "KBJC", "origin_dist_nm": 0.1,
+    "landed": true, "landed_at": "2026-05-22T16:17:09.183Z",
+    "on_ground_min": 8.8, "airborne_min": 71.8,
+    "impact_index": 0.237, "impact_score": 0.475, "impact_grade": "B",
+    "pop_impact": 1144555273,
+    "bands": [{ "klass": null, "points": [[40.04, -105.22, 6500], …] }]
+  }]
+}
+```
+
+**Scoring contract** — `impact_index` is the pure population value (identical to
+the leaderboard); **`impact_score` already has the training ×2 baked in**, so
+the consumer must not apply it again. `impact_grade` is the letter for
+`impact_score`. **`bands[]`** are the capture-worker's classified runs
+(`klass`: `red`/`orange`/`yellow`/`purple`/`null`; points `[lat,lon,alt]`).
+
+**Gating fields** — `airborne_min` is the *last sortie's* airborne time (a
+day-track merges all of an aircraft's flights, so this walks back to that
+landing's takeoff). `origin_dist_nm` is the great-circle from the first observed
+fix to the field — note the capture is corridor-bounded (~36 nm), so this is the
+*observed inbound leg*, not necessarily the true flight origin distance.
+`null` `airborne_min` means a taxi-only track (no airborne segment captured).
 
 ### GET /api/noise/missions
 
@@ -134,17 +261,23 @@ into `unknown`.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `days` | int | 1 | Window size in UTC days, ending today. `1` = today only. Clamped to 1–90. |
+| `airport` / `operatedAt` | ICAO | — | **"operated" scope** — flights where `origin` **or** `dest` (nearest field to the first/last fix) **or** home `base` == this airport. The field's own activity, **including visitors**. |
+| `homeBase` / `base` | ICAO | — | **"based" scope** — only aircraft whose home base is this airport. |
+
+If both are given, `airport`/`operatedAt` (operated) wins. With no scope param,
+returns the whole corridor (`scope: "all"`). The response echoes `airport` and
+`scope` (`operated` \| `based` \| `all`) so the panel can be labeled accurately.
+Scope is applied **before** cycle extraction, so scoped queries are fast;
+results are cached 300 s.
 
 Points for the same aircraft are concatenated across days before cycle
 extraction, so a flight crossing midnight UTC is counted once.
 
 ```json
 {
-  "date": "2026-04-20",
-  "days": 30,
-  "from": "2026-03-22",
-  "to": "2026-04-20",
-  "updated_at": "2026-04-20T21:16:00.000Z",
+  "date": "2026-05-22", "days": 30, "from": "2026-04-22", "to": "2026-05-22",
+  "airport": "KBDU", "scope": "operated",
+  "updated_at": "2026-05-22T21:16:00.000Z",
   "days_loaded": 30,
   "total": 412,
   "categories": {
