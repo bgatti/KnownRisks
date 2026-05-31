@@ -2829,6 +2829,55 @@ function normalizeRunwayRef(ref) {
     .join('/')
 }
 
+// Shared runway fetch for one airport — used by `/api/airports/:icao`
+// and `/api/runways` (regional). Returns the final list to emit
+// (curated overlay applied, source-tagged), or null when the icao is
+// unknown. Cache + OSM fallback logic identical to what the single-
+// airport handler used inline.
+async function getRunwaysForAirport(icao) {
+  const ap = ENRICH_AP.find(a => a.code === icao)
+  if (!ap) return null
+  const cached = airportRunwayCache.get(icao)
+  let osmRunways
+  if (cached && Date.now() - cached.fetchedAt < AIRPORT_RUNWAY_TTL_MS) {
+    osmRunways = cached.runways
+  } else {
+    try {
+      osmRunways = await fetchOverpassRunways(ap.lat, ap.lon, 3000)
+      if (osmRunways.length > 0) {
+        airportRunwayCache.set(icao, { runways: osmRunways, fetchedAt: Date.now() })
+      }
+    } catch (err) {
+      console.error('[runways] overpass error for', icao, err.message)
+      osmRunways = cached?.runways || []
+    }
+  }
+  const curated = await loadCuratedRunways()
+  if (curated[icao] && Array.isArray(curated[icao].runways)) {
+    const osmByRef = new Map()
+    for (const r of osmRunways) {
+      const k = normalizeRunwayRef(r.ref)
+      if (!k) continue
+      const prev = osmByRef.get(k)
+      if (!prev || (r.centerline?.length || 0) > (prev.centerline?.length || 0)) {
+        osmByRef.set(k, r)
+      }
+    }
+    return curated[icao].runways.map((c) => {
+      const osm = osmByRef.get(normalizeRunwayRef(c.ref))
+      return {
+        ref: c.ref,
+        surface: c.surface || osm?.surface || null,
+        length_ft: c.length_ft ?? osm?.length_ft ?? null,
+        width_ft: c.width_ft ?? osm?.width_ft ?? null,
+        centerline: osm?.centerline || [],
+        source: 'curated',
+      }
+    })
+  }
+  return osmRunways.map(r => ({ ...r, source: 'osm' }))
+}
+
 // Fetch `aeroway=runway` ways from OSM Overpass within `radiusM` of the
 // field. Same query the kiosk's pilot-console used to run client-side
 // (Ask #8 moves it server-side so multiple workstations don't each hit
@@ -3735,6 +3784,73 @@ function flightsApiPlugin() {
         }
       })
 
+      // GET /api/runways?center=<icao>&radius_nm=<N>
+      //
+      // Regional runway endpoint (FLIGHT_DATA_SERVICE.md Ask #10). Returns
+      // every runway at every airport within `radius_nm` of `center` in
+      // one round-trip, with `icao` + `airport_name` attached to each row
+      // so the kiosk's regional-context map can group/label. Replaces
+      // the client's per-airport parallel-probe fallback (7 HTTP
+      // requests at boot, doesn't scale as AIRPORT_META_STATIC grows).
+      //
+      // center: ICAO code (default KBDU). radius_nm: 1..200, default 50.
+      // Iterates ENRICH_AP / AIRPORT_META_STATIC; each in-range airport
+      // resolves runways via the same getRunwaysForAirport helper the
+      // single-airport endpoint uses, so curated overrides + OSM
+      // fallback + cache all apply.
+      server.middlewares.use('/api/runways', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        res.setHeader('Content-Type', 'application/json')
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('Cache-Control', 'public, max-age=86400')
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const center = (u.searchParams.get('center') || 'KBDU').trim().toUpperCase()
+          const radiusNm = Math.max(1, Math.min(200, Number(u.searchParams.get('radius_nm')) || 50))
+          const centerAp = ENRICH_AP.find(a => a.code === center)
+          if (!centerAp) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: `unknown center airport ${center}` }))
+          }
+          const out = []
+          // Iterate every configured airport. Order doesn't matter for
+          // correctness; the result is keyed by (icao, ref). Using
+          // AIRPORT_META_STATIC keys catches every airport the kiosk
+          // knows about; ENRICH_AP supplies the lat/lon for distance.
+          for (const ap of ENRICH_AP) {
+            const dist = distNmAp(centerAp.lat, centerAp.lon, ap.lat, ap.lon)
+            if (dist > radiusNm) continue
+            const meta = AIRPORT_META_STATIC[ap.code] || {}
+            const rwys = await getRunwaysForAirport(ap.code)
+            if (!rwys || rwys.length === 0) continue
+            for (const r of rwys) {
+              out.push({
+                icao: ap.code,
+                airport_name: meta.name || null,
+                ref: r.ref,
+                surface: r.surface,
+                length_ft: r.length_ft,
+                width_ft: r.width_ft,
+                centerline: r.centerline,
+                source: r.source,
+              })
+            }
+          }
+          res.end(JSON.stringify({
+            center,
+            center_lat: centerAp.lat,
+            center_lon: centerAp.lon,
+            radius_nm: radiusNm,
+            count: out.length,
+            runways: out,
+          }))
+        } catch (err) {
+          console.error('[api/runways] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+
       // GET /api/airports/:icao
       //
       // Airport metadata for the Pilot Console (FLIGHT_DATA_SERVICE.md Ask #8):
@@ -3762,60 +3878,9 @@ function flightsApiPlugin() {
           // Cache lookup; fetch on miss/stale. Overpass failures degrade
           // gracefully to runways: [] — the rest of the metadata still
           // ships so the wind dial and badge copy keep working.
-          const cached = airportRunwayCache.get(icao)
-          let osmRunways
-          if (cached && Date.now() - cached.fetchedAt < AIRPORT_RUNWAY_TTL_MS) {
-            osmRunways = cached.runways
-          } else {
-            try {
-              osmRunways = await fetchOverpassRunways(ap.lat, ap.lon, 3000)
-              if (osmRunways.length > 0) {
-                airportRunwayCache.set(icao, { runways: osmRunways, fetchedAt: Date.now() })
-              }
-            } catch (err) {
-              console.error('[api/airports] overpass error for', icao, err.message)
-              osmRunways = cached?.runways || []
-            }
-          }
-          // Apply curated overrides. When runways.json carries an entry
-          // for this airport, the curated `ref` list is canonical:
-          //   - Each curated runway emits with FAA-accurate length/width/
-          //     surface and `source: "curated"`.
-          //   - Centerline comes from the best matching OSM way (by
-          //     normalized ref), or [] when OSM has none. OSM duplicates
-          //     for the same ref get picked by longest centerline.
-          //   - OSM entries with no curated match are dropped (likely
-          //     taxiways labeled with a runway ref).
-          // Airports not in runways.json fall back to OSM data as-is
-          // with `source: "osm"`.
-          const curated = await loadCuratedRunways()
-          let runways
-          if (curated[icao] && Array.isArray(curated[icao].runways)) {
-            // Group OSM ways by normalized ref, keep the longest centerline
-            const osmByRef = new Map()
-            for (const r of osmRunways) {
-              const k = normalizeRunwayRef(r.ref)
-              if (!k) continue
-              const prev = osmByRef.get(k)
-              if (!prev || (r.centerline?.length || 0) > (prev.centerline?.length || 0)) {
-                osmByRef.set(k, r)
-              }
-            }
-            runways = curated[icao].runways.map((c) => {
-              const osm = osmByRef.get(normalizeRunwayRef(c.ref))
-              return {
-                ref: c.ref,
-                surface: c.surface || osm?.surface || null,
-                length_ft: c.length_ft ?? osm?.length_ft ?? null,
-                width_ft: c.width_ft ?? osm?.width_ft ?? null,
-                centerline: osm?.centerline || [],
-                source: 'curated',
-              }
-            })
-          } else {
-            // No curated entry; pass OSM data through with a source tag.
-            runways = osmRunways.map(r => ({ ...r, source: 'osm' }))
-          }
+          // Curated overlay + OSM fallback lives in the shared helper
+          // so the regional `/api/runways` endpoint gets the same data.
+          const runways = await getRunwaysForAirport(icao) || []
           const meta = AIRPORT_META_STATIC[icao] || {}
           res.end(JSON.stringify({
             icao,
