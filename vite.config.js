@@ -3416,6 +3416,94 @@ function flightsApiPlugin() {
         }
       })
 
+      // GET /api/flights/current/stream?airport=KBDU[&school=<slug>]
+      //
+      // SSE push channel for the CURRENT feed (Ask #4). v0 sends full
+      // snapshots every 5 s instead of diff events — simpler to render,
+      // simpler to debug, and the kiosk's existing snapshot consumer
+      // works unchanged. Heartbeat every 15 s so the client can detect
+      // a dropped connection. Same query-string surface as the polled
+      // endpoint (airport / school / landed_hours / range_nm).
+      //
+      // Implementation note: self-fetches /api/flights/current internally
+      // rather than re-running the whole snapshot pipeline. One snapshot
+      // build per connected client per 5 s — fine for a few dispatch
+      // desks; if subscriber count grows, fan out a shared snapshot
+      // timer to all open connections.
+      server.middlewares.use('/api/flights/current/stream', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        res.setHeader('Content-Type', 'text/event-stream')
+        res.setHeader('Cache-Control', 'no-cache, no-transform')
+        res.setHeader('Connection', 'keep-alive')
+        res.setHeader('X-Accel-Buffering', 'no') // tell reverse proxies not to buffer
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        if (typeof res.flushHeaders === 'function') res.flushHeaders()
+        // Immediate SSE comment to force the proxy to start the stream
+        // — without this, Railway's edge can buffer the first ~kB
+        // before any byte reaches the client.
+        try { res.write(': sse-open\n\n') } catch {}
+
+        const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+        const innerPath = `/api/flights/current?${u.searchParams.toString()}`
+        const port = parseInt(process.env.PORT || '5174', 10)
+        console.log('[flights/current/stream] subscriber connected', { innerPath, port })
+
+        const SNAPSHOT_MS = 5000
+        const HEARTBEAT_MS = 15000
+
+        let closed = false
+        let snapshotTimer = null
+        let heartbeatTimer = null
+        const cleanup = () => {
+          closed = true
+          if (snapshotTimer) clearTimeout(snapshotTimer)
+          if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null }
+        }
+        req.on('close', cleanup)
+        req.on('error', cleanup)
+
+        // Railway's edge proxy buffers responses up to ~some-threshold
+        // before flushing. SSE events smaller than that get held until
+        // the buffer fills or the connection closes. Padding each event
+        // with a 4 KB comment forces a flush after every emit.
+        const FLUSH_PADDING = ': ' + ' '.repeat(4096) + '\n\n'
+        const sendEvent = (obj) => {
+          if (closed) return false
+          try {
+            res.write(`data: ${JSON.stringify(obj)}\n\n`)
+            res.write(FLUSH_PADDING)
+          } catch { cleanup(); return false }
+          return true
+        }
+
+        const tick = async () => {
+          if (closed) return
+          console.log('[flights/current/stream] tick start', innerPath)
+          try {
+            const resp = await fetch(`http://localhost:${port}${innerPath}`)
+            console.log('[flights/current/stream] inner fetch', resp.status)
+            if (resp.ok) {
+              const snap = await resp.json()
+              sendEvent({ type: 'snapshot', ...snap })
+              console.log('[flights/current/stream] snapshot sent, flights=', snap.count)
+            } else {
+              sendEvent({ type: 'error', status: resp.status, message: `inner /current ${resp.status}` })
+            }
+          } catch (err) {
+            console.error('[flights/current/stream] tick error', err.message)
+            sendEvent({ type: 'error', message: err.message })
+          }
+          if (!closed) snapshotTimer = setTimeout(tick, SNAPSHOT_MS)
+        }
+
+        heartbeatTimer = setInterval(() => {
+          sendEvent({ type: 'heartbeat', ts: Date.now() })
+        }, HEARTBEAT_MS)
+
+        // Initial snapshot fires immediately on connect.
+        tick()
+      })
+
       // GET /api/airports/:icao
       //
       // Airport metadata for the Pilot Console (FLIGHT_DATA_SERVICE.md Ask #8):
