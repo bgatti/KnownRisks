@@ -2820,11 +2820,21 @@ async function fetchOverpassRunways(lat, lon, radiusM = 3000) {
     const tags = el.tags || {}
     const lengthM = tags.length ? Number(tags.length) : null
     const widthM = tags.width ? Number(tags.width) : null
+    // OSM `length` is supposed to be meters but is frequently mis-tagged
+    // (a value of "10000" probably means 10,000 ft, not 10,000 m, but
+    // we can't tell). Cap at 5,000 m / ~16,400 ft — no civil runway in
+    // the catchment exceeds that. Null is honest when the OSM data is
+    // unusable; the kiosk's info box can render "— ft" or fall back to
+    // a centerline-derived length.
+    const lengthFt = Number.isFinite(lengthM) && lengthM > 0 && lengthM <= 5000
+      ? Math.round(lengthM * 3.28084) : null
+    const widthFt = Number.isFinite(widthM) && widthM > 0 && widthM <= 200
+      ? Math.round(widthM * 3.28084) : null
     runways.push({
       ref: tags.ref || null,
       surface: tags.surface || null,
-      length_ft: Number.isFinite(lengthM) ? Math.round(lengthM * 3.28084) : null,
-      width_ft: Number.isFinite(widthM) ? Math.round(widthM * 3.28084) : null,
+      length_ft: lengthFt,
+      width_ft: widthFt,
       centerline: geom.map(g => [g.lat, g.lon]),
     })
   }
@@ -3659,7 +3669,15 @@ function flightsApiPlugin() {
           } else {
             try {
               runways = await fetchOverpassRunways(ap.lat, ap.lon, 3000)
-              airportRunwayCache.set(icao, { runways, fetchedAt: Date.now() })
+              // Don't cache empty results — almost always means a
+              // transient Overpass failure (User-Agent rejection, timeout,
+              // rate limit) rather than a legitimate no-runways-here.
+              // Caching empty stamps the failure for 24 h. Caching only
+              // non-empty preserves correctness with one cost: the next
+              // cold-miss after a real failure will retry.
+              if (runways.length > 0) {
+                airportRunwayCache.set(icao, { runways, fetchedAt: Date.now() })
+              }
             } catch (err) {
               console.error('[api/airports] overpass error for', icao, err.message)
               runways = cached?.runways || [] // keep last good if we have one
