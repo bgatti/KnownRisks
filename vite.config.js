@@ -2752,6 +2752,53 @@ const IMPACT_SCALE_DEFAULT = 50
 
 const VNAP_KLASS_RANK = { yellow: 1, orange: 2, red: 3, purple: 4 }
 
+// Pattern exclusion envelope — fixes inside this envelope are dropped from
+// the population-impact and worst-segment calculations (but NOT from VNAP
+// counting or complaint matching). Rationale: the pattern's noise exposure
+// over the immediate airport neighborhood is structurally unavoidable —
+// every takeoff and landing happens there. Penalizing it inflates
+// `pop_impact` for what every flight at this field has to do. If a pattern
+// leg also crosses a noise-abatement zone (vnap_count) or triggers a
+// complaint, those still count — that's the right signal.
+//
+// Envelope: within `pattern_radius_nm` of the field AND ≤ pattern_alt_agl_ft.
+// 2 nm × 1500 ft AGL covers a standard FAA pattern (~1000 AGL) plus the
+// climb-out buffer to ~1500 before the aircraft "leaves the pattern."
+const PATTERN_RADIUS_NM_BY_AIRPORT = {
+  KBDU: 2,
+  KBJC: 3, // bigger field, longer downwinds
+}
+const PATTERN_RADIUS_NM_DEFAULT = 2
+const PATTERN_ALT_AGL_FT_DEFAULT = 1500
+
+// Canonical slug for a school name. Drops parenthetical abbreviations
+// ("Soaring Society of Boulder (SSB)" → "soaring-society-of-boulder"),
+// lowercases, replaces non-alphanumeric runs with single hyphens, trims
+// edge hyphens. Used by /api/schools and by the `?school=` filter on
+// /api/flights/current.
+function slugifySchool(name) {
+  if (!name) return null
+  return String(name)
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
+function patternEnvelopeFor(airport) {
+  return {
+    radiusNm: PATTERN_RADIUS_NM_BY_AIRPORT[airport] ?? PATTERN_RADIUS_NM_DEFAULT,
+    altAglFt: PATTERN_ALT_AGL_FT_DEFAULT,
+  }
+}
+
+function isInPattern(p, ap, radiusNm, altAglFt) {
+  if (!ap || p[0] == null || p[1] == null) return false
+  if (distNmAp(p[0], p[1], ap.lat, ap.lon) > radiusNm) return false
+  if (p[2] == null) return false
+  return (p[2] - ap.elev) <= altAglFt
+}
+
 // Same value as flightScore.js's internal `DBFS_TO_DBA_CALIBRATION`. Kept
 // in sync manually; both convert the dBFS reading the complaint form
 // records into an SPL dBA estimate at the receiver. If this drifts,
@@ -2790,6 +2837,17 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   const flightPts = allPts.filter(p => p[3] != null && p[3] >= tMs && p[3] <= lMs)
   if (flightPts.length < 2) return out
   const engineless = isEnginelessType(type)
+  const ap = ENRICH_AP.find(a => a.code === airport)
+  const env = patternEnvelopeFor(airport)
+  // Population-impact + worst-segment use a pattern-excluded subset — the
+  // pattern's exposure over the airport neighborhood is unavoidable and
+  // shouldn't accumulate into a "this pilot was noisy" score. V and N
+  // (VNAP + complaints) keep using flightPts: a pattern leg that punches
+  // through a noise-abatement polygon or triggers a complaint is exactly
+  // the kind of signal those metrics are supposed to surface.
+  const nonPatternPts = ap
+    ? flightPts.filter(p => !isInPattern(p, ap, env.radiusNm, env.altAglFt))
+    : flightPts
 
   // ── V — VNAP zone touches (deduped by zone name, airport-scoped) ─────
   const zonesHit = new Set()
@@ -2812,13 +2870,24 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   out.vnap_count = zonesHit.size
   out.vnap_worst_klass = worstVnapKlass
 
-  // ── P — pop_impact 0-100 + categorical pop_grade ─────────────────────
-  if (POPGRID && POPGRID.popAt) {
-    const { total, lenFt } = impactSegments(flightPts, POPGRID.popAt, distFt)
+  // ── P — pop_impact 0-100 + categorical pop_grade (pattern-excluded) ──
+  // Null-when-clamping per the kiosk's calibration request: while
+  // IMPACT_SCALE_BY_AIRPORT is provisional, any flight in the
+  // "needs retune" band (impact_index > 1.5, Option B) returns null
+  // rather than the v0 clamp value of 100. The kiosk's chip renderer
+  // hides on null — wrong data ranks worse than missing on the
+  // operator's screen. pop_grade keeps emitting its categorical letter
+  // because the A-F mapping is calibration-stable.
+  if (POPGRID && POPGRID.popAt && nonPatternPts.length >= 2) {
+    const { total, lenFt } = impactSegments(nonPatternPts, POPGRID.popAt, distFt)
     const impact_index = lenFt > 0 ? (total / lenFt) / POP_SCALE : 0
     out.impact_index = Math.round(impact_index * 1000) / 1000
     const scale = IMPACT_SCALE_BY_AIRPORT[airport] ?? IMPACT_SCALE_DEFAULT
-    out.pop_impact = Math.max(0, Math.min(100, Math.round(impact_index * scale)))
+    if (impact_index > 1.5) {
+      out.pop_impact = null
+    } else {
+      out.pop_impact = Math.max(0, Math.min(100, Math.round(impact_index * scale)))
+    }
     out.pop_grade = impactGrade(impact_index)
   }
 
@@ -2852,13 +2921,220 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
     out.complaint_worst_klass = worstK
   }
 
-  // ── worst_segment — sliding-window dBA × density window (TODO) ───────
-  // Stub: null until the sliding-window analysis lands. Channel client
-  // already gates its v0 overlay on `worst_segment` being present, so
-  // omitting it here is the documented "fall back to client-side proxy"
-  // path. Will populate from a 30–60 s window over the flight track in
-  // the follow-up tick.
+  // ── worst_segment — 30 s sliding window over pattern-excluded fixes ──
+  out.worst_segment = computeWorstSegment(nonPatternPts, POPGRID?.popAt, airport, engineless)
+
+  // ── incursion_segments — per-zone in-polygon runs (Ask #6) ───────────
+  out.incursion_segments = computeIncursionSegments(flightPts, airport, engineless, ap)
   return out
+}
+
+// Intersect line segment [p1, p2] with polygon boundary; return the
+// point at the FIRST intersection along [p1, p2] as [lat, lon, alt, ts_ms],
+// or null when the segment doesn't cross any polygon edge. Used by
+// computeIncursionSegments to pin segment endpoints to the actual VNAP
+// boundary instead of the nearest in-polygon fix — without this the
+// rendered polyline can sit 100+ m inside the zone depending on ADS-B
+// sampling rate.
+//
+// Uses 2D line-line intersection in lat/lon — fine for sub-mile polygon
+// edges at this latitude where lat/lon distortion is < 0.5% over the
+// edge length. alt and ts are linearly interpolated along the [p1, p2]
+// parameter.
+function interpolatePolygonEdge(p1, p2, polygon) {
+  if (!polygon || polygon.length < 2) return null
+  const x1 = p1[1], y1 = p1[0]
+  const x2 = p2[1], y2 = p2[0]
+  let bestT = null
+  for (let i = 0; i < polygon.length - 1; i++) {
+    const v1 = polygon[i], v2 = polygon[i + 1]
+    const x3 = v1[1], y3 = v1[0]
+    const x4 = v2[1], y4 = v2[0]
+    const den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if (Math.abs(den) < 1e-14) continue // parallel
+    const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den
+    const s = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / den
+    if (t < 0 || t > 1 || s < 0 || s > 1) continue
+    if (bestT == null || t < bestT) bestT = t
+  }
+  if (bestT == null) return null
+  const lat = p1[0] + bestT * (p2[0] - p1[0])
+  const lon = p1[1] + bestT * (p2[1] - p1[1])
+  const alt = (p1[2] != null && p2[2] != null)
+    ? Math.round(p1[2] + bestT * (p2[2] - p1[2]))
+    : (p1[2] ?? p2[2] ?? null)
+  const ts = (p1[3] != null && p2[3] != null)
+    ? Math.round(p1[3] + bestT * (p2[3] - p1[3]))
+    : (p1[3] ?? p2[3] ?? null)
+  return [lat, lon, alt, ts]
+}
+
+// Per-flight VNAP incursion segments (FLIGHT_DATA_SERVICE.md Ask #6).
+// Walks the flight against each airport-scoped NOISE_ZONES polygon and
+// emits the contiguous in-polygon runs with klass≥orange. Severity:
+//   - `significant`: any red fix in the run
+//   - `minor`: only orange fixes (no red)
+// `near` (within 500 ft of the polygon edge but not inside) is intentionally
+// not emitted in v0 — per the channel exchange, until the kiosk surfaces
+// it differently from "no incursions at all" the wire bytes don't earn
+// their keep.
+//
+// Polygon-edge interpolation is also deferred — segment endpoints are the
+// first/last in-polygon fixes. ADS-B sampling means the polyline can land
+// up to 100+ m inside the zone boundary; if the rendered overlay looks
+// chunky enough to matter we add a binary search along the bounding edge
+// from prev/next fix in a follow-up.
+//
+// Runs over the FULL flight track (including pattern fixes) — a pattern
+// leg through a noise-abatement polygon is exactly the kind of signal
+// this metric is supposed to surface, so the pattern-exclusion that
+// pop_impact / worst_segment use does NOT apply here.
+function computeIncursionSegments(flightPts, airport, engineless, ap) {
+  if (!flightPts || flightPts.length < 2) return []
+  const fieldElevFt = ap?.elev ?? null
+  const airportZones = NOISE_ZONES.filter(z => {
+    const za = (z.name || '').split(/\s+/, 1)[0]
+    return !za || za === airport
+  })
+  const segments = []
+  for (const zone of airportZones) {
+    let runStart = -1
+    let runEnd = -1
+    let worstKlass = null
+    let peakDba = 0
+    const runPts = []
+    const closeRun = () => {
+      if (runStart < 0) return
+      segments.push({
+        zone_name: zone.name,
+        severity: worstKlass === 'red' ? 'significant' : 'minor',
+        points: runPts.slice(),
+        dba_peak: Math.round(peakDba),
+        start_ts: new Date(flightPts[runStart][3]).toISOString(),
+        end_ts: new Date(flightPts[runEnd][3]).toISOString(),
+      })
+      runStart = -1
+      runEnd = -1
+      worstKlass = null
+      peakDba = 0
+      runPts.length = 0
+    }
+    for (let i = 0; i < flightPts.length; i++) {
+      const p = flightPts[i]
+      if (p[3] == null) continue
+      const k = classifyPoint(p[0], p[1], p[2], [zone], { engineless })
+      if (k === 'red' || k === 'orange') {
+        // Entering the polygon — interpolate the polygon-edge crossing
+        // point from the previous (outside) fix and use that as the
+        // segment start, so the rendered polyline pins to the actual
+        // VNAP boundary rather than the first in-polygon fix.
+        if (runStart < 0) {
+          runStart = i
+          if (i > 0) {
+            const edgePt = interpolatePolygonEdge(flightPts[i - 1], p, zone.polygon)
+            if (edgePt) runPts.push(edgePt)
+          }
+        }
+        runEnd = i
+        runPts.push([p[0], p[1], p[2], p[3]])
+        if (!worstKlass || (VNAP_KLASS_RANK[k] || 0) > (VNAP_KLASS_RANK[worstKlass] || 0)) {
+          worstKlass = k
+        }
+        const d = aglAdjustedDba(p, fieldElevFt, k)
+        if (d > peakDba) peakDba = d
+      } else if (runStart >= 0) {
+        // Exiting the polygon — interpolate the exit edge from the last
+        // in-polygon fix to this (outside) fix and append it as the
+        // segment endpoint.
+        const edgePt = interpolatePolygonEdge(flightPts[runEnd], p, zone.polygon)
+        if (edgePt) runPts.push(edgePt)
+        closeRun()
+      }
+    }
+    closeRun() // flush a run still open at flight end
+  }
+  // Sort by start time so the kiosk renders in flight order.
+  segments.sort((a, b) => a.start_ts.localeCompare(b.start_ts))
+  return segments
+}
+
+// Find the 30-second flight window with the highest population-noise impact.
+// Used by computeFlightIndicators to populate `worst_segment` on the CURRENT
+// feed (FLIGHT_DATA_SERVICE.md Ask #5b). Returns null when the flight has no
+// population exposure (every window's peak density is zero — e.g. an open-
+// space glider sortie). Per-point dBA uses the same band-klass → dBA proxy
+// the kiosk's client-side v0 uses (red 85 / orange 75 / yellow 65 / clean
+// 55) — until the noise pipeline exposes a per-fix continuous dBA both
+// sides have the same view. impact_score reuses the per-airport scale so
+// it reads on the same 0-100 axis as `pop_impact` (Ask #5a).
+const WORST_SEGMENT_KLASS_DBA = { yellow: 65, orange: 75, red: 85, purple: 90 }
+const WORST_SEGMENT_CLEAN_DBA = 55
+const WORST_SEGMENT_WINDOW_MS = 30_000
+
+// AGL-aware klass → dBA proxy. -6 dB per altitude doubling above 1000 ft AGL.
+// Pattern altitude is the reference where the klass-bucket proxy is
+// calibrated against ground sensors; a higher cruise fix over the same
+// block produces less perceived noise. Used by both worst_segment and
+// incursion_segments so a single fix can't show up `significant` in one
+// metric and `dba: 55` in the other — same calibration, different
+// aggregation.
+function aglAdjustedDba(p, fieldElevFt, klass) {
+  let d = WORST_SEGMENT_KLASS_DBA[klass] ?? WORST_SEGMENT_CLEAN_DBA
+  if (fieldElevFt != null && p[2] != null) {
+    const agl = Math.max(0, p[2] - fieldElevFt)
+    if (agl > 1000) d = Math.max(0, d - 6 * Math.log2(agl / 1000))
+  }
+  return d
+}
+
+function computeWorstSegment(flightPts, popAt, airport, engineless) {
+  if (!flightPts || flightPts.length < 3 || !popAt) return null
+  const pts = flightPts.filter(p => p[3] != null)
+  if (pts.length < 3) return null
+  const scale = IMPACT_SCALE_BY_AIRPORT[airport] ?? IMPACT_SCALE_DEFAULT
+  const ap = ENRICH_AP.find(a => a.code === airport)
+  const fieldElevFt = ap?.elev ?? null
+  let best = null
+  for (let i = 0; i < pts.length; i++) {
+    let j = i
+    while (j < pts.length && pts[j][3] - pts[i][3] < WORST_SEGMENT_WINDOW_MS) j++
+    const endIdx = j - 1
+    if (endIdx - i < 2) continue
+    const winPts = pts.slice(i, endIdx + 1)
+    let peakDba = 0, sumDba = 0, peakPop = 0
+    for (const p of winPts) {
+      const k = classifyPoint(p[0], p[1], p[2], NOISE_ZONES, { engineless })
+      const d = aglAdjustedDba(p, fieldElevFt, k)
+      sumDba += d
+      if (d > peakDba) peakDba = d
+      const popv = popAt(p[0], p[1]) || 0
+      if (popv > peakPop) peakPop = popv
+    }
+    if (peakPop <= 0) continue
+    const { total, lenFt } = impactSegments(winPts, popAt, distFt)
+    const impact_index = lenFt > 0 ? (total / lenFt) / POP_SCALE : 0
+    const rawScore = Math.round(impact_index * scale)
+    // Null-when-clamping per kiosk's calibration request: while the
+    // window-scoped IMPACT_SCALE is provisional, a rawScore > 100 means
+    // we'd clamp; emit null instead. Internal rawScore is kept on the
+    // best record so window selection stays correct (the worst window
+    // still wins, it just doesn't surface a misleading 100).
+    const impact_score = rawScore > 100 ? null : Math.max(0, rawScore)
+    if (!best || rawScore > best._rawScore) {
+      best = {
+        points: winPts.map(p => [p[0], p[1], p[2], p[3]]),
+        dba_mean: Math.round(sumDba / winPts.length),
+        dba_peak: Math.round(peakDba),
+        pop_density_peak: Math.round(peakPop),
+        impact_score,
+        _rawScore: rawScore,
+        start_ts: new Date(winPts[0][3]).toISOString(),
+        end_ts: new Date(winPts[winPts.length - 1][3]).toISOString(),
+      }
+    }
+  }
+  if (best) delete best._rawScore
+  return best
 }
 
 // ── /api/flights/* — Pilot Console "CURRENT" surface ────────────────────────
@@ -2948,6 +3224,20 @@ function groupCyclesIntoFlights(cycles, gapMinMs) {
 //              esizes ids before the server emits them; rejecting would
 //              break the queued-POST replay).
 function flightsApiPlugin() {
+  // Same shape the live-positions / flight-impact / adsb plugins use —
+  // each plugin keeps its own closure rather than sharing a module-scope
+  // helper (a low-risk dup; refactor to module scope when more than 3-4
+  // plugins need it).
+  const loadLive = async () => {
+    if (db.useDb) return db.loadLiveFromDb()
+    const fs = await import('fs/promises')
+    const path = await import('path')
+    try {
+      const buf = await fs.default.readFile(path.default.resolve('public/tracks_live.json'), 'utf8')
+      return JSON.parse(buf)
+    } catch { return { tracks: [], updated_at: null } }
+  }
+
   return {
     name: 'flights-api',
     configureServer(server) {
@@ -3023,6 +3313,49 @@ function flightsApiPlugin() {
         }
       })
 
+      // GET /api/schools?airport=KBDU
+      //
+      // Catalog of registered schools at an airport — slug, display name,
+      // and per-school tail count. Drives the Pilot Console's dropdown
+      // and validates the `?school=<slug>` filter on /api/flights/current
+      // (Ask #7). Source of truth is the `school` column in `tracks`,
+      // grouped by school name and slugged at read time so the canonical
+      // slug shape stays server-controlled.
+      server.middlewares.use('/api/schools', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        res.setHeader('Content-Type', 'application/json')
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('Cache-Control', 'public, max-age=300')
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const airport = (u.searchParams.get('airport') || '').trim().toUpperCase()
+          if (!airport) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: 'airport required' }))
+          }
+          const r = await db.queryDb(
+            `SELECT school, COUNT(DISTINCT call) AS tail_count
+             FROM tracks
+             WHERE base_airport = $1 AND school IS NOT NULL AND school <> ''
+             GROUP BY school
+             ORDER BY tail_count DESC, school ASC`,
+            [airport],
+          )
+          const schools = r.rows
+            .map(row => ({
+              slug: slugifySchool(row.school),
+              name: row.school,
+              tail_count: Number(row.tail_count) || 0,
+            }))
+            .filter(s => s.slug) // drop unsluggable names
+          res.end(JSON.stringify({ airport, count: schools.length, schools }))
+        } catch (err) {
+          console.error('[api/schools] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+
       // GET /api/flights/acknowledgements[?airport=KBDU&since=ISO]
       // Read-only dump of flight-ack records — lets the Pilot Console
       // reconcile its localStorage queue against server state on reconnect.
@@ -3085,6 +3418,7 @@ function flightsApiPlugin() {
           const airport = (u.searchParams.get('airport') || 'KBDU').trim().toUpperCase()
           const landedHours = Math.max(0.5, Math.min(48, Number(u.searchParams.get('landed_hours')) || 6))
           const rangeNm = Math.max(1, Math.min(50, Number(u.searchParams.get('range_nm')) || 25))
+          const schoolFilter = (u.searchParams.get('school') || '').trim().toLowerCase() || null
           const ap = ENRICH_AP.find((a) => a.code === airport)
           if (!ap) { res.statusCode = 400; return res.end(JSON.stringify({ error: `unknown airport ${airport}` })) }
 
@@ -3126,6 +3460,28 @@ function flightsApiPlugin() {
           const tracks = live.tracks || []
           const baseZones = await adsb.loadZones()
           const zoneConfig = { ...baseZones, field_elevation_ft: ap.elev }
+
+          // ── Per-tail descriptor / school / base lookup ────────────────
+          // Same shape /api/adsb/current-flights and /api/noise/recent-landings
+          // use. Without this the row renders the bare ICAO type code
+          // ("C172" instead of "CESSNA 172") because the kiosk falls back
+          // to `type` when `desc` is null (client-flagged regression).
+          const tails = [...new Set(tracks.map((t) => (t.call || '').trim()).filter(Boolean))]
+          const info = new Map()
+          if (tails.length) {
+            try {
+              const r = await db.queryDb(
+                `SELECT call,
+                   (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base,
+                   (array_agg(purpose      ORDER BY date DESC) FILTER (WHERE purpose      IS NOT NULL))[1] AS purpose,
+                   (array_agg(school       ORDER BY date DESC) FILTER (WHERE school       IS NOT NULL))[1] AS school,
+                   (array_agg(desc_text    ORDER BY date DESC) FILTER (WHERE desc_text    IS NOT NULL))[1] AS descr
+                 FROM tracks WHERE call = ANY($1) GROUP BY call`,
+                [tails],
+              )
+              for (const row of r.rows) info.set(row.call, row)
+            } catch {}
+          }
 
           const flights = []
           for (const t of tracks) {
@@ -3208,13 +3564,40 @@ function flightsApiPlugin() {
               const ack = ackByFlightId.get(flightId)
               const acknowledged = !!ack
 
-              // Phase (v0 — phaseML wiring deferred to a follow-up):
-              //   airborne → 'nearby' (within range) — always in AIRBORNE_RELEVANT
+              // Phase resolution:
+              //   airborne → phaseML label (pattern / inbound / departing /
+              //              en_route / practice_area / nearby) — same engine
+              //              /api/adsb/current-flights uses, sliced to the
+              //              last PHASE_WINDOW_S of fixes.
               //   landed + acked → 'landed'
               //   landed + not acked → 'ack_pending'
               let phase
-              if (isAirborne) phase = 'nearby'
-              else if (acknowledged) phase = 'landed'
+              if (isAirborne) {
+                let mlPhase = 'nearby'
+                try {
+                  const PHASE_WINDOW_S = 180
+                  const windowStartMs = (last[3] || nowMs) - PHASE_WINDOW_S * 1000
+                  const phasePts = []
+                  for (const p of pts) {
+                    if (p[3] == null || p[3] < windowStartMs) continue
+                    phasePts.push({
+                      lat: p[0], lon: p[1],
+                      altMslFt: p[2], tsUnix: p[3] / 1000,
+                    })
+                  }
+                  if (phasePts.length >= 2) {
+                    const { phases } = classifyOneTrack(phasePts, {
+                      typeCode: t.type || '',
+                      intentWindowS: PHASE_WINDOW_S,
+                      priorByAirport: { [airport]: 2.0 },
+                    })
+                    if (phases && phases.length) mlPhase = phases[phases.length - 1].phase
+                  }
+                } catch (e) {
+                  console.error('[flights/current] phaseML error for', tail, e.message)
+                }
+                phase = mlPhase
+              } else if (acknowledged) phase = 'landed'
               else phase = 'ack_pending'
 
               // Membership.
@@ -3235,12 +3618,25 @@ function flightsApiPlugin() {
               const indFull = computeFlightIndicators(
                 grp, pts, tail, t.type, airport, complaintsRaw,
               )
-              const { worst_segment, impact_index, ...indicators } = indFull
+              const { worst_segment, incursion_segments, impact_index, ...indicators } = indFull
 
+              const inf = info.get(tail) || {}
+              // Ask #7 — filter to flights registered to this school. The
+              // unknown-slug case still emits the response shape; the
+              // flights[] array is just empty, matching the kiosk's
+              // "not a 404, legitimate empty state" semantics.
+              if (schoolFilter) {
+                const flightSlug = slugifySchool(inf.school)
+                if (!flightSlug || flightSlug !== schoolFilter) continue
+              }
               flights.push({
                 id: flightId,
                 tail,
                 type: t.type || null,
+                desc: inf.descr || expandType(t.type),
+                base: inf.base || null,
+                school: inf.school || null,
+                school_slug: slugifySchool(inf.school),
                 icon_url: aircraftIconUrl(t.type, tail),
                 phase,
                 is_airborne: isAirborne,
@@ -3253,6 +3649,7 @@ function flightsApiPlugin() {
                 cycles_in_flight: grp.length,
                 indicators,
                 worst_segment,
+                incursion_segments,
                 impact_index,
                 lat: refPt?.[0] ?? null,
                 lon: refPt?.[1] ?? null,
@@ -3276,8 +3673,9 @@ function flightsApiPlugin() {
             flight_gap_min: flightGapMinFor(airport),
             landed_hours: landedHours,
             range_nm: rangeNm,
+            school_filter: schoolFilter,
             count: flights.length,
-            indicators_note: 'V/P/N indicators wired (Ask #2 + #5a). worst_segment is null pending the sliding-window analysis (Ask #5b).',
+            indicators_note: 'V/P/N indicators wired (Ask #2 + #5a). worst_segment wired (Ask #5b) with AGL-aware dBA proxy. incursion_segments wired (Ask #6) with polygon-edge interpolation, significant/minor severity tiers, and AGL-aware dBA proxy. pop_impact and worst_segment.impact_score return null when calibration would clamp (kiosk-requested while IMPACT_SCALE retunes). pop_impact and worst_segment EXCLUDE the strict airport pattern envelope (within pattern_radius_nm and ≤ 1500 ft AGL). VNAP, complaint, and incursion_segments indicators use the full track. Ask #7 ?school=<slug> filter active when set. phase labels from phaseML classifier (pattern/inbound/departing/en_route/practice_area/nearby) for airborne; landed or ack_pending for landed.',
             pop_impact_scale: 'pop_impact is a 0-100 integer per Ask #5a; impact_index is the legacy small-float for back-compat with the wall kiosk.',
             flights,
           }))
@@ -6297,7 +6695,7 @@ const API_MANIFEST = {
         {
           method: 'GET',
           path: '/api/flights/current',
-          purpose: 'Unified CURRENT feed: airborne flights within range_nm OR landed-at-airport-and-not-yet-acknowledged. V/P/N indicators are zero in v0; Ask #2 wires them in.',
+          purpose: 'Unified CURRENT feed: airborne flights within range_nm OR landed-at-airport-and-not-yet-acknowledged. Each row carries inline V/P/N indicators (vnap_count, pop_impact 0-100, complaint_count), a worst_segment (30s sliding-window dBA × density), and incursion_segments (per-zone VNAP-polygon runs with significant/minor severity tiers). pop_impact and worst_segment exclude the strict airport pattern envelope; incursion_segments use the full track.',
           params: [
             { name: 'airport', type: 'string', default: 'KBDU', desc: 'ICAO of the airport whose CURRENT to return.' },
             { name: 'landed_hours', type: 'number', default: 6, desc: 'Hours to look back for unacked landings (0.5..48).' },
