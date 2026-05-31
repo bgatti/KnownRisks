@@ -2739,16 +2739,26 @@ function pilotApiPlugin() {
 // the leaderboard uses) onto the 0–100 integer `pop_impact` the Pilot
 // Console wants. Calibration target (FLIGHT_DATA_SERVICE.md Ask #5a):
 // 100 = loudest plausible aircraft × densest catchment cell × pattern-leg
-// duration. The provisional ×50 is a reasonable v0 — it puts the existing
-// A/B/C/D/F grade boundaries (impact_index < 0.3 / 0.6 / 1.2 / 2.0 / ∞)
-// at roughly 0–15 / 15–30 / 30–60 / 60–100 / 100. Per-airport refinement
-// uses real catchment-population data once we calibrate against a
-// known-loud reference flight at each field.
+// duration.
+//
+// Retuned 2026-05-31 against an empirical sample of 115 KBDU flights
+// (pattern-excluded). Observed impact_index distribution:
+//   p50=0.43, p75=0.91, p90=1.59, p95=2.21, p99=2.79, max=17.2
+// Scale=40 puts the calibration ceiling at impact_index ≈ 2.5 → 100;
+// p95 maps to 88, p90 to 63, p75 to 36. ~5% of flights null (vs 12%
+// at the v0 scale=50 / threshold=1.5). The bulk of the distribution
+// sits in the 0-95 range with real numbers; only the genuine high-
+// impact outliers null.
 const IMPACT_SCALE_BY_AIRPORT = {
-  KBDU: 50,
-  KBJC: 50,
+  KBDU: 40,
+  KBJC: 40,
 }
-const IMPACT_SCALE_DEFAULT = 50
+const IMPACT_SCALE_DEFAULT = 40
+
+// Null threshold for pop_impact — aligned with the scale so that the
+// null fires exactly when the unscaled value would exceed 100. Updated
+// whenever IMPACT_SCALE_DEFAULT moves so the two stay in lock-step.
+const POP_IMPACT_NULL_THRESHOLD = 100 / IMPACT_SCALE_DEFAULT  // 2.5 at scale=40
 
 const VNAP_KLASS_RANK = { yellow: 1, orange: 2, red: 3, purple: 4 }
 
@@ -2921,19 +2931,17 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   out.vnap_worst_klass = worstVnapKlass
 
   // ── P — pop_impact 0-100 + categorical pop_grade (pattern-excluded) ──
-  // Null-when-clamping per the kiosk's calibration request: while
-  // IMPACT_SCALE_BY_AIRPORT is provisional, any flight in the
-  // "needs retune" band (impact_index > 1.5, Option B) returns null
-  // rather than the v0 clamp value of 100. The kiosk's chip renderer
-  // hides on null — wrong data ranks worse than missing on the
-  // operator's screen. pop_grade keeps emitting its categorical letter
-  // because the A-F mapping is calibration-stable.
+  // Null-when-clamping: any flight whose impact_index would exceed the
+  // scale's calibration ceiling returns null rather than a clamped 100.
+  // Threshold is held in lock-step with the scale (POP_IMPACT_NULL_THRESHOLD).
+  // pop_grade keeps emitting its categorical letter because the A-F
+  // mapping is calibration-stable.
   if (POPGRID && POPGRID.popAt && nonPatternPts.length >= 2) {
     const { total, lenFt } = impactSegments(nonPatternPts, POPGRID.popAt, distFt)
     const impact_index = lenFt > 0 ? (total / lenFt) / POP_SCALE : 0
     out.impact_index = Math.round(impact_index * 1000) / 1000
     const scale = IMPACT_SCALE_BY_AIRPORT[airport] ?? IMPACT_SCALE_DEFAULT
-    if (impact_index > 1.5) {
+    if (impact_index > POP_IMPACT_NULL_THRESHOLD) {
       out.pop_impact = null
     } else {
       out.pop_impact = Math.max(0, Math.min(100, Math.round(impact_index * scale)))
@@ -3820,7 +3828,7 @@ function flightsApiPlugin() {
             range_nm: rangeNm,
             school_filter: schoolFilter,
             count: flights.length,
-            indicators_note: 'V/P/N indicators wired (Ask #2 + #5a). worst_segment wired (Ask #5b) with AGL-aware dBA proxy. incursion_segments wired (Ask #6) with polygon-edge interpolation, significant/minor severity tiers, and AGL-aware dBA proxy. pop_impact and worst_segment.impact_score return null when calibration would clamp (kiosk-requested while IMPACT_SCALE retunes). pop_impact and worst_segment EXCLUDE the strict airport pattern envelope (within pattern_radius_nm and ≤ 1500 ft AGL). VNAP, complaint, and incursion_segments indicators use the full track. Ask #7 ?school=<slug> filter active when set. phase labels from phaseML classifier (pattern/inbound/departing/en_route/practice_area/nearby) for airborne; landed or ack_pending for landed. Flight grouping has a companion coverage-gap guard: cycles with >= FLIGHT_GAP_MIN apart but <30% expected ADS-B coverage AND >2,000 ft aircraft drift in the gap window are merged anyway (the gap was a coverage dropout, not real ground time).',
+            indicators_note: 'V/P/N indicators wired (Ask #2 + #5a). worst_segment wired (Ask #5b) with AGL-aware dBA proxy. incursion_segments wired (Ask #6) with polygon-edge interpolation, significant/minor severity tiers, and AGL-aware dBA proxy. pop_impact retuned 2026-05-31: scale=40, null threshold=2.5 (was 50/1.5). p95 of observed impact_index now maps to 88; null cohort drops from ~12% to ~5%. worst_segment.impact_score still nulls when window-scoped raw exceeds 100 (intrinsic to 30 s concentration). pop_impact and worst_segment EXCLUDE the strict airport pattern envelope (within pattern_radius_nm and ≤ 1500 ft AGL). VNAP, complaint, and incursion_segments indicators use the full track. Ask #7 ?school=<slug> filter active when set. phase labels from phaseML classifier (pattern/inbound/departing/en_route/practice_area/nearby) for airborne; landed or ack_pending for landed. Flight grouping has a companion coverage-gap guard: cycles >= FLIGHT_GAP_MIN apart but <30% expected ADS-B coverage AND >2,000 ft aircraft drift merge anyway.',
             pop_impact_scale: 'pop_impact is a 0-100 integer per Ask #5a; impact_index is the legacy small-float for back-compat with the wall kiosk.',
             flights,
           }))
