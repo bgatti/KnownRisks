@@ -3184,6 +3184,11 @@ function computeIncursionSegments(flightPts, airport, engineless, ap) {
           lengthFt += distFt(a[0], a[1], b[0], b[1])
         }
       }
+      // VNAP ceiling AGL — global default 7500 MSL (matches noiseZonesApiPlugin
+      // DEFAULT_CEILING_FT). Per-zone or per-airport overrides can be added
+      // here when we have them; for now every zone uses the same ceiling
+      // and we just convert to AGL using the field elevation.
+      const VNAP_CEILING_MSL_DEFAULT = 7500
       segments.push({
         zone_name: zone.name,
         severity: worstKlass === 'red' ? 'significant' : 'minor',
@@ -3193,10 +3198,8 @@ function computeIncursionSegments(flightPts, airport, engineless, ap) {
         alt_agl_mean: aglCount > 0 ? Math.round(aglSum / aglCount) : null,
         alt_agl_peak: aglCount > 0 ? Math.round(aglMax) : null,
         length_nm: Math.round((lengthFt / 6076.12) * 100) / 100,
-        // Our NOISE_ZONES table doesn't carry a per-zone published floor
-        // today; emit null so the kiosk box can render "VNAP floor: —"
-        // truthfully. If we add a floor column later, populate from there.
         vnap_floor_agl: null,
+        vnap_ceiling_agl: fieldElevFt != null ? Math.round(VNAP_CEILING_MSL_DEFAULT - fieldElevFt) : null,
         start_ts: new Date(flightPts[runStart][3]).toISOString(),
         end_ts: new Date(flightPts[runEnd][3]).toISOString(),
       })
@@ -3663,6 +3666,73 @@ function flightsApiPlugin() {
 
         // Initial snapshot fires immediately on connect.
         tick()
+      })
+
+      // GET /api/flights/:id/complaints
+      //
+      // Per-flight complaint detail for the kiosk's info-box / popup
+      // surface (the "full explanation" goal — Ask #9's deferred sibling
+      // endpoint). Returns the projected complaint records matched to a
+      // specific flight_id: lat/lon/started_at/klass/dba_estimate/notes/
+      // reporter/source_category/distance_miles. Same projection
+      // `projectComplaint` (from flightScore.js) used everywhere else.
+      //
+      // flight_id format `<airport>-<tail>-<YYYYMMDDHHMM>` UTC lowercase.
+      // We decode tail + takeoff timestamp from the id and run the
+      // same tail+window match the indicators use (±10 min pad, 12-hour
+      // forward window to cover any realistic GA flight).
+      server.middlewares.use('/api/flights/', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+        // We only handle the /:id/complaints suffix here. Other /api/flights/*
+        // routes (acknowledge, acknowledgements, current, current/stream)
+        // claim their paths first via their own middleware registrations.
+        const m = u.pathname.match(/^\/([^/]+)\/complaints$/)
+        if (!m) return next()
+        const flightId = decodeURIComponent(m[1]).toLowerCase()
+        res.setHeader('Content-Type', 'application/json')
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('Cache-Control', 'public, max-age=15')
+        try {
+          // Decode <airport>-<tail>-<YYYYMMDDHHMM>. Tails can contain
+          // hyphens (rare but possible on experimental registrations);
+          // the timestamp is the last hyphen-delimited token.
+          const parts = flightId.split('-')
+          if (parts.length < 3) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: 'invalid flight_id format' }))
+          }
+          const ymdhm = parts[parts.length - 1]
+          const airport = parts[0].toUpperCase()
+          const tail = parts.slice(1, -1).join('-').toUpperCase()
+          if (!/^\d{12}$/.test(ymdhm)) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: 'invalid timestamp in flight_id' }))
+          }
+          const year = Number(ymdhm.slice(0, 4))
+          const month = Number(ymdhm.slice(4, 6))
+          const day = Number(ymdhm.slice(6, 8))
+          const hour = Number(ymdhm.slice(8, 10))
+          const minute = Number(ymdhm.slice(10, 12))
+          const takeoffMs = Date.UTC(year, month - 1, day, hour, minute)
+          const windowEndMs = takeoffMs + 12 * 3600 * 1000 // 12 h forward
+          const complaintsRaw = await loadComplaintsCached()
+          const fsMod = await import('./flightScore.js')
+          const matched = fsMod.matchComplaintsForKiosk(complaintsRaw, tail, takeoffMs, windowEndMs)
+          res.end(JSON.stringify({
+            flight_id: flightId,
+            airport,
+            tail,
+            takeoff_ts: new Date(takeoffMs).toISOString(),
+            window_hours: 12,
+            count: matched.length,
+            complaints: matched,
+          }))
+        } catch (err) {
+          console.error('[api/flights/:id/complaints] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
       })
 
       // GET /api/airports/:icao
