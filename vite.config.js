@@ -2785,13 +2785,13 @@ const PATTERN_ALT_AGL_FT_DEFAULT = 1500
 // declination values are positive East (US/Colorado area). Extend this
 // map as new airports get configured for /api/airports/:icao.
 const AIRPORT_META_STATIC = {
-  KBDU: { name: 'Boulder Municipal',          magnetic_variation_e: 6.8 },
-  KBJC: { name: 'Rocky Mountain Metropolitan', magnetic_variation_e: 6.9 },
-  KAPA: { name: 'Centennial',                 magnetic_variation_e: 6.7 },
-  KFNL: { name: 'Northern Colorado Regional', magnetic_variation_e: 6.5 },
-  KEIK: { name: 'Erie Municipal',             magnetic_variation_e: 6.7 },
-  KLMO: { name: 'Vance Brand (Longmont)',     magnetic_variation_e: 6.7 },
-  KGXY: { name: 'Greeley-Weld County',        magnetic_variation_e: 6.4 },
+  KBDU: { name: 'Boulder Municipal',          magnetic_variation_e: 6.8, tz: 'America/Denver' },
+  KBJC: { name: 'Rocky Mountain Metropolitan', magnetic_variation_e: 6.9, tz: 'America/Denver' },
+  KAPA: { name: 'Centennial',                 magnetic_variation_e: 6.7, tz: 'America/Denver' },
+  KFNL: { name: 'Northern Colorado Regional', magnetic_variation_e: 6.5, tz: 'America/Denver' },
+  KEIK: { name: 'Erie Municipal',             magnetic_variation_e: 6.7, tz: 'America/Denver' },
+  KLMO: { name: 'Vance Brand (Longmont)',     magnetic_variation_e: 6.7, tz: 'America/Denver' },
+  KGXY: { name: 'Greeley-Weld County',        magnetic_variation_e: 6.4, tz: 'America/Denver' },
 }
 
 // In-memory runway cache (24 h TTL). Overpass queries are slow and
@@ -2852,11 +2852,68 @@ function patternEnvelopeFor(airport) {
   }
 }
 
+// Pattern fixes (takeoff + landing + T&G circuits) contribute to pop_impact
+// at this weight relative to en-route fixes. 0 = strict exclusion (the
+// original behavior); 1 = no exclusion. 0.3 = "pattern noise counts, but
+// at ~30% the rate of an en-route overflight." Lets the score reflect
+// "this flight did 12 pattern circuits over Boulder" without that
+// dominating over a single bad-neighbor overflight elsewhere.
+//
+// Placeholder for a proper per-airport empirical "average pattern impact"
+// calibration — once that lands, this weight folds into the calibration
+// constant per-airport.
+const PATTERN_WEIGHT = 0.3
+
 function isInPattern(p, ap, radiusNm, altAglFt) {
   if (!ap || p[0] == null || p[1] == null) return false
   if (distNmAp(p[0], p[1], ap.lat, ap.lon) > radiusNm) return false
   if (p[2] == null) return false
   return (p[2] - ap.elev) <= altAglFt
+}
+
+// A fix is in *some* airport's pattern if it sits within that airport's
+// pattern envelope. Used for pop_impact pattern-weighting and for
+// worst_segment exclusion — a T&G at KLMO over the KLMO pattern is
+// unavoidable to KLMO operations, same as a T&G at KBDU over KBDU's
+// pattern. Iterates every ENRICH_AP entry; cheap enough (≈ 7 airports
+// × distNmAp per point).
+function isInAnyPattern(p) {
+  if (p[0] == null || p[1] == null || p[2] == null) return false
+  for (const ap of ENRICH_AP) {
+    const env = patternEnvelopeFor(ap.code)
+    if (distNmAp(p[0], p[1], ap.lat, ap.lon) > env.radiusNm) continue
+    if ((p[2] - ap.elev) <= env.altAglFt) return true
+  }
+  return false
+}
+
+// Sibling of `impactSegments` (from popGrid.js) that applies a per-segment
+// weight so pattern fixes can contribute at a reduced rate rather than
+// being excluded entirely. Returns the same { total, lenFt } shape so
+// downstream impact_index math is unchanged. Mirrors the exact kernel
+// (segment length × pop at midpoint × (REF_AGL/AGL)² attenuation) — a
+// per-point implementation would drop the ft multiplier and zero out
+// the whole index, which is the regression we just caught.
+function impactSegmentsWeighted(pts, popAt, distFn, isPatternFn, patternWeight) {
+  const { GROUND_REF_FT, REF_AGL_FT, MIN_AGL_FT } = POP_KERNEL
+  let total = 0, lenFt = 0
+  if (!pts || pts.length < 2) return { total, lenFt }
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i]
+    const ft = distFn(a[0], a[1], b[0], b[1])
+    lenFt += ft
+    const midAlt = ((a[2] || 0) + (b[2] || 0)) / 2
+    const pop = ft > 0 ? popAt((a[0] + b[0]) / 2, (a[1] + b[1]) / 2) : 0
+    const agl = Math.max(MIN_AGL_FT, midAlt - GROUND_REF_FT)
+    const atten = (REF_AGL_FT / agl) ** 2
+    let contribution = pop > 0 && ft > 0 ? ft * pop * atten : 0
+    if (contribution > 0) {
+      const midPt = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, midAlt, b[3]]
+      if (isPatternFn(midPt)) contribution *= patternWeight
+    }
+    total += contribution
+  }
+  return { total, lenFt }
 }
 
 // Same value as flightScore.js's internal `DBFS_TO_DBA_CALIBRATION`. Kept
@@ -2898,16 +2955,16 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   if (flightPts.length < 2) return out
   const engineless = isEnginelessType(type)
   const ap = ENRICH_AP.find(a => a.code === airport)
-  const env = patternEnvelopeFor(airport)
   // Population-impact + worst-segment use a pattern-excluded subset — the
   // pattern's exposure over the airport neighborhood is unavoidable and
-  // shouldn't accumulate into a "this pilot was noisy" score. V and N
-  // (VNAP + complaints) keep using flightPts: a pattern leg that punches
-  // through a noise-abatement polygon or triggers a complaint is exactly
-  // the kind of signal those metrics are supposed to surface.
-  const nonPatternPts = ap
-    ? flightPts.filter(p => !isInPattern(p, ap, env.radiusNm, env.altAglFt))
-    : flightPts
+  // shouldn't accumulate into a "this pilot was noisy" score. The
+  // exclusion is multi-airport: a KBDU-area flight doing T&Gs at KLMO
+  // also sits in KLMO's pattern envelope. Without this, neighboring-
+  // field pattern legs dominated worst_segment for ~80% of KBDU flights.
+  // V and N (VNAP + complaints) keep using flightPts: a pattern leg that
+  // punches through a noise-abatement polygon or triggers a complaint
+  // is exactly the kind of signal those metrics are supposed to surface.
+  const nonPatternPts = flightPts.filter(p => !isInAnyPattern(p))
 
   // ── V — VNAP zone touches (deduped by zone name, airport-scoped) ─────
   const zonesHit = new Set()
@@ -2930,14 +2987,19 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   out.vnap_count = zonesHit.size
   out.vnap_worst_klass = worstVnapKlass
 
-  // ── P — pop_impact 0-100 + categorical pop_grade (pattern-excluded) ──
+  // ── P — pop_impact 0-100 + categorical pop_grade ─────────────────────
+  // Pattern fixes (takeoff / landing / T&G circuits) contribute at
+  // PATTERN_WEIGHT (0.3) — included so a flight with 12 pattern circuits
+  // over Boulder reads higher than one with 1 circuit, but not enough
+  // to dominate over a single bad-neighbor overflight elsewhere.
+  // worst_segment below stays strictly pattern-excluded so the overlay
+  // doesn't always render on the runway approach.
   // Null-when-clamping: any flight whose impact_index would exceed the
   // scale's calibration ceiling returns null rather than a clamped 100.
-  // Threshold is held in lock-step with the scale (POP_IMPACT_NULL_THRESHOLD).
-  // pop_grade keeps emitting its categorical letter because the A-F
-  // mapping is calibration-stable.
-  if (POPGRID && POPGRID.popAt && nonPatternPts.length >= 2) {
-    const { total, lenFt } = impactSegments(nonPatternPts, POPGRID.popAt, distFt)
+  if (POPGRID && POPGRID.popAt && flightPts.length >= 2) {
+    const { total, lenFt } = impactSegmentsWeighted(
+      flightPts, POPGRID.popAt, distFt, isInAnyPattern, PATTERN_WEIGHT,
+    )
     const impact_index = lenFt > 0 ? (total / lenFt) / POP_SCALE : 0
     out.impact_index = Math.round(impact_index * 1000) / 1000
     const scale = IMPACT_SCALE_BY_AIRPORT[airport] ?? IMPACT_SCALE_DEFAULT
@@ -3063,11 +3125,38 @@ function computeIncursionSegments(flightPts, airport, engineless, ap) {
     const runPts = []
     const closeRun = () => {
       if (runStart < 0) return
+      // AGL stats + length over the segment's points (Ask #9 info-box).
+      // Edge-interpolated endpoints in runPts can lack a usable alt
+      // (alt may be the linearly-interpolated value); we still take it.
+      let aglSum = 0, aglMin = Infinity, aglMax = -Infinity, aglCount = 0
+      let lengthFt = 0
+      for (let k = 0; k < runPts.length; k++) {
+        const p = runPts[k]
+        if (p[2] != null && fieldElevFt != null) {
+          const agl = Math.max(0, p[2] - fieldElevFt)
+          aglSum += agl
+          if (agl < aglMin) aglMin = agl
+          if (agl > aglMax) aglMax = agl
+          aglCount++
+        }
+        if (k > 0) {
+          const a = runPts[k - 1], b = runPts[k]
+          lengthFt += distFt(a[0], a[1], b[0], b[1])
+        }
+      }
       segments.push({
         zone_name: zone.name,
         severity: worstKlass === 'red' ? 'significant' : 'minor',
         points: runPts.slice(),
         dba_peak: Math.round(peakDba),
+        alt_agl_min: aglCount > 0 ? Math.round(aglMin) : null,
+        alt_agl_mean: aglCount > 0 ? Math.round(aglSum / aglCount) : null,
+        alt_agl_peak: aglCount > 0 ? Math.round(aglMax) : null,
+        length_nm: Math.round((lengthFt / 6076.12) * 100) / 100,
+        // Our NOISE_ZONES table doesn't carry a per-zone published floor
+        // today; emit null so the kiosk box can render "VNAP floor: —"
+        // truthfully. If we add a floor column later, populate from there.
+        vnap_floor_agl: null,
         start_ts: new Date(flightPts[runStart][3]).toISOString(),
         end_ts: new Date(flightPts[runEnd][3]).toISOString(),
       })
@@ -3179,12 +3268,44 @@ function computeWorstSegment(flightPts, popAt, airport, engineless) {
     // still wins, it just doesn't surface a misleading 100).
     const impact_score = rawScore > 100 ? null : Math.max(0, rawScore)
     if (!best || rawScore > best._rawScore) {
+      // Ask #9 info-box stats: AGL min/mean/peak, length_nm, people_exposed.
+      // people_exposed is the people-seconds aggregate the kiosk wants
+      // ("this segment overflew ~2,400 people for ~30 s") — sum across
+      // window fixes of (popAt × dt), where dt is the gap from the prior
+      // fix in seconds.
+      let aglSum = 0, aglMin = Infinity, aglMax = -Infinity, aglCount = 0
+      let lengthFtBest = 0
+      let peopleSec = 0
+      for (let k = 0; k < winPts.length; k++) {
+        const p = winPts[k]
+        if (p[2] != null && fieldElevFt != null) {
+          const agl = Math.max(0, p[2] - fieldElevFt)
+          aglSum += agl
+          if (agl < aglMin) aglMin = agl
+          if (agl > aglMax) aglMax = agl
+          aglCount++
+        }
+        if (k > 0) {
+          const a = winPts[k - 1], b = winPts[k]
+          lengthFtBest += distFt(a[0], a[1], b[0], b[1])
+          const dt = ((b[3] || 0) - (a[3] || 0)) / 1000
+          if (dt > 0) {
+            const popv = popAt(b[0], b[1]) || 0
+            peopleSec += popv * dt
+          }
+        }
+      }
       best = {
         points: winPts.map(p => [p[0], p[1], p[2], p[3]]),
         dba_mean: Math.round(sumDba / winPts.length),
         dba_peak: Math.round(peakDba),
         pop_density_peak: Math.round(peakPop),
         impact_score,
+        alt_agl_min: aglCount > 0 ? Math.round(aglMin) : null,
+        alt_agl_mean: aglCount > 0 ? Math.round(aglSum / aglCount) : null,
+        alt_agl_peak: aglCount > 0 ? Math.round(aglMax) : null,
+        length_nm: Math.round((lengthFtBest / 6076.12) * 100) / 100,
+        people_exposed: Math.round(peopleSec),
         _rawScore: rawScore,
         start_ts: new Date(winPts[0][3]).toISOString(),
         end_ts: new Date(winPts[winPts.length - 1][3]).toISOString(),
@@ -3552,6 +3673,7 @@ function flightsApiPlugin() {
             lon: ap.lon,
             elev_ft: ap.elev,
             magnetic_variation_e: meta.magnetic_variation_e ?? null,
+            tz: meta.tz || null,
             runways,
           }))
         } catch (err) {
