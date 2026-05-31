@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "description": "Curated runway data overlay for /api/airports/:icao. Authoritative dimensions and surface from FAA Form 5010 via AirNav.com; OSM Overpass still supplies the centerline geometry per runway (matched by `ref`, leading zeros stripped). When OSM has no matching way for a curated ref, the runway emits with `centerline: []`.",
+    "description": "Curated runway data overlay for /api/airports/:icao and /api/runways. Authoritative dimensions and surface from FAA Form 5010 via AirNav.com; OSM Overpass still supplies the centerline geometry per runway (matched by `ref`, leading zeros stripped). When OSM has no matching way for a curated ref, the runway emits with `centerline: []`. `elev_ft` is the published surface elevation (MSL, ft), used by the per-flight verified_alt offset to back out ADS-B reporting drift — when a flight passes over the runway at low altitude its reported alt should match elev_ft; the delta becomes that flight's correction.",
     "source": "FAA Form 5010 via AirNav.com (https://www.airnav.com/airport/<icao>)",
     "last_updated": "2026-05-31",
     "update_process": "When OSM data changes or a new airport gets added to AIRPORT_META_STATIC, re-pull AirNav and update this file. Server doesn't auto-sync — single source of truth is this file."
@@ -8,44 +8,44 @@
   "airports": {
     "KBDU": {
       "runways": [
-        { "ref": "8/26",   "length_ft": 4100, "width_ft": 75, "surface": "asphalt" },
-        { "ref": "8G/26G", "length_ft": 4100, "width_ft": 20, "surface": "asphalt/turf" }
+        { "ref": "8/26",   "length_ft": 4100, "width_ft": 75, "surface": "asphalt",     "elev_ft": 5288 },
+        { "ref": "8G/26G", "length_ft": 4100, "width_ft": 20, "surface": "asphalt/turf", "elev_ft": 5288 }
       ]
     },
     "KBJC": {
       "runways": [
-        { "ref": "12L/30R", "length_ft": 9000, "width_ft": 100, "surface": "asphalt" },
-        { "ref": "12R/30L", "length_ft": 7002, "width_ft": 75,  "surface": "asphalt" },
-        { "ref": "3/21",    "length_ft": 3600, "width_ft": 75,  "surface": "asphalt" }
+        { "ref": "12L/30R", "length_ft": 9000, "width_ft": 100, "surface": "asphalt", "elev_ft": 5673 },
+        { "ref": "12R/30L", "length_ft": 7002, "width_ft": 75,  "surface": "asphalt", "elev_ft": 5673 },
+        { "ref": "3/21",    "length_ft": 3600, "width_ft": 75,  "surface": "asphalt", "elev_ft": 5673 }
       ]
     },
     "KAPA": {
       "runways": [
-        { "ref": "17L/35R", "length_ft": 10001, "width_ft": 100, "surface": "asphalt" },
-        { "ref": "17R/35L", "length_ft": 7001,  "width_ft": 75,  "surface": "asphalt" },
-        { "ref": "10/28",   "length_ft": 4800,  "width_ft": 75,  "surface": "asphalt" }
+        { "ref": "17L/35R", "length_ft": 10001, "width_ft": 100, "surface": "asphalt", "elev_ft": 5885 },
+        { "ref": "17R/35L", "length_ft": 7001,  "width_ft": 75,  "surface": "asphalt", "elev_ft": 5885 },
+        { "ref": "10/28",   "length_ft": 4800,  "width_ft": 75,  "surface": "asphalt", "elev_ft": 5885 }
       ]
     },
     "KFNL": {
       "runways": [
-        { "ref": "15/33", "length_ft": 8500, "width_ft": 100, "surface": "asphalt" },
-        { "ref": "6/24",  "length_ft": 2189, "width_ft": 40,  "surface": "asphalt" }
+        { "ref": "15/33", "length_ft": 8500, "width_ft": 100, "surface": "asphalt", "elev_ft": 5016 },
+        { "ref": "6/24",  "length_ft": 2189, "width_ft": 40,  "surface": "asphalt", "elev_ft": 5016 }
       ]
     },
     "KEIK": {
       "runways": [
-        { "ref": "16/34", "length_ft": 4700, "width_ft": 60, "surface": "concrete" }
+        { "ref": "16/34", "length_ft": 4700, "width_ft": 60, "surface": "concrete", "elev_ft": 5025 }
       ]
     },
     "KLMO": {
       "runways": [
-        { "ref": "11/29", "length_ft": 4799, "width_ft": 75, "surface": "concrete" }
+        { "ref": "11/29", "length_ft": 4799, "width_ft": 75, "surface": "concrete", "elev_ft": 5054 }
       ]
     },
     "KGXY": {
       "runways": [
-        { "ref": "17/35", "length_ft": 10000, "width_ft": 100, "surface": "asphalt" },
-        { "ref": "10/28", "length_ft": 5801,  "width_ft": 100, "surface": "asphalt" }
+        { "ref": "17/35", "length_ft": 10000, "width_ft": 100, "surface": "asphalt", "elev_ft": 4697 },
+        { "ref": "10/28", "length_ft": 5801,  "width_ft": 100, "surface": "asphalt", "elev_ft": 4697 }
       ]
     }
   }

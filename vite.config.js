@@ -2870,12 +2870,13 @@ async function getRunwaysForAirport(icao) {
         surface: c.surface || osm?.surface || null,
         length_ft: c.length_ft ?? osm?.length_ft ?? null,
         width_ft: c.width_ft ?? osm?.width_ft ?? null,
+        elev_ft: c.elev_ft ?? ap.elev ?? null,
         centerline: osm?.centerline || [],
         source: 'curated',
       }
     })
   }
-  return osmRunways.map(r => ({ ...r, source: 'osm' }))
+  return osmRunways.map(r => ({ ...r, elev_ft: ap.elev ?? null, source: 'osm' }))
 }
 
 // Fetch `aeroway=runway` ways from OSM Overpass within `radiusM` of the
@@ -2952,6 +2953,53 @@ function patternEnvelopeFor(airport) {
 // calibration — once that lands, this weight folds into the calibration
 // constant per-airport.
 const PATTERN_WEIGHT = 0.3
+
+// `verified_alt` — back out ADS-B reporting drift on a per-flight basis.
+// Mode-S barometric altitude is calibrated to standard-pressure (29.92)
+// while the published runway elevation is true MSL. Local pressure and
+// transponder accuracy combine to give each flight a systematic offset
+// that can be hundreds of feet — enough to make a pattern leg read as
+// en-route, or vice-versa.
+//
+// Calibration: any fix that's geographically over the airport AND at a
+// reported altitude close to the field is taken as ground-truth. The
+// per-flight offset is the average delta between those reported alts
+// and the field elevation. Apply by subtracting offset_ft from any raw
+// reported altitude:
+//   verified_alt_ft = reported_alt_ft - offset_ft
+//   verified_agl_ft = verified_alt_ft - field_elev_ft
+//
+// Tuning knobs:
+//   CAL_RADIUS_NM    — how close to airport center counts as "over field"
+//   CAL_ALT_BAND_FT  — reported alt must be within ±this of field elev
+//                      (large enough to catch a +200ft transponder bias,
+//                       small enough to exclude pattern legs above 1000 AGL)
+//   MIN_FIXES        — minimum calibration fixes before we trust the offset
+const VERIFIED_ALT_CAL_RADIUS_NM = 0.5
+const VERIFIED_ALT_CAL_BAND_FT = 250
+const VERIFIED_ALT_MIN_FIXES = 3
+
+function computeFlightAltOffset(flightPts, airport) {
+  const ap = ENRICH_AP.find(a => a.code === airport)
+  if (!ap || !flightPts || !flightPts.length) {
+    return { offset_ft: 0, calibration_fixes: 0 }
+  }
+  const fixes = []
+  for (const p of flightPts) {
+    if (p[0] == null || p[1] == null || p[2] == null) continue
+    if (distNmAp(p[0], p[1], ap.lat, ap.lon) > VERIFIED_ALT_CAL_RADIUS_NM) continue
+    if (Math.abs(p[2] - ap.elev) > VERIFIED_ALT_CAL_BAND_FT) continue
+    fixes.push(p[2])
+  }
+  if (fixes.length < VERIFIED_ALT_MIN_FIXES) {
+    return { offset_ft: 0, calibration_fixes: fixes.length }
+  }
+  const avg = fixes.reduce((s, v) => s + v, 0) / fixes.length
+  return {
+    offset_ft: Math.round(avg - ap.elev),
+    calibration_fixes: fixes.length,
+  }
+}
 
 function isInPattern(p, ap, radiusNm, altAglFt) {
   if (!ap || p[0] == null || p[1] == null) return false
@@ -3044,6 +3092,12 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   if (flightPts.length < 2) return out
   const engineless = isEnginelessType(type)
   const ap = ENRICH_AP.find(a => a.code === airport)
+  // verified_alt offset for this flight — back out per-flight ADS-B
+  // barometric drift by comparing low-over-field fixes to known field
+  // elevation. Subtracted from any raw alt before computing AGL.
+  const calib = computeFlightAltOffset(flightPts, airport)
+  out.alt_offset_ft = calib.offset_ft
+  out.alt_offset_calibration_fixes = calib.calibration_fixes
   // Population-impact + worst-segment use a pattern-excluded subset — the
   // pattern's exposure over the airport neighborhood is unavoidable and
   // shouldn't accumulate into a "this pilot was noisy" score. The
@@ -3131,10 +3185,10 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   }
 
   // ── worst_segment — 30 s sliding window over pattern-excluded fixes ──
-  out.worst_segment = computeWorstSegment(nonPatternPts, POPGRID?.popAt, airport, engineless)
+  out.worst_segment = computeWorstSegment(nonPatternPts, POPGRID?.popAt, airport, engineless, calib.offset_ft)
 
   // ── incursion_segments — per-zone in-polygon runs (Ask #6) ───────────
-  out.incursion_segments = computeIncursionSegments(flightPts, airport, engineless, ap)
+  out.incursion_segments = computeIncursionSegments(flightPts, airport, engineless, ap, calib.offset_ft)
   return out
 }
 
@@ -3198,9 +3252,11 @@ function interpolatePolygonEdge(p1, p2, polygon) {
 // leg through a noise-abatement polygon is exactly the kind of signal
 // this metric is supposed to surface, so the pattern-exclusion that
 // pop_impact / worst_segment use does NOT apply here.
-function computeIncursionSegments(flightPts, airport, engineless, ap) {
+function computeIncursionSegments(flightPts, airport, engineless, ap, altOffsetFt = 0) {
   if (!flightPts || flightPts.length < 2) return []
-  const fieldElevFt = ap?.elev ?? null
+  // Bake the per-flight ADS-B drift correction into the field-elev
+  // reference so all AGL math here uses verified altitude.
+  const fieldElevFt = ap?.elev != null ? ap.elev + (altOffsetFt || 0) : null
   const airportZones = NOISE_ZONES.filter(z => {
     const za = (z.name || '').split(/\s+/, 1)[0]
     return !za || za === airport
@@ -3236,8 +3292,12 @@ function computeIncursionSegments(flightPts, airport, engineless, ap) {
       // VNAP ceiling AGL — global default 7500 MSL (matches noiseZonesApiPlugin
       // DEFAULT_CEILING_FT). Per-zone or per-airport overrides can be added
       // here when we have them; for now every zone uses the same ceiling
-      // and we just convert to AGL using the field elevation.
+      // and we convert to AGL using the TRUE field elevation (ap.elev),
+      // not the per-flight verified_alt-corrected fieldElevFt. The ceiling
+      // is an inherent zone property; it shouldn't shift per flight's
+      // ADS-B calibration.
       const VNAP_CEILING_MSL_DEFAULT = 7500
+      const trueFieldElevFt = ap?.elev ?? null
       segments.push({
         zone_name: zone.name,
         severity: worstKlass === 'red' ? 'significant' : 'minor',
@@ -3248,7 +3308,7 @@ function computeIncursionSegments(flightPts, airport, engineless, ap) {
         alt_agl_peak: aglCount > 0 ? Math.round(aglMax) : null,
         length_nm: Math.round((lengthFt / 6076.12) * 100) / 100,
         vnap_floor_agl: null,
-        vnap_ceiling_agl: fieldElevFt != null ? Math.round(VNAP_CEILING_MSL_DEFAULT - fieldElevFt) : null,
+        vnap_ceiling_agl: trueFieldElevFt != null ? Math.round(VNAP_CEILING_MSL_DEFAULT - trueFieldElevFt) : null,
         start_ts: new Date(flightPts[runStart][3]).toISOString(),
         end_ts: new Date(flightPts[runEnd][3]).toISOString(),
       })
@@ -3326,13 +3386,15 @@ function aglAdjustedDba(p, fieldElevFt, klass) {
   return d
 }
 
-function computeWorstSegment(flightPts, popAt, airport, engineless) {
+function computeWorstSegment(flightPts, popAt, airport, engineless, altOffsetFt = 0) {
   if (!flightPts || flightPts.length < 3 || !popAt) return null
   const pts = flightPts.filter(p => p[3] != null)
   if (pts.length < 3) return null
   const scale = IMPACT_SCALE_BY_AIRPORT[airport] ?? IMPACT_SCALE_DEFAULT
   const ap = ENRICH_AP.find(a => a.code === airport)
-  const fieldElevFt = ap?.elev ?? null
+  // Subtract the per-flight ADS-B drift correction from the field-elev
+  // reference so all AGL math here uses verified altitude.
+  const fieldElevFt = ap?.elev != null ? ap.elev + (altOffsetFt || 0) : null
   let best = null
   for (let i = 0; i < pts.length; i++) {
     let j = i
@@ -3831,6 +3893,7 @@ function flightsApiPlugin() {
                 surface: r.surface,
                 length_ft: r.length_ft,
                 width_ft: r.width_ft,
+                elev_ft: r.elev_ft,
                 centerline: r.centerline,
                 source: r.source,
               })
