@@ -3784,21 +3784,38 @@ function flightsApiPlugin() {
             res.statusCode = 400
             return res.end(JSON.stringify({ error: 'airport required' }))
           }
-          const r = await db.queryDb(
-            `SELECT school, COUNT(DISTINCT call) AS tail_count
-             FROM tracks
-             WHERE base_airport = $1 AND school IS NOT NULL AND school <> ''
-             GROUP BY school
-             ORDER BY tail_count DESC, school ASC`,
-            [airport],
-          )
-          const schools = r.rows
-            .map(row => ({
-              slug: slugifySchool(row.school),
-              name: row.school,
-              tail_count: Number(row.tail_count) || 0,
+          // Authoritative source for "schools based at this airport" is
+          // the static flight_schools_fleets.json config — each school
+          // has a single `airport` field naming its registered base.
+          // Querying tracks.base_airport (the prior implementation) was
+          // wrong: that table records the destination/base for each
+          // individual track, so a Rocky Mountain Flight School tail
+          // doing a cross-country to KFNL gets `base_airport='KFNL'` on
+          // that row, and the school then appears at KFNL with one
+          // tail. Aggregated across the whole tracks history, RMS ended
+          // up listed at all 7 configured airports.
+          const { default: fs } = await import('fs/promises')
+          const { default: path } = await import('path')
+          let fleets = { schools: [] }
+          try {
+            const raw = await fs.readFile(path.resolve('public/flight_schools_fleets.json'), 'utf8')
+            fleets = JSON.parse(raw)
+          } catch (e) {
+            console.error('[api/schools] fleet config read failed:', e.message)
+          }
+          // Normalize the school's airport field — entries can be
+          // "KBDU", "KBJC area", or "KFTG/KCFO"; take the first
+          // ICAO-shaped token before any whitespace or slash.
+          const airportOf = (s) => ((s.airport || '').split(/[\s/]/, 1)[0] || '').trim().toUpperCase()
+          const schools = (fleets.schools || [])
+            .filter((s) => airportOf(s) === airport)
+            .map((s) => ({
+              slug: slugifySchool(s.name),
+              name: s.name,
+              tail_count: Array.isArray(s.aircraft) ? s.aircraft.length : 0,
             }))
-            .filter(s => s.slug) // drop unsluggable names
+            .filter((s) => s.slug)
+            .sort((a, b) => (b.tail_count - a.tail_count) || a.name.localeCompare(b.name))
           res.end(JSON.stringify({ airport, count: schools.length, schools }))
         } catch (err) {
           console.error('[api/schools] error', err)
