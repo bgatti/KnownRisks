@@ -2771,6 +2771,56 @@ const PATTERN_RADIUS_NM_BY_AIRPORT = {
 const PATTERN_RADIUS_NM_DEFAULT = 2
 const PATTERN_ALT_AGL_FT_DEFAULT = 1500
 
+// Airport static metadata not derivable from ENRICH_AP. Magnetic
+// declination values are positive East (US/Colorado area). Extend this
+// map as new airports get configured for /api/airports/:icao.
+const AIRPORT_META_STATIC = {
+  KBDU: { name: 'Boulder Municipal',          magnetic_variation_e: 6.8 },
+  KBJC: { name: 'Rocky Mountain Metropolitan', magnetic_variation_e: 6.9 },
+  KAPA: { name: 'Centennial',                 magnetic_variation_e: 6.7 },
+  KFNL: { name: 'Northern Colorado Regional', magnetic_variation_e: 6.5 },
+  KEIK: { name: 'Erie Municipal',             magnetic_variation_e: 6.7 },
+  KLMO: { name: 'Vance Brand (Longmont)',     magnetic_variation_e: 6.7 },
+  KGXY: { name: 'Greeley-Weld County',        magnetic_variation_e: 6.4 },
+}
+
+// In-memory runway cache (24 h TTL). Overpass queries are slow and
+// rate-limited; cache aggressively since runways don't move.
+const airportRunwayCache = new Map()
+const AIRPORT_RUNWAY_TTL_MS = 24 * 3600 * 1000
+
+// Fetch `aeroway=runway` ways from OSM Overpass within `radiusM` of the
+// field. Same query the kiosk's pilot-console used to run client-side
+// (Ask #8 moves it server-side so multiple workstations don't each hit
+// Overpass). Returns `[{ ref, surface, length_ft, width_ft, centerline }]`.
+async function fetchOverpassRunways(lat, lon, radiusM = 3000) {
+  const query = `[out:json][timeout:25];way["aeroway"="runway"](around:${radiusM},${lat},${lon});out geom;`
+  const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`
+  // Overpass rejects requests without a User-Agent (406 Not Acceptable),
+  // including the default Node fetch UA. Identify the service per
+  // Overpass etiquette.
+  const res = await fetch(url, { headers: { 'User-Agent': 'flightsafe-noise-api/1.0 (+aviation-monitor)' } })
+  if (!res.ok) throw new Error(`overpass ${res.status}`)
+  const json = await res.json()
+  const runways = []
+  for (const el of json.elements || []) {
+    if (el.type !== 'way') continue
+    const geom = el.geometry || []
+    if (geom.length < 2) continue
+    const tags = el.tags || {}
+    const lengthM = tags.length ? Number(tags.length) : null
+    const widthM = tags.width ? Number(tags.width) : null
+    runways.push({
+      ref: tags.ref || null,
+      surface: tags.surface || null,
+      length_ft: Number.isFinite(lengthM) ? Math.round(lengthM * 3.28084) : null,
+      width_ft: Number.isFinite(widthM) ? Math.round(widthM * 3.28084) : null,
+      centerline: geom.map(g => [g.lat, g.lon]),
+    })
+  }
+  return runways
+}
+
 // Canonical slug for a school name. Drops parenthetical abbreviations
 // ("Soaring Society of Boulder (SSB)" → "soaring-society-of-boulder"),
 // lowercases, replaces non-alphanumeric runs with single hyphens, trims
@@ -3313,6 +3363,63 @@ function flightsApiPlugin() {
         }
       })
 
+      // GET /api/airports/:icao
+      //
+      // Airport metadata for the Pilot Console (FLIGHT_DATA_SERVICE.md Ask #8):
+      // name, lat/lon/elev, magnetic_variation_e, and runway centerlines as
+      // [lat, lon] polylines. Runways are fetched from OSM Overpass server-
+      // side and cached for 24 h — clients shouldn't be hitting a community-
+      // hosted third-party origin from every workstation.
+      server.middlewares.use('/api/airports/', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        res.setHeader('Content-Type', 'application/json')
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('Cache-Control', 'public, max-age=86400')
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const icao = u.pathname.replace(/^\//, '').trim().toUpperCase()
+          if (!icao) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: 'icao required' }))
+          }
+          const ap = ENRICH_AP.find(a => a.code === icao)
+          if (!ap) {
+            res.statusCode = 404
+            return res.end(JSON.stringify({ error: `unknown airport ${icao}` }))
+          }
+          // Cache lookup; fetch on miss/stale. Overpass failures degrade
+          // gracefully to runways: [] — the rest of the metadata still
+          // ships so the wind dial and badge copy keep working.
+          const cached = airportRunwayCache.get(icao)
+          let runways
+          if (cached && Date.now() - cached.fetchedAt < AIRPORT_RUNWAY_TTL_MS) {
+            runways = cached.runways
+          } else {
+            try {
+              runways = await fetchOverpassRunways(ap.lat, ap.lon, 3000)
+              airportRunwayCache.set(icao, { runways, fetchedAt: Date.now() })
+            } catch (err) {
+              console.error('[api/airports] overpass error for', icao, err.message)
+              runways = cached?.runways || [] // keep last good if we have one
+            }
+          }
+          const meta = AIRPORT_META_STATIC[icao] || {}
+          res.end(JSON.stringify({
+            icao,
+            name: meta.name || null,
+            lat: ap.lat,
+            lon: ap.lon,
+            elev_ft: ap.elev,
+            magnetic_variation_e: meta.magnetic_variation_e ?? null,
+            runways,
+          }))
+        } catch (err) {
+          console.error('[api/airports] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+
       // GET /api/schools?airport=KBDU
       //
       // Catalog of registered schools at an airport — slug, display name,
@@ -3689,8 +3796,22 @@ function flightsApiPlugin() {
   }
 }
 
-// GET  /api/complaints[?tail=...]  → list all or filter by tail
-// POST /api/complaints               → lodge a complaint against an excursion
+// Permitted `source_category` values on a complaint. Default `aviation`
+// preserves the historical shape; the other values let the kiosk's
+// reporting form surface non-aviation sources so the operator can compute
+// aviation-vs-other ratios. Adding a value here is the only place — kept
+// closed so we don't get free-text drift in downstream rollups.
+const COMPLAINT_SOURCE_CATEGORIES = new Set([
+  'aviation',
+  'road',
+  'construction',
+  'rail',
+  'industrial',
+  'other',
+])
+
+// GET  /api/complaints[?tail=...&source=...]  → list all or filter
+// POST /api/complaints                          → lodge a complaint
 // Storage: noise/web/data/complaints.json (outside public/, not served).
 // Multiple complaints per (tail, startedAt) are allowed — different
 // reporters can each file their own. Concurrent POSTs are serialized via
@@ -3737,6 +3858,7 @@ function complaintsApiPlugin() {
           if (req.method === 'GET') {
             const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
             const tail = (u.searchParams.get('tail') || '').trim().toUpperCase()
+            const source = (u.searchParams.get('source') || '').trim().toLowerCase()
             let list
             if (db.useDb) {
               list = await db.getComplaints(tail || null)
@@ -3745,6 +3867,11 @@ function complaintsApiPlugin() {
               list = tail
                 ? data.complaints.filter((c) => (c.tail || '').toUpperCase() === tail)
                 : data.complaints
+            }
+            if (source) {
+              // Default to 'aviation' for records written before source_category
+              // existed — preserves historical filtering semantics.
+              list = list.filter((c) => (c.source_category || 'aviation') === source)
             }
             res.setHeader('Content-Type', 'application/json')
             res.setHeader('Access-Control-Allow-Origin', '*')
@@ -3763,16 +3890,36 @@ function complaintsApiPlugin() {
           const tail = ((body.tail || '') + '').trim().toUpperCase()
           const startedAt = ((body.startedAt || '') + '').trim()
           const klass = ((body.klass || '') + '').trim()
-          if (!tail || !startedAt || !klass) {
+          const sourceCategory = (((body.source_category || body.sourceCategory) || 'aviation') + '').trim().toLowerCase()
+          if (!COMPLAINT_SOURCE_CATEGORIES.has(sourceCategory)) {
             res.statusCode = 400
             res.setHeader('Content-Type', 'application/json')
-            res.end(JSON.stringify({ error: 'missing required fields: tail, startedAt, klass' }))
+            res.end(JSON.stringify({
+              error: `invalid source_category; allowed: ${[...COMPLAINT_SOURCE_CATEGORIES].join(', ')}`,
+            }))
+            return
+          }
+          // tail is only required for aviation reports. Non-aviation
+          // (road / construction / rail / industrial / other) can omit
+          // tail entirely — the report is about an environmental source
+          // the reporter hears, not a specific aircraft.
+          if (sourceCategory === 'aviation' && !tail) {
+            res.statusCode = 400
+            res.setHeader('Content-Type', 'application/json')
+            res.end(JSON.stringify({ error: 'tail required for aviation source_category' }))
+            return
+          }
+          if (!startedAt || !klass) {
+            res.statusCode = 400
+            res.setHeader('Content-Type', 'application/json')
+            res.end(JSON.stringify({ error: 'missing required fields: startedAt, klass' }))
             return
           }
           const record = {
             id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
             createdAt: new Date().toISOString(),
-            tail,
+            source_category: sourceCategory,
+            tail: tail || null,
             startedAt,
             endedAt: body.endedAt || null,
             klass,
@@ -3789,7 +3936,18 @@ function complaintsApiPlugin() {
             distanceMiles: typeof body.distanceMiles === 'number' ? body.distanceMiles : null,
           }
           if (db.useDb) {
-            await db.addComplaint(record)
+            // Workaround for the complaints.tail NOT NULL column — non-
+            // aviation reports satisfy it with '' while raw JSONB preserves
+            // the true null shape on the wire. Schema migration to NULL
+            // tail is a follow-up.
+            await db.queryDb(
+              'INSERT INTO complaints (id, tail, started_at, ended_at, klass, zone, notes, type, score, raw) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+              [
+                record.id, record.tail || '', record.startedAt, record.endedAt,
+                record.klass, record.zone, record.notes, record.type,
+                record.score, JSON.stringify(record),
+              ],
+            )
           } else {
             const task = async () => {
               const data = await loadAll(fs, path)
