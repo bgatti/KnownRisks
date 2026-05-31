@@ -4,8 +4,9 @@ import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import { loadPopGrid, impactSegments, pointImpact, POP_KERNEL } from './src/popGrid.js'
-import { distFt, classifyPoint } from './src/geo.js'
+import { distFt, classifyPoint, isEnginelessType } from './src/geo.js'
 import { NOISE_ZONES } from './src/noiseZones.js'
+import { classifyOneTrack, phaseMLApiPlugin } from './phaseML/index.js'
 
 // Load .env.local into process.env BEFORE importing db.js (which reads
 // DATABASE_URL at module load). Lets local dev point at Railway's Postgres
@@ -38,6 +39,7 @@ const TYPE_DESC = {
   P28A: 'Piper Cherokee/Warrior PA-28', P28B: 'Piper Cherokee 180', PA28: 'Piper Cherokee PA-28',
   P28R: 'Piper Arrow PA-28R', PA46: 'Piper Malibu/Mirage', PA44: 'Piper Seminole',
   PA25: 'Piper Pawnee (tow plane)', PA18: 'Piper Super Cub (tow plane)',
+  HUSK: 'Aviat Husky (tow plane)',
   DV20: 'Diamond Katana DV20', DA20: 'Diamond Katana DA20', DA40: 'Diamond Diamond Star',
   DA42: 'Diamond Twin Star',
   SR20: 'Cirrus SR20', SR22: 'Cirrus SR22', S22T: 'Cirrus SR22T',
@@ -79,6 +81,7 @@ const TYPE_DESC = {
   E195: 'Embraer E-195',
   MD83: 'McDonnell Douglas MD-83', MD88: 'McDonnell Douglas MD-88',
   H60: 'Sikorsky UH-60 Black Hawk', GYRO: 'Gyroplane',
+  C30J: 'Lockheed Martin C-130J Super Hercules', C130: 'Lockheed C-130 Hercules',
 }
 function expandType(type) {
   if (!type) return null
@@ -269,23 +272,36 @@ function impactGrade(score) {
 // points) and `impact_share` (fraction of the track total) so kiosks that
 // don't autoscale per-point can still color whole bands relatively. Points
 // stay backwards-compatible: legacy clients reading p[0..2] keep working.
-function bandsFromPoints(pts, popAt) {
+// `typeCode`: optional aircraft ICAO type. Engineless types (gliders,
+// balloons) are VNAP-exempt — their bands are always emitted with klass=null.
+function bandsFromPoints(pts, popAt, typeCode) {
   const out = []
   let cur = null
   let trackTotal = 0
+  const engineless = isEnginelessType(typeCode)
   for (const p of pts) {
-    const klass = classifyPoint(p[0], p[1], p[2], NOISE_ZONES)
+    const klass = classifyPoint(p[0], p[1], p[2], NOISE_ZONES, { engineless })
     let imp = null
     if (popAt) {
       imp = Math.round(pointImpact(p[0], p[1], p[2], popAt))
       trackTotal += imp
     }
     const pt = imp != null ? [p[0], p[1], p[2], imp] : [p[0], p[1], p[2]]
-    if (cur && cur.klass === klass) { cur.points.push(pt); if (imp != null) cur.impact += imp }
-    else {
+    // Capture the source-point timestamp (4th elt of the INPUT tuple,
+    // which is ms-since-epoch from the live store) on each band so
+    // per-band complaint attribution can find a time window. The
+    // output `points` only carry impact in slot 3, so this can't be
+    // recovered downstream.
+    const ts = typeof p[3] === 'number' ? p[3] : null
+    if (cur && cur.klass === klass) {
+      cur.points.push(pt)
+      if (imp != null) cur.impact += imp
+      if (ts != null) { if (cur.start_ms == null) cur.start_ms = ts; cur.end_ms = ts }
+    } else {
       if (cur) out.push(cur)
       cur = { klass, points: [pt] }
       if (imp != null) cur.impact = imp
+      if (ts != null) { cur.start_ms = ts; cur.end_ms = ts }
     }
   }
   if (cur) out.push(cur)
@@ -293,6 +309,34 @@ function bandsFromPoints(pts, popAt) {
     for (const b of out) b.impact_share = Math.round((b.impact / trackTotal) * 1000) / 1000
   }
   return out
+}
+
+// Classify a track's flight phase from its raw points ([lat, lon, alt, ...]).
+// `overflight`  — never came near pattern altitude (always above field+300 ft)
+// `departure`   — started low at the field, left climbing
+// `arrival`     — descended into the field and stayed low at the end
+// `pattern`     — both low at start and end (typical pattern work; or 2+
+//                  descent cycles which also indicates pattern flying)
+// Returns the same shape as /api/excursions/segments — `{ phase, descents,
+// hasDescents }` — so /api/excursions/boot can carry it through verbatim
+// and the kiosk's local altitude-trend heuristic becomes a fallback only.
+function classifyTrackPhase(points) {
+  if (!points || points.length === 0) return { phase: 'overflight', descents: 0, hasDescents: false }
+  const fieldElev = 5288 // KBDU default; good enough for the firstLow/lastLow check
+  const descThreshold = fieldElev + 300 // 5588 MSL
+  let descents = 0, wasHigh = false
+  for (const p of points) {
+    if (p[2] > descThreshold) wasHigh = true
+    else if (wasHigh) { descents++; wasHigh = false }
+  }
+  const firstLow = points[0][2] != null && points[0][2] < descThreshold
+  const lastLow = points[points.length - 1][2] != null && points[points.length - 1][2] < descThreshold
+  let phase = 'overflight'
+  if (firstLow && lastLow && descents >= 2) phase = 'pattern'
+  else if (firstLow && !lastLow) phase = 'departure'
+  else if (!firstLow && lastLow) phase = 'arrival'
+  else if (firstLow && lastLow) phase = 'pattern'
+  return { phase, descents, hasDescents: descents > 0 }
 }
 
 // Population grid for the leaderboard's pop-impact explainer (computed live, so
@@ -303,6 +347,54 @@ const POP_SCALE = 1000 // pop_impact-per-ft that maps to impact_index = 1 (keep 
 const LEADERBOARD_FLIGHT_EXP = 1.5 // super-linear frequency emphasis
 const LEADERBOARD_ZONE_K = 12      // zone-proxy impact scaling (pre-population fallback)
 const missionsCache = new Map()    // key `${days}|${scope}|${airport}` → { ts, body } (5-min TTL)
+
+// Compute a track's [startMs, endMs] from its bands' point timestamps.
+// Falls back to the track date (a full UTC day) for sparse historical
+// tracks whose points have no per-point timestamp. Returns null when
+// there's no usable signal at all.
+function trackTimeWindow(t) {
+  let lo = null, hi = null
+  for (const b of (t?.bands || [])) {
+    for (const p of (b?.points || [])) {
+      const ts = Array.isArray(p) ? p[3] : (p && p.ts)
+      const n = typeof ts === 'number' ? ts : (typeof ts === 'string' ? Date.parse(ts) : NaN)
+      if (Number.isFinite(n)) {
+        if (lo == null || n < lo) lo = n
+        if (hi == null || n > hi) hi = n
+      }
+    }
+  }
+  if (lo != null && hi != null) return [lo, hi]
+  if (t?.date) {
+    const day = Date.parse(t.date + 'T00:00:00Z')
+    if (Number.isFinite(day)) return [day, day + 24 * 3600 * 1000]
+  }
+  return null
+}
+
+// Shared complaint loader with 30 s memoization. The kiosk polls multiple
+// enriched endpoints; without this each call would re-query Postgres.
+// Exposed as a module-scope helper so /api/excursions/boot and
+// /api/adsb/current-flights both reuse the same cache window.
+const COMPLAINT_CACHE_TTL_MS = 30 * 1000
+let complaintCache = { ts: 0, list: [] }
+async function loadComplaintsCached() {
+  const now = Date.now()
+  if (now - complaintCache.ts < COMPLAINT_CACHE_TTL_MS) return complaintCache.list
+  let list = []
+  if (db.useDb) {
+    try { list = await db.getComplaints(null) } catch { list = [] }
+  } else {
+    try {
+      const fs = await import('fs/promises')
+      const path = await import('path')
+      const buf = await fs.default.readFile(path.default.resolve('data/complaints.json'), 'utf8')
+      list = JSON.parse(buf).complaints || []
+    } catch { list = [] }
+  }
+  complaintCache = { ts: now, list }
+  return list
+}
 
 // Build the leaderboard from the LIVE store (live_tracks), which is the current
 // per-day capture — the historical `tracks` table lags real time. Flights are
@@ -1168,11 +1260,17 @@ function excursionsApiPlugin() {
               ? t.points.filter((p) => p[3] >= fromMs && p[3] <= toMs)
               : t.points
             if (walk.length === 0) continue
+            // Engineless aircraft (gliders, balloons) are VNAP-exempt — emit
+            // their segments as a single clean band so they never appear in
+            // the excursion feed even when low over a noise zone.
+            const trackEngineless = isEnginelessType(t.type)
             const segments = []
             let cur = null
             for (let i = 0; i < walk.length; i++) {
               const p = walk[i]
-              const { klass, zone } = classifyPoint(p[0], p[1], p[2])
+              const { klass, zone } = trackEngineless
+                ? { klass: null, zone: null }
+                : classifyPoint(p[0], p[1], p[2])
               if (cur && cur.klass === klass && cur.zone === zone) {
                 cur.points.push(p)
               } else {
@@ -1208,26 +1306,15 @@ function excursionsApiPlugin() {
               ? segments.filter((s) => s.points.some((p) => withinRadius(p[0], p[1])))
               : segments
             if (filtered.length) {
-              // Detect descents: count times the track drops below field elev + 300 ft
-              const fieldElev = 5288 // KBDU default; good enough for classification
-              const descThreshold = fieldElev + 300
-              let descents = 0, wasHigh = false
-              for (const p of walk) {
-                if (p[2] > descThreshold) wasHigh = true
-                else if (wasHigh) { descents++; wasHigh = false }
-              }
-              const firstLow = walk[0] && walk[0][2] < descThreshold
-              const lastLow = walk[walk.length - 1] && walk[walk.length - 1][2] < descThreshold
-              let phase = 'overflight'
-              if (firstLow && lastLow && descents >= 2) phase = 'pattern'
-              else if (firstLow && !lastLow) phase = 'departure'
-              else if (!firstLow && lastLow) phase = 'arrival'
-              else if (firstLow && lastLow) phase = 'pattern'
+              // Shared classifier — see classifyTrackPhase() at module scope.
+              // /api/excursions/boot calls the same helper so the kiosk sees
+              // identical phase values from either source.
+              const { phase, descents, hasDescents } = classifyTrackPhase(walk)
               tracksOut.push({
                 tail: t.call || t.reg || tail || '?',
                 type: t.type || '',
                 src: t.src, date, live: isLive,
-                phase, descents, hasDescents: descents > 0,
+                phase, descents, hasDescents,
                 segments: filtered,
               })
             }
@@ -1308,6 +1395,18 @@ function excursionsApiPlugin() {
           const fromDate = new Date(nowMs - hours * 3600 * 1000).toISOString().slice(0, 10)
           const toDate = new Date(nowMs).toISOString().slice(0, 10)
 
+          // Load complaints once per request (30 s memoized). Used twice:
+          //   (a) per-track `complaints[]` — tail+window match for the
+          //       kiosk's "halo the matching flight track" overlay
+          //   (b) top-level `complaints` — every complaint in the request
+          //       window, geocoded or not. The kiosk filters this to lat/lon
+          //       for map pins and re-uses it to render notes alongside flights.
+          const fsMod = await import('./flightScore.js')
+          const complaintsRaw = await loadComplaintsCached()
+          const complaintsForWindow = fsMod.recentComplaintsForKiosk(
+            complaintsRaw, Math.min(24 * 60, hours * 60),
+          )
+
           // Historical tracks are indexed by date only, so sub-day windows
           // can't be filtered at the point level — live data covers that range.
           // Skip the historical query entirely when hours < 24.
@@ -1357,7 +1456,11 @@ function excursionsApiPlugin() {
               SUM(seg_red) DESC
           `
           const activeRes = await db.queryDb(activeSql, [fromDate, toDate])
-          const active = activeRes.rows.map(r => ({
+          // Engineless aircraft (gliders, balloons) are VNAP-exempt. Even
+          // if they have non-null worst_class in the historical tracks
+          // table (the backfill ran before this rule existed), they
+          // never appear in the active list.
+          const active = activeRes.rows.filter(r => !isEnginelessType(r.type)).map(r => ({
             tail: r.tail, type: r.type || 'Unknown',
             school: r.school || null, airport: r.airport || null,
             worst: r.worst,
@@ -1374,15 +1477,26 @@ function excursionsApiPlugin() {
           // filter at sub-second resolution. Any `hours` value works here.
           const windowFromMs = nowMs - hours * 3600 * 1000
           try {
-            const liveRes = await db.queryDb(
-              'SELECT tracks, updated_at FROM live_tracks WHERE day = CURRENT_DATE ORDER BY id DESC LIMIT 1'
-            )
-            if (liveRes.rows.length) {
-              const rawLive = liveRes.rows[0].tracks || []
+            // Fetch live_tracks across the FULL requested window, not just
+            // CURRENT_DATE. The capture worker keys rows by UTC day; near
+            // midnight a `hours=24` request needs both yesterday's and
+            // today's rows to cover the actual 24-hour window. Without
+            // this, the response shrinks to ~minutes right after the
+            // UTC rollover. (The per-point timestamp trim below clips
+            // anything outside windowFromMs.)
+            const liveRange = await db.loadLiveFromDbByDateRange(fromDate, toDate)
+            const rawLive = liveRange.tracks || []
+            if (rawLive.length) {
               liveCount = rawLive.length
-              liveUpdatedAt = liveRes.rows[0].updated_at || null
+              liveUpdatedAt = liveRange.updated_at || null
               for (const t of rawLive) {
                 if (!t.bands || t.bands.length === 0) continue
+                // Engineless aircraft (gliders, balloons) are VNAP-exempt —
+                // the capture worker may have written historical bands with
+                // non-null klass values before this rule existed; flatten
+                // any such bands to klass=null at read time so they never
+                // surface as excursions.
+                const engineless = isEnginelessType(t.type)
                 // Trim each band's points to the time window when possible.
                 // Bands whose last point is older than the cutoff are dropped;
                 // bands spanning the cutoff get their leading points sliced.
@@ -1391,7 +1505,8 @@ function excursionsApiPlugin() {
                   const pts = b.points || []
                   if (!pts.length) continue
                   const hasTs = pts[pts.length - 1].length > 3
-                  if (!hasTs) { trimmedBands.push(b); continue }
+                  const sanitised = engineless && b.klass ? { ...b, klass: null } : b
+                  if (!hasTs) { trimmedBands.push(sanitised); continue }
                   // Find the first point >= windowFromMs
                   let startIdx = pts.length
                   for (let i = 0; i < pts.length; i++) {
@@ -1400,26 +1515,37 @@ function excursionsApiPlugin() {
                   if (startIdx >= pts.length) continue // whole band is too old
                   // Keep the last point before the window as a bridge for continuity
                   const slice = startIdx > 0 ? pts.slice(startIdx - 1) : pts.slice(startIdx)
-                  if (slice.length >= 2) trimmedBands.push({ ...b, points: slice })
+                  if (slice.length >= 2) trimmedBands.push({ ...sanitised, points: slice })
                 }
                 if (!trimmedBands.length) continue
+                // Server-classified flight phase for the kiosk — same
+                // classifier as /api/excursions/segments. Replaces the
+                // client-side altitude-trend heuristic which trailed on
+                // stale fixes and mis-classified thermalling gliders.
+                const phaseAll = trimmedBands.flatMap((b) => b.points || [])
+                const { phase, descents, hasDescents } = classifyTrackPhase(phaseAll)
                 liveTracks.push({
                   call: t.call || t.reg || '?',
                   type: t.type || '',
                   src: 'live',
                   date: toDate,
                   base: null,
-                  worst: t.worst || null,
+                  // VNAP-exempt aircraft: zero out the cached worst/seg/len
+                  // counters too, so consumers reading those fields directly
+                  // see consistent state with the (now-null-klass) bands.
+                  worst: engineless ? null : (t.worst || null),
                   school: null,
                   seg_total: t.seg_total || 0,
-                  seg_red: t.seg_red || 0,
-                  seg_orange: t.seg_orange || 0,
-                  seg_yellow: t.seg_yellow || 0,
+                  seg_red: engineless ? 0 : (t.seg_red || 0),
+                  seg_orange: engineless ? 0 : (t.seg_orange || 0),
+                  seg_yellow: engineless ? 0 : (t.seg_yellow || 0),
                   len_total_ft: t.len_total_ft || 0,
-                  len_red_ft: t.len_red_ft || 0,
-                  len_orange_ft: t.len_orange_ft || 0,
-                  len_yellow_ft: t.len_yellow_ft || 0,
+                  len_red_ft: engineless ? 0 : (t.len_red_ft || 0),
+                  len_orange_ft: engineless ? 0 : (t.len_orange_ft || 0),
+                  len_yellow_ft: engineless ? 0 : (t.len_yellow_ft || 0),
                   bands: trimmedBands,
+                  phase, descents, hasDescents,
+                  vnap_exempt: engineless || undefined,
                   live: true,
                 })
               }
@@ -1625,11 +1751,69 @@ function excursionsApiPlugin() {
               weight: 1.5,
               opacity: 0.7,
               blend: 'multiply',
-              note: 'Each track.bands[] is an array of {klass, points} runs. Render each run as a Polyline colored by klass (null = clean_color). Points are [lat, lon, alt_ft]. Adjacent runs share their boundary point for continuity.',
+              note: 'Each track.bands[] is an array of {klass, points} runs. Render each run as a Polyline colored by klass (null = clean_color). Points are [lat, lon, alt_ft]. Adjacent runs share their boundary point for continuity. Each band may also carry `complaints[]`, `complaint_dba_max`, `complaint_worst_klass`, `complaint_count` — paint a halo on those bands using complaint_dba_max for intensity and complaint_worst_klass for colour. The track-level `complaints[]` is the union; each complaint has `band_indices[]` so a kiosk can render either way.',
             },
             active,
-            tracks: [...tracksRes.rows, ...liveTracks],
+            tracks: [
+              ...tracksRes.rows.map((r) => {
+                // Mirror the phase enrichment we do for liveTracks above so
+                // historical (hours>=24) tracks carry the same field. Bands
+                // come straight from the DB; flatten their points and
+                // classify the whole track.
+                const pts = (r.bands || []).flatMap((b) => b.points || [])
+                const ph = classifyTrackPhase(pts)
+                // VNAP-exempt: flatten any non-null klass bands on engineless
+                // aircraft (the backfill predates this rule). Also zero
+                // the cached worst/seg counters so consumers reading them
+                // directly see consistent state with the bands.
+                const engineless = isEnginelessType(r.type)
+                const bands = engineless
+                  ? (r.bands || []).map(b => b.klass ? { ...b, klass: null } : b)
+                  : r.bands
+                const exemptedCounters = engineless ? {
+                  worst: null, seg_red: 0, seg_orange: 0, seg_yellow: 0, seg_purple: 0,
+                  len_red_ft: 0, len_orange_ft: 0, len_yellow_ft: 0, len_purple_ft: 0,
+                } : null
+                // Per-track complaints — tail+window match. Historical
+                // tracks are date-granular, so we widen the window to the
+                // whole UTC day when no per-point timestamp is available.
+                const win = trackTimeWindow(r)
+                const trackComplaints = win
+                  ? fsMod.matchComplaintsForKiosk(complaintsRaw, r.call, win[0], win[1])
+                  : []
+                // Per-band attribution → each band gains its own
+                // complaints[] + complaint_dba_max + complaint_worst_klass,
+                // and each top-level complaint gains band_indices[].
+                // Use a tight 60 s pad here (≪ the 10-min flight-level pad)
+                // so glow lights only the segments actually within earshot
+                // of when the complainant pressed record.
+                fsMod.attachComplaintsToBands(bands, trackComplaints, { pad: 60 * 1000 })
+                return {
+                  ...r, ...(exemptedCounters || {}), bands,
+                  phase: ph.phase, descents: ph.descents, hasDescents: ph.hasDescents,
+                  vnap_exempt: engineless || undefined,
+                  complaints: trackComplaints,
+                }
+              }),
+              ...liveTracks.map(lt => {
+                const win = trackTimeWindow(lt)
+                const trackComplaints = win
+                  ? fsMod.matchComplaintsForKiosk(complaintsRaw, lt.call, win[0], win[1])
+                  : []
+                fsMod.attachComplaintsToBands(lt.bands, trackComplaints, { pad: 60 * 1000 })
+                return { ...lt, complaints: trackComplaints }
+              }),
+            ],
             live: { updated_at: liveUpdatedAt, tracks: liveCount },
+            // Top-level complaint feed for the kiosk's map-pin layer.
+            // Items contain geocoded entries (lat/lon set) and tail-only
+            // entries — kiosk filters to the subset it needs.
+            complaints: {
+              window_minutes: Math.min(24 * 60, hours * 60),
+              count: complaintsForWindow.length,
+              geocoded_count: complaintsForWindow.filter(c => c.lat != null && c.lon != null).length,
+              items: complaintsForWindow,
+            },
           }))
         } catch (err) {
           console.error('[excursions-boot] error', err)
@@ -1805,6 +1989,9 @@ function excursionsApiPlugin() {
                 // Live tracks: use the live file's updated_at as a proxy.
                 trackTs = liveUpdatedAtMs
               }
+              // Engineless aircraft are VNAP-exempt → no points contribute
+              // to this tail's worst-class or counts.
+              if (isEnginelessType(t.type)) continue
               let trackHit = false
               let trackMaxPointTs = 0
               for (const p of t.points) {
@@ -2111,6 +2298,8 @@ function excursionsApiPlugin() {
           for (const t of matches) {
             const m = (t.src || '').match(/(\d{4}-\d{2}-\d{2})/)
             const date = m ? m[1] : null
+            // Engineless aircraft (gliders/balloons) → no excursions emitted.
+            if (isEnginelessType(t.type)) continue
             const tags = t.points.map((p) => classifyPoint(p[0], p[1], p[2]))
             let cur = null
             for (let i = 0; i < t.points.length; i++) {
@@ -2538,6 +2727,562 @@ function pilotApiPlugin() {
           res.end(JSON.stringify({ count: items.length, items }))
         } catch (err) {
           console.error('[notifications-api] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+    },
+  }
+}
+
+// Per-airport scale that maps an `impact_index` (small float, same units
+// the leaderboard uses) onto the 0–100 integer `pop_impact` the Pilot
+// Console wants. Calibration target (FLIGHT_DATA_SERVICE.md Ask #5a):
+// 100 = loudest plausible aircraft × densest catchment cell × pattern-leg
+// duration. The provisional ×50 is a reasonable v0 — it puts the existing
+// A/B/C/D/F grade boundaries (impact_index < 0.3 / 0.6 / 1.2 / 2.0 / ∞)
+// at roughly 0–15 / 15–30 / 30–60 / 60–100 / 100. Per-airport refinement
+// uses real catchment-population data once we calibrate against a
+// known-loud reference flight at each field.
+const IMPACT_SCALE_BY_AIRPORT = {
+  KBDU: 50,
+  KBJC: 50,
+}
+const IMPACT_SCALE_DEFAULT = 50
+
+const VNAP_KLASS_RANK = { yellow: 1, orange: 2, red: 3, purple: 4 }
+
+// Same value as flightScore.js's internal `DBFS_TO_DBA_CALIBRATION`. Kept
+// in sync manually; both convert the dBFS reading the complaint form
+// records into an SPL dBA estimate at the receiver. If this drifts,
+// per-flight `complaint_dba_max` and per-complaint `dba_estimate` will
+// diverge — leave a TODO to either export it from flightScore.js or move
+// it to a shared constants module.
+const DBFS_TO_DBA_CALIBRATION_LOCAL = 132
+
+// Indicators bundle for a single flight (FLIGHT_DATA_SERVICE.md Ask #2 + #5).
+//
+//   grpCycles  — array of { tMs, lMs } from the per-airport flight grouping.
+//   allPts     — full sorted point list for the tail (already time-sorted).
+//   tail/type  — for engineless gating + aircraft-typed classification.
+//   airport    — used to filter NOISE_ZONES by ICAO prefix and to pick the
+//                pop_impact scaling constant.
+//   complaints — raw (un-projected) complaint records, scoped to today.
+//
+// Returns the flat `indicators` object expected on each /api/flights/current
+// row, plus a separate `impact_index` (the small-float upstream value) so
+// downstream callers can compose if needed. `worst_segment` is a stub for now
+// (sliding-window dBA analysis lands in a follow-up tick).
+function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complaints) {
+  const out = {
+    vnap_count: 0,
+    vnap_worst_klass: null,
+    pop_impact: 0,
+    pop_grade: null,
+    complaint_count: 0,
+    complaint_dba_max: null,
+    complaint_worst_klass: null,
+    worst_segment: null,
+    impact_index: 0,
+  }
+  const tMs = grpCycles[0].tMs
+  const lMs = grpCycles[grpCycles.length - 1].lMs ?? Date.now()
+  const flightPts = allPts.filter(p => p[3] != null && p[3] >= tMs && p[3] <= lMs)
+  if (flightPts.length < 2) return out
+  const engineless = isEnginelessType(type)
+
+  // ── V — VNAP zone touches (deduped by zone name, airport-scoped) ─────
+  const zonesHit = new Set()
+  let worstVnapKlass = null
+  for (const p of flightPts) {
+    const k = classifyPoint(p[0], p[1], p[2], NOISE_ZONES, { engineless })
+    if (!k) continue
+    for (const z of NOISE_ZONES) {
+      const zAirport = (z.name || '').split(/\s+/, 1)[0]
+      if (zAirport && zAirport !== airport) continue
+      if (classifyPoint(p[0], p[1], p[2], [z], { engineless })) {
+        zonesHit.add(z.name)
+        if (!worstVnapKlass || (VNAP_KLASS_RANK[k] || 0) > (VNAP_KLASS_RANK[worstVnapKlass] || 0)) {
+          worstVnapKlass = k
+        }
+        break // one zone per point is enough
+      }
+    }
+  }
+  out.vnap_count = zonesHit.size
+  out.vnap_worst_klass = worstVnapKlass
+
+  // ── P — pop_impact 0-100 + categorical pop_grade ─────────────────────
+  if (POPGRID && POPGRID.popAt) {
+    const { total, lenFt } = impactSegments(flightPts, POPGRID.popAt, distFt)
+    const impact_index = lenFt > 0 ? (total / lenFt) / POP_SCALE : 0
+    out.impact_index = Math.round(impact_index * 1000) / 1000
+    const scale = IMPACT_SCALE_BY_AIRPORT[airport] ?? IMPACT_SCALE_DEFAULT
+    out.pop_impact = Math.max(0, Math.min(100, Math.round(impact_index * scale)))
+    out.pop_grade = impactGrade(impact_index)
+  }
+
+  // ── N — complaint correlations (tail + flight window, ±10-min pad) ───
+  if (complaints && complaints.length) {
+    // Reuse the projected-complaint helper from flightScore.js to get
+    // dba_estimate / klass per matched complaint.
+    const matched = []
+    const T = tail.toUpperCase()
+    const pad = 10 * 60 * 1000
+    const lo = tMs - pad, hi = lMs + pad
+    for (const c of complaints) {
+      if ((c.tail || '').toUpperCase() !== T) continue
+      const s = c.startedAt ? Date.parse(c.startedAt) : NaN
+      const e = c.endedAt ? Date.parse(c.endedAt) : s
+      if (!Number.isFinite(s)) continue
+      if (e < lo || s > hi) continue
+      matched.push(c)
+    }
+    out.complaint_count = matched.length
+    let worstK = null, maxDba = null
+    for (const c of matched) {
+      const m = c.notes ? /(-?\d+(?:\.\d+)?)\s*dbfs/i.exec(c.notes) : null
+      const dbfs = m ? Number(m[1]) : null
+      const dba = Number.isFinite(dbfs) ? Math.round(dbfs + DBFS_TO_DBA_CALIBRATION_LOCAL) : null
+      if (dba != null && (maxDba == null || dba > maxDba)) maxDba = dba
+      const k = c.klass
+      if (k && (!worstK || (VNAP_KLASS_RANK[k] || 0) > (VNAP_KLASS_RANK[worstK] || 0))) worstK = k
+    }
+    out.complaint_dba_max = maxDba
+    out.complaint_worst_klass = worstK
+  }
+
+  // ── worst_segment — sliding-window dBA × density window (TODO) ───────
+  // Stub: null until the sliding-window analysis lands. Channel client
+  // already gates its v0 overlay on `worst_segment` being present, so
+  // omitting it here is the documented "fall back to client-side proxy"
+  // path. Will populate from a 30–60 s window over the flight track in
+  // the follow-up tick.
+  return out
+}
+
+// ── /api/flights/* — Pilot Console "CURRENT" surface ────────────────────────
+//
+// A "flight" here is NOT a single takeoff-to-landing cycle. It groups
+// consecutive cycles for the same tail that share a sortie: touch-and-goes
+// and full-stops-with-taxi-back stay inside one flight; only a ground gap
+// long enough for a crew swap + fresh preflight + run-up starts a new one.
+//
+// FLIGHT_GAP_MIN — per-airport ground-gap threshold (minutes) separating
+// "same flight" from "new flight." Empirically chosen from a histogram of
+// 1,491 consecutive-cycle gaps across 464 tail-days of KBDU-area tracks
+// (2026-04-18..24).
+//
+// Inflections in the trainer-gap distribution (density per minute):
+//   3-4 → 4-5 min:    195/min → 26/min   (7.5× drop) — pattern work ends
+//   8-10 → 10-15 min: 14/min → 5.8/min   (2.4× drop) — coverage tails off
+//   10-15 → 15-30:    5.8/min → 1.9/min  (3× drop)
+//   30-60 → 60+:      0.83/min → cluster — clean "next sortie" floor
+//
+// The 5-30 min range is dominated by ADS-B coverage gaps mid-flight, not
+// real ground time. Raising the threshold inside that range catches few
+// extra "same-flight" merges (10→30 min only buys +3.8 pp) while reducing
+// false-positive new flights during dropouts. Right floor is per-airport:
+// KBJC has long taxi times (Class D, bigger field) and benefits from a
+// wider window.
+//
+// COMPANION GUARD (still TODO): even with these wider numbers the proper
+// fix for coverage-gap mid-flight fragmentation is a second-pass collapse
+// that examines ADS-B coverage and aircraft drift inside the gap.
+//   - ADS-B coverage during the gap < 30% of expected, AND
+//   - aircraft moved > 2,000 ft between supposed landing and takeoff
+//   → treat as a single flight regardless of gap length.
+const FLIGHT_GAP_MIN_BY_AIRPORT = {
+  KBDU: 20, // small GA — operator-tuned past the empirical 15-min plateau
+  KBJC: 30, // Class D, longer taxi/ground-hold times (operator note)
+}
+const FLIGHT_GAP_MIN_DEFAULT = 20
+
+function flightGapMinFor(airport) {
+  const k = (airport || '').toUpperCase()
+  return FLIGHT_GAP_MIN_BY_AIRPORT[k] ?? FLIGHT_GAP_MIN_DEFAULT
+}
+
+// Back-compat alias for callers that don't yet pass airport context.
+// Prefer flightGapMinFor(airport) in new code.
+const FLIGHT_GAP_MIN = FLIGHT_GAP_MIN_DEFAULT
+
+// computeFlightId(airport, tail, takeoffMs) — stable per-flight key.
+// Format: `<airport>-<tail>-<YYYYMMDDHHMM>` lowercase, UTC. Minute granularity
+// matches the kiosk's client-synthesized `land-<TAIL>-<YYYYMMDDHHmm>` bucket
+// so queued POSTs can reconcile once the kiosk swaps to server ids.
+function computeFlightId(airport, tail, takeoffMs) {
+  const d = new Date(takeoffMs)
+  if (isNaN(d.getTime())) return null
+  const pad = (n) => String(n).padStart(2, '0')
+  const ymdhm = `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`
+  return `${(airport || 'unk').toLowerCase()}-${(tail || 'unk').toLowerCase()}-${ymdhm}`
+}
+
+// groupCyclesIntoFlights(cycles, gapMinMs) — cycles must be sorted ascending
+// by tMs (takeoff epoch ms). Each cycle: { tMs, lMs, ...rest }. Returns an
+// array of groups; each group is an array of the input cycle objects that
+// belong to the same flight. A new flight begins when the gap between the
+// previous landing (lMs) and the next takeoff (tMs) is >= gapMinMs.
+function groupCyclesIntoFlights(cycles, gapMinMs) {
+  if (!cycles || !cycles.length) return []
+  const groups = [[cycles[0]]]
+  for (let i = 1; i < cycles.length; i++) {
+    const gap = cycles[i].tMs - cycles[i - 1].lMs
+    if (gap >= gapMinMs) groups.push([cycles[i]])
+    else groups[groups.length - 1].push(cycles[i])
+  }
+  return groups
+}
+
+// POST /api/flights/acknowledge
+// Body: { flight_id, acknowledged_by, note?, tail? }
+//
+// One tap acks every issue on the flight: VNAP crossings, population-impact
+// moments, and correlated complaints all become "handled" from the Pilot
+// Console's perspective. The CURRENT feed drops this flight on next poll.
+//
+// Idempotency: same flight_id + same acknowledged_by → 200 (no-op).
+//              same flight_id + different acknowledged_by → 409 with prior
+//              attribution. Unknown flight_id is accepted (the kiosk synth-
+//              esizes ids before the server emits them; rejecting would
+//              break the queued-POST replay).
+function flightsApiPlugin() {
+  return {
+    name: 'flights-api',
+    configureServer(server) {
+      server.middlewares.use('/api/flights/acknowledge', async (req, res, next) => {
+        if (req.method !== 'POST') return next()
+        res.setHeader('Content-Type', 'application/json')
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        try {
+          const body = await readJsonBody(req).catch(() => null)
+          if (!body) { res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'invalid JSON body' })) }
+          const flightId = ((body.flight_id || '') + '').trim().toLowerCase()
+          const by = ((body.acknowledged_by || '') + '').trim()
+          const note = ((body.note || '') + '').trim() || null
+          const tail = ((body.tail || '') + '').trim().toUpperCase() || null
+          if (!flightId || !by) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ ok: false, error: 'flight_id and acknowledged_by required' }))
+          }
+          // Look for an existing flight-ack on this flight_id.
+          let existing = null
+          if (db.useDb) {
+            const all = await db.getNotifications(null, 'flight-ack')
+            existing = (all || []).find((it) => (it.flight_id || '').toLowerCase() === flightId) || null
+          } else {
+            const { default: fs } = await import('fs/promises')
+            const { default: path } = await import('path')
+            const cur = (await notificationsLedger.load(fs, path)) || { items: [] }
+            existing = (cur.items || []).find((it) => it.kind === 'flight-ack' && (it.flight_id || '').toLowerCase() === flightId) || null
+          }
+          if (existing) {
+            const existingBy = existing.acknowledged_by || null
+            if (existingBy && existingBy !== by) {
+              res.statusCode = 409
+              return res.end(JSON.stringify({
+                ok: false,
+                reason: 'already_acknowledged',
+                by: existingBy,
+                at: existing.at || null,
+              }))
+            }
+            res.statusCode = 200
+            return res.end(JSON.stringify({
+              ok: true,
+              acknowledged_at: existing.at || null,
+              idempotent: true,
+            }))
+          }
+          const record = {
+            kind: 'flight-ack',
+            flight_id: flightId,
+            tail,
+            acknowledged_by: by,
+            note,
+            at: new Date().toISOString(),
+          }
+          if (db.useDb) {
+            await db.addNotification(record)
+          } else {
+            const { default: fs } = await import('fs/promises')
+            const { default: path } = await import('path')
+            await notificationsLedger.mutate(fs, path, (cur) => {
+              const items = Array.isArray(cur.items) ? cur.items : []
+              items.push(record)
+              return { items }
+            })
+          }
+          res.statusCode = 201
+          res.end(JSON.stringify({ ok: true, acknowledged_at: record.at, flight_id: flightId }))
+        } catch (err) {
+          console.error('[flights/acknowledge] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ ok: false, error: String(err) }))
+        }
+      })
+
+      // GET /api/flights/acknowledgements[?airport=KBDU&since=ISO]
+      // Read-only dump of flight-ack records — lets the Pilot Console
+      // reconcile its localStorage queue against server state on reconnect.
+      server.middlewares.use('/api/flights/acknowledgements', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        res.setHeader('Content-Type', 'application/json')
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const airport = (u.searchParams.get('airport') || '').trim().toLowerCase()
+          const sinceParam = u.searchParams.get('since')
+          const sinceMs = sinceParam ? Date.parse(sinceParam) : null
+          let items
+          if (db.useDb) {
+            items = await db.getNotifications(null, 'flight-ack')
+          } else {
+            const { default: fs } = await import('fs/promises')
+            const { default: path } = await import('path')
+            const cur = (await notificationsLedger.load(fs, path)) || { items: [] }
+            items = (cur.items || []).filter((it) => it.kind === 'flight-ack')
+          }
+          items = (items || []).filter((it) => {
+            if (airport && !(it.flight_id || '').toLowerCase().startsWith(`${airport}-`)) return false
+            if (sinceMs && Number.isFinite(sinceMs)) {
+              const at = Date.parse(it.at || '')
+              if (!Number.isFinite(at) || at < sinceMs) return false
+            }
+            return true
+          })
+          res.end(JSON.stringify({ count: items.length, items }))
+        } catch (err) {
+          console.error('[flights/acknowledgements] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ ok: false, error: String(err) }))
+        }
+      })
+
+      // GET /api/flights/current?airport=KBDU[&landed_hours=6][&range_nm=25]
+      //
+      // Unified Pilot Console CURRENT feed (FLIGHT_DATA_SERVICE.md Ask #1).
+      // Membership rule:
+      //   - Airborne AND within range_nm of airport (phaseML refinement
+      //     deferred to a follow-up; v0 includes all airborne traffic in
+      //     range so the kiosk's existing rule is a strict subset).
+      //   - OR landed at airport in the last landed_hours AND not yet
+      //     acknowledged via /api/flights/acknowledge.
+      //
+      // A flight = a group of cycles whose ground gaps are all <
+      // flightGapMinFor(airport) min — i.e. T&Gs and short taxi-back
+      // full-stops collapse into one row, one acknowledge.
+      //
+      // V/P/N indicators are zero in v0; Ask #2 wires them in next.
+      server.middlewares.use('/api/flights/current', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        res.setHeader('Content-Type', 'application/json')
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('Cache-Control', 'public, max-age=5')
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const airport = (u.searchParams.get('airport') || 'KBDU').trim().toUpperCase()
+          const landedHours = Math.max(0.5, Math.min(48, Number(u.searchParams.get('landed_hours')) || 6))
+          const rangeNm = Math.max(1, Math.min(50, Number(u.searchParams.get('range_nm')) || 25))
+          const ap = ENRICH_AP.find((a) => a.code === airport)
+          if (!ap) { res.statusCode = 400; return res.end(JSON.stringify({ error: `unknown airport ${airport}` })) }
+
+          const nowMs = Date.now()
+          const landedCutoffMs = nowMs - landedHours * 3600 * 1000
+          const gapMinMs = flightGapMinFor(airport) * 60000
+          const groundCeil = ap.elev + 200
+          const LANDING_NEAR_NM = 4
+
+          // ── Acks (kind='flight-ack') keyed by flight_id ───────────────
+          let ackItems = []
+          if (db.useDb) {
+            try { ackItems = await db.getNotifications(null, 'flight-ack') } catch {}
+          } else {
+            try {
+              const { default: fs } = await import('fs/promises')
+              const { default: path } = await import('path')
+              const cur = (await notificationsLedger.load(fs, path)) || { items: [] }
+              ackItems = (cur.items || []).filter((it) => it.kind === 'flight-ack')
+            } catch {}
+          }
+          const ackByFlightId = new Map()
+          for (const it of (ackItems || [])) {
+            const fid = (it.flight_id || '').toLowerCase()
+            if (!fid) continue
+            const at = Date.parse(it.at || '')
+            const existing = ackByFlightId.get(fid)
+            if (!existing || (Number.isFinite(at) && at > Date.parse(existing.at || ''))) {
+              ackByFlightId.set(fid, it)
+            }
+          }
+
+          // ── Complaints (cached) for per-flight N indicator ────────────
+          let complaintsRaw = []
+          try { complaintsRaw = await loadComplaintsCached() } catch { complaintsRaw = [] }
+
+          // ── Tracks + zones ────────────────────────────────────────────
+          const live = await loadLive()
+          const tracks = live.tracks || []
+          const baseZones = await adsb.loadZones()
+          const zoneConfig = { ...baseZones, field_elevation_ft: ap.elev }
+
+          const flights = []
+          for (const t of tracks) {
+            const tail = (t.call || '').trim()
+            if (!tail || tail.startsWith('~')) continue
+            const pts = (t.points || []).slice().sort((a, b) => (a[3] || 0) - (b[3] || 0))
+            if (pts.length < 2) continue
+
+            // Project extractTowCycles output to { tMs, lMs }. lMs is null
+            // for in-progress (airborne) cycles.
+            const rawCycles = adsb.extractTowCycles(t.hex, tail, pts, zoneConfig) || []
+            const cycles = []
+            for (const c of rawCycles) {
+              const tMs = Date.parse(c.takeoff_ts || '')
+              if (!Number.isFinite(tMs)) continue
+              const lMs = c.landing_ts ? Date.parse(c.landing_ts) : null
+              cycles.push({ tMs, lMs: Number.isFinite(lMs) ? lMs : null })
+            }
+            if (!cycles.length) continue
+            cycles.sort((a, b) => a.tMs - b.tMs)
+
+            // Group cycles into flights using the per-airport gap. A null
+            // lMs (still airborne) ends its group — no later cycle can
+            // merge into an open one.
+            const groups = []
+            let curGrp = [cycles[0]]
+            for (let i = 1; i < cycles.length; i++) {
+              const prev = cycles[i - 1]
+              if (prev.lMs == null) { groups.push(curGrp); curGrp = [cycles[i]]; continue }
+              const gap = cycles[i].tMs - prev.lMs
+              if (gap >= gapMinMs) { groups.push(curGrp); curGrp = [cycles[i]] }
+              else curGrp.push(cycles[i])
+            }
+            groups.push(curGrp)
+
+            // Most recent track fix — drives airborne/landed decision and
+            // the row's position marker.
+            const last = pts[pts.length - 1]
+            const lastSeenS = Math.max(0, Math.round((nowMs - (last[3] || nowMs)) / 1000))
+
+            for (let gi = 0; gi < groups.length; gi++) {
+              const grp = groups[gi]
+              const takeoffMs = grp[0].tMs
+              const lastCy = grp[grp.length - 1]
+              const landingMs = lastCy.lMs
+              const isLastGroup = gi === groups.length - 1
+
+              // Airborne iff this is the latest group AND its last cycle
+              // is still open OR the most recent fix is above ground ceiling.
+              const isAirborne = isLastGroup && (
+                landingMs == null
+                || (last[2] != null && last[2] > groundCeil)
+              )
+
+              // Pick reference fix: last fix when airborne, otherwise the
+              // first fix at/after landing.
+              let refPt = last
+              if (!isAirborne && landingMs != null) {
+                refPt = pts.find((p) => p[3] != null && p[3] >= landingMs) || last
+              }
+              const dist = distNmAp(refPt[0], refPt[1], ap.lat, ap.lon)
+              const landingDist = (!isAirborne && refPt)
+                ? distNmAp(refPt[0], refPt[1], ap.lat, ap.lon)
+                : Infinity
+
+              // track_deg from last two fixes (same math as /live).
+              let trackDeg = null
+              if (pts.length >= 2) {
+                const a = pts[pts.length - 2], b = last
+                const dtSec = ((b[3] || 0) - (a[3] || 0)) / 1000
+                if (dtSec > 0) {
+                  const cos = Math.cos(((a[0] + b[0]) / 2) * Math.PI / 180)
+                  const dx = (b[1] - a[1]) * 364560 * cos
+                  const dy = (b[0] - a[0]) * 364560
+                  trackDeg = Math.round((Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360)
+                }
+              }
+
+              const flightId = computeFlightId(airport, tail, takeoffMs)
+              const ack = ackByFlightId.get(flightId)
+              const acknowledged = !!ack
+
+              // Phase (v0 — phaseML wiring deferred to a follow-up):
+              //   airborne → 'nearby' (within range) — always in AIRBORNE_RELEVANT
+              //   landed + acked → 'landed'
+              //   landed + not acked → 'ack_pending'
+              let phase
+              if (isAirborne) phase = 'nearby'
+              else if (acknowledged) phase = 'landed'
+              else phase = 'ack_pending'
+
+              // Membership.
+              const inAirborneSet = isAirborne && dist <= rangeNm
+              const inLandedSet = !isAirborne
+                && landingMs != null
+                && landingMs >= landedCutoffMs
+                && landingDist <= LANDING_NEAR_NM
+                && !acknowledged
+              if (!inAirborneSet && !inLandedSet) continue
+
+              const sinceMs = isAirborne
+                ? (nowMs - takeoffMs)
+                : (nowMs - (landingMs || nowMs))
+
+              // Compute V/P/N indicators inline (Ask #2 + #5a). worst_segment
+              // is still null pending the sliding-window analysis (Ask #5b).
+              const indFull = computeFlightIndicators(
+                grp, pts, tail, t.type, airport, complaintsRaw,
+              )
+              const { worst_segment, impact_index, ...indicators } = indFull
+
+              flights.push({
+                id: flightId,
+                tail,
+                type: t.type || null,
+                icon_url: aircraftIconUrl(t.type, tail),
+                phase,
+                is_airborne: isAirborne,
+                landed_at: landingMs ? new Date(landingMs).toISOString() : null,
+                takeoff_ts: new Date(takeoffMs).toISOString(),
+                acknowledged,
+                acknowledged_by: ack?.acknowledged_by || null,
+                acknowledged_at: ack?.at || null,
+                since_ms: Math.max(0, sinceMs),
+                cycles_in_flight: grp.length,
+                indicators,
+                worst_segment,
+                impact_index,
+                lat: refPt?.[0] ?? null,
+                lon: refPt?.[1] ?? null,
+                alt_ft: refPt?.[2] ?? null,
+                track_deg: trackDeg,
+                last_seen_s: lastSeenS,
+                dist_nm: Math.round(dist * 10) / 10,
+              })
+            }
+          }
+
+          // Airborne first, then most-recent landing first.
+          flights.sort((a, b) => {
+            if (a.is_airborne !== b.is_airborne) return a.is_airborne ? -1 : 1
+            return (b.landed_at || '').localeCompare(a.landed_at || '')
+          })
+
+          res.end(JSON.stringify({
+            airport,
+            generated_at: new Date(nowMs).toISOString(),
+            flight_gap_min: flightGapMinFor(airport),
+            landed_hours: landedHours,
+            range_nm: rangeNm,
+            count: flights.length,
+            indicators_note: 'V/P/N indicators wired (Ask #2 + #5a). worst_segment is null pending the sliding-window analysis (Ask #5b).',
+            pop_impact_scale: 'pop_impact is a 0-100 integer per Ask #5a; impact_index is the legacy small-float for back-compat with the wall kiosk.',
+            flights,
+          }))
+        } catch (err) {
+          console.error('[flights/current] error', err)
           res.statusCode = 500
           res.end(JSON.stringify({ error: String(err) }))
         }
@@ -3306,6 +4051,12 @@ function noiseApiPlugin() {
           const range = await db.loadLiveFromDbByDateRange(today, today)
           const tracks = range.tracks || []
 
+          // Complaints — same shared loader the boot endpoint uses, so the
+          // kiosk's recent-impact map can glow per-band/segment without
+          // having to cross-reference /api/complaints from the client.
+          const fsMod = await import('./flightScore.js')
+          const complaintsRaw = await loadComplaintsCached()
+
           // call → base/purpose/school/desc from the historical classification
           const tails = [...new Set(tracks.map((t) => (t.call || '').trim()).filter(Boolean))]
           const info = new Map()
@@ -3344,10 +4095,12 @@ function noiseApiPlugin() {
             //    airport (extractTowCycles with KBDU's threshold also detects
             //    cycles at neighboring fields like KEIK/KLMO — filter those out
             //    by landing location, not just time).
+            const LANDING_CONFIRM_MS = 30 * 1000 // need ≥30 s of on-ground fixes after landing_ts to call it "landed"
+            const groundCeil = ap.elev + 200     // a fix at/below this is "on the ground" near the field
             const atAirport = []
             for (const f of adsb.extractTowCycles(t.hex, t.call, pts, zoneConfig)) {
               if (!f.takeoff_ts || !f.landing_ts) continue
-              const tMs = Date.parse(f.takeoff_ts), lMs = Date.parse(f.landing_ts)
+              let tMs = Date.parse(f.takeoff_ts), lMs = Date.parse(f.landing_ts)
               if (!Number.isFinite(tMs) || !Number.isFinite(lMs)) continue
               if ((nowMs - lMs) > minutesMs) continue
               // Endpoint of this cycle (last fix at or before landing_ts).
@@ -3355,7 +4108,27 @@ function noiseApiPlugin() {
               for (const p of pts) { if (p[3] != null && p[3] <= lMs) endPt = p; else if (p[3] > lMs) break }
               if (!endPt) continue
               if (distNmAp(endPt[0], endPt[1], ap.lat, ap.lon) > LANDING_NEAR_NM) continue
-              atAirport.push({ takeoff_ts: f.takeoff_ts, landing_ts: f.landing_ts, tMs, lMs })
+              // Reject "phantom landings": the phase detector treats a single
+              // below-threshold fix on short final as on_ground (e.g. N75FF at
+              // 5325 ft / 83 kts / -758 fpm gave a 0-second on_ground phase
+              // and was reported as landed while still flying). Require either
+              // ≥LANDING_CONFIRM_MS of fixes at/below the field ground ceiling
+              // OR ≥2 such fixes spanning some duration. If neither holds, the
+              // aircraft is still on short final — skip until next poll.
+              const groundFixes = pts.filter(p => p[3] != null && p[3] >= lMs - 5000 && p[2] != null && p[2] <= groundCeil)
+              const groundSpan = groundFixes.length >= 2 ? (groundFixes[groundFixes.length - 1][3] - groundFixes[0][3]) : 0
+              if (groundSpan < LANDING_CONFIRM_MS) continue
+              // Trim cycle to its last contiguous session — phase detection
+              // can't see a landing across an ADS-B blackout, so a morning
+              // flight + 14-hour gap + evening flight reads as one ~15-hour
+              // "cycle". Walk the cycle's points; if any consecutive pair is
+              // more than SESSION_GAP_MS apart, the real takeoff is after the
+              // last such gap.
+              const inCy = pts.filter(p => p[3] != null && p[3] >= tMs && p[3] <= lMs)
+              for (let i = inCy.length - 1; i > 0; i--) {
+                if ((inCy[i][3] - inCy[i - 1][3]) > SESSION_GAP_MS) { tMs = inCy[i][3]; break }
+              }
+              atAirport.push({ takeoff_ts: new Date(tMs).toISOString(), landing_ts: f.landing_ts, tMs, lMs })
             }
             // 2. Sort by takeoff and merge T&Gs at THIS field: consecutive cycles
             //    whose ground gap is < TNG_GAP_MS collapse into one flight. (A
@@ -3379,10 +4152,18 @@ function noiseApiPlugin() {
             if (merged.length === 0) {
               const last = pts[pts.length - 1]
               const tdAlt = ap.elev + 1500
-              const groundCeil = ap.elev + 200
+              // Same phantom-landing guard as the main path: require ≥30 s of
+              // tail fixes at/below the field ground ceiling, so an aircraft
+              // on short final isn't reported as landed. (groundCeil declared
+              // above near LANDING_CONFIRM_MS, reused here.)
+              const tailFixes = last && last[3] != null
+                ? pts.filter(p => p[3] != null && (last[3] - p[3]) <= 60_000 && p[2] != null && p[2] <= groundCeil)
+                : []
+              const tailSpan = tailFixes.length >= 2 ? (tailFixes[tailFixes.length - 1][3] - tailFixes[0][3]) : 0
               if (last && last[3] != null && (nowMs - last[3]) <= minutesMs
                   && last[2] != null && last[2] <= tdAlt
-                  && distNmAp(last[0], last[1], ap.lat, ap.lon) <= LANDING_NEAR_NM) {
+                  && distNmAp(last[0], last[1], ap.lat, ap.lon) <= LANDING_NEAR_NM
+                  && tailSpan >= LANDING_CONFIRM_MS) {
                 // Walk backward: find the start of the last contiguous session.
                 let sessionStart = pts.length - 1
                 for (let i = pts.length - 1; i > 0; i--) {
@@ -3422,6 +4203,53 @@ function noiseApiPlugin() {
               // purpose-aware weighting (training ×2, slide cadence, etc.) is a
               // caller concern (badges, sort order, slide rotation).
               const impact_score = Math.round(impact_index * 1000) / 1000
+              const bands = bandsFromPoints(cyclePts, POPGRID.popAt, t.type)
+              // Per-landing complaints — tail+cycle-window match. Then
+              // attach to bands with the same tight 60-s pad the boot
+              // endpoint uses, so the recent-impact map can paint
+              // per-segment glow without a client-side cross-reference.
+              const landingComplaints = fsMod.matchComplaintsForKiosk(complaintsRaw, tail, tMs, lMs)
+              fsMod.attachComplaintsToBands(bands, landingComplaints, { pad: 60 * 1000 })
+              // Departure detection — find the first POST-landing fix that's
+              // both airborne (alt > field+200 ft) AND > 0.5 nm from the
+              // field. A brief taxi-back or hold-short ADS-B blip stays
+              // close to the runway so the 0.5 nm guard rejects it. The
+              // first such fix is when the aircraft really left — that's
+              // `departed_at`. If we never see one, the aircraft is either
+              // still on the ground or has dropped out of ADS-B coverage.
+              const DEPART_MIN_NM = 0.5
+              const COVERAGE_FRESH_MS = 5 * 60_000 // last fix within 5 min → coverage is live
+              let departedMs = null
+              for (const p of pts) {
+                if (p[3] == null || p[3] <= lMs) continue
+                if (p[2] == null || p[2] <= groundCeil) continue
+                if (distNmAp(p[0], p[1], ap.lat, ap.lon) < DEPART_MIN_NM) continue
+                departedMs = p[3]
+                break
+              }
+              // "still_on_ground" only when we have RECENT coverage of the
+              // tail; otherwise we can't tell if the aircraft is on the
+              // ground or just out of ADS-B reach. (last point in the full
+              // track within COVERAGE_FRESH_MS of now → coverage is live.)
+              const lastFix = pts[pts.length - 1]
+              const coverageFresh = lastFix && lastFix[3] != null && (nowMs - lastFix[3]) <= COVERAGE_FRESH_MS
+              const stillOnGround = departedMs == null && coverageFresh
+              // on_ground_min — actual dwell (departed - landed), OR
+              // wall-clock since landing when truly on the ground, OR
+              // null when we have no idea (coverage gap, no departure seen).
+              let onGroundMin = null
+              if (departedMs != null) {
+                onGroundMin = Math.round(Math.max(0, (departedMs - lMs) / 60000) * 10) / 10
+              } else if (stillOnGround) {
+                onGroundMin = Math.round(Math.max(0, (nowMs - lMs) / 60000) * 10) / 10
+              }
+              // The user-visible "landed full stop" decision: we still emit
+              // the cycle (the kiosk wants to see overflights / brief
+              // touches in the impact list), but mark it honestly. An
+              // aircraft that departed in < 60 s is a transit touch, not a
+              // landed-full-stop. The boot endpoint's phase classifier
+              // independently classifies these as 'overflight'.
+              const fullStop = onGroundMin == null ? null : onGroundMin >= 1.0
               out.push({
                 tail, type: t.type || null, desc: inf.descr || expandType(t.type),
                 icon_url: aircraftIconUrl(t.type, tail),
@@ -3430,16 +4258,25 @@ function noiseApiPlugin() {
                 origin_dist_nm: Math.round(distNmAp(p0[0], p0[1], ap.lat, ap.lon) * 10) / 10,
                 landed: true,
                 landed_at: new Date(lMs).toISOString(),
-                on_ground_min: Math.round(Math.max(0, (nowMs - lMs) / 60000) * 10) / 10,
+                departed_at: departedMs != null ? new Date(departedMs).toISOString() : null,
+                still_on_ground: !!stillOnGround,
+                on_ground_min: onGroundMin,
+                full_stop: fullStop,
                 airborne_min: Math.round(Math.max(0, (lMs - tMs) / 60000) * 10) / 10,
                 impact_index: Math.round(impact_index * 1000) / 1000,
                 impact_score, impact_grade: impactGrade(impact_score),
                 pop_impact: Math.round(total),
-                bands: bandsFromPoints(cyclePts, POPGRID.popAt),
+                bands,
+                complaints: landingComplaints,
               })
             }
           }
           out.sort((a, b) => (b.landed_at || '').localeCompare(a.landed_at || ''))
+          // Top-level complaint feed — every complaint within `minutes`,
+          // independent of which landing it matches. Kiosk filters to
+          // lat/lon-populated entries for map pins (mirrors the boot
+          // endpoint's shape so a single client renderer handles both).
+          const complaintsForWindow = fsMod.recentComplaintsForKiosk(complaintsRaw, minutes)
           res.end(JSON.stringify({
             generated_at: new Date(nowMs).toISOString(),
             airport, minutes, pop_scale: POP_SCALE,
@@ -3448,8 +4285,20 @@ function noiseApiPlugin() {
               impact_score: 'alias of impact_index (no purpose multiplier — purpose-aware ranking is a caller concern)',
               impact_grade: 'A<0.3 B<0.6 C<1.2 D<2.0 F',
             },
+            departure_tracking: {
+              departed_at: 'ISO ts of the first post-landing fix that is airborne AND > 0.5 nm from the field. null when no departure detected.',
+              still_on_ground: 'true iff departed_at is null AND last fix on this tail is within 5 min of now (coverage live).',
+              on_ground_min: 'Actual ground dwell. (departed_at - landed_at) when departed; (now - landed_at) when still_on_ground; null when coverage gapped.',
+              full_stop: 'true when on_ground_min >= 1.0 min. false = transit touch / overflight. null when undetermined.',
+            },
             count: out.length,
             landings: out,
+            complaints: {
+              window_minutes: minutes,
+              count: complaintsForWindow.length,
+              geocoded_count: complaintsForWindow.filter(c => c.lat != null && c.lon != null).length,
+              items: complaintsForWindow,
+            },
           }))
         } catch (e) {
           console.error('[noise-api] /recent-landings error', e)
@@ -4095,21 +4944,294 @@ function adsbApiPlugin() {
         }
       })
 
-      // ── GET /api/adsb/track/:icao ──────────────────────────────────
-      server.middlewares.use('/api/adsb/track/', async (req, res, next) => {
+      // ── GET /api/adsb/current-flights?airport=KBDU&range_nm=10 ─────
+      // Aircraft BASED at `airport` that are currently flying in the area.
+      // "Based at" combines three signals (an aircraft qualifies if ANY
+      // match): tracks-DB base_airport classification, flight-school
+      // fleet registry (data/flight_schools_fleets.json — school's airport
+      // field), and fleet.json (the local tow-plane registry). Pass
+      // `?include=visitors` to drop the based-at filter entirely. "Flying"
+      // = last fix above field+200 ft AGL within `range_nm` of the field.
+      // For each, return how long they've been airborne (from the first
+      // airborne fix in the current contiguous session — same session-gap
+      // logic as /api/noise/recent-landings) and a placeholder `phase`
+      // from the rule-based oracle. The phase field is a placeholder
+      // pending the ML classifier in src/PHASE_ML_KICKOFF.md.
+      server.middlewares.use('/api/adsb/current-flights', async (req, res, next) => {
         if (req.method !== 'GET') return next()
         try {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-          // Extract icao from path: /api/adsb/track/a59663 → url is /a59663
-          const icao = u.pathname.replace(/^\//, '').toLowerCase()
-          if (!icao) {
-            res.statusCode = 400
-            res.end(JSON.stringify({ error: 'icao required' }))
-            return
+          const airport = (u.searchParams.get('airport') || 'KBDU').trim().toUpperCase()
+          const rangeNm = Math.max(0.5, Math.min(50, Number(u.searchParams.get('range_nm')) || 10))
+          const includeVisitors = (u.searchParams.get('include') || '').toLowerCase().includes('visitors')
+          const ap = ENRICH_AP.find((a) => a.code === airport)
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.setHeader('Cache-Control', 'public, max-age=5')
+          if (!ap) { res.statusCode = 400; return res.end(JSON.stringify({ error: `unknown airport ${airport}` })) }
+
+          const live = await loadLive()
+          const tracks = live.tracks || []
+          const nowMs = Date.now()
+          const SESSION_GAP_MS = 30 * 60000
+          const STALE_MAX_S = 180 // skip aircraft whose last fix is > 3 min old
+          const groundCeil = ap.elev + 200
+
+          // Complaints (30 s memoized) for per-flight halo + top-level pins.
+          // Same loader the /api/excursions/boot endpoint uses, so a kiosk
+          // polling both surfaces shares one DB hit per window.
+          const fsMod = await import('./flightScore.js')
+          const complaintsRaw = await loadComplaintsCached()
+
+          // Per-tail base lookup (same shape as other endpoints).
+          const tails = [...new Set(tracks.map((t) => (t.call || '').trim()).filter(Boolean))]
+          const info = new Map()
+          if (tails.length) {
+            const r = await db.queryDb(
+              `SELECT call,
+                 (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base,
+                 (array_agg(purpose      ORDER BY date DESC) FILTER (WHERE purpose      IS NOT NULL))[1] AS purpose,
+                 (array_agg(school       ORDER BY date DESC) FILTER (WHERE school       IS NOT NULL))[1] AS school,
+                 (array_agg(desc_text    ORDER BY date DESC) FILTER (WHERE desc_text    IS NOT NULL))[1] AS descr
+               FROM tracks WHERE call = ANY($1) GROUP BY call`, [tails])
+            for (const row of r.rows) info.set(row.call, row)
           }
 
-          const sinceParam = u.searchParams.get('since')
-          const since = sinceParam ? new Date(sinceParam).getTime() : Date.now() - 4 * 3600 * 1000
+          // Build tail→airport map from flight_schools_fleets.json. Many
+          // school aircraft (e.g. N75FF / N53FF) don't have base_airport
+          // set in the tracks DB but ARE listed in a school's aircraft[].
+          // Cached per process; the file is static config.
+          if (!global.__SCHOOL_TAIL_AIRPORT) {
+            try {
+              const { default: fs } = await import('fs/promises')
+              const raw = await fs.readFile('public/flight_schools_fleets.json', 'utf8')
+              const sf = JSON.parse(raw)
+              const m = new Map()
+              for (const s of sf.schools || []) {
+                const sAp = (s.airport || '').split(/\s+/)[0].trim().toUpperCase() // "KBJC area" → "KBJC"
+                if (!sAp) continue
+                for (const ac of s.aircraft || []) {
+                  const t = (ac.tail || '').trim().toUpperCase()
+                  if (t && !m.has(t)) m.set(t, { airport: sAp, school: s.name || null })
+                }
+              }
+              global.__SCHOOL_TAIL_AIRPORT = m
+            } catch { global.__SCHOOL_TAIL_AIRPORT = new Map() }
+          }
+          const schoolMap = global.__SCHOOL_TAIL_AIRPORT
+          const fleet = await adsb.loadFleet() // hex → { tail, operator, role } — currently only KBDU tow planes
+
+          // Phase classifier — phaseML/oracle.js + maneuvers.js (the JS
+          // port of noise/phase-ml/). Stateless, pure, sub-ms per track.
+          // Returns { phase, current_maneuvers[], intent } per aircraft;
+          // see noise/web/phaseML/README.md for the full contract. The
+          // multi-airport intent posterior is computed against a prior
+          // biased to the requested airport so kiosk-local context is
+          // preserved (other airports still scored, just down-weighted).
+          const PHASE_WINDOW_S = 180 // 3-min trailing slice for intent
+          const RECENT_MANEUVER_S = 60 // surface maneuvers whose end is within this
+          const priorByAirport = { [airport]: 2.0 } // soft kiosk bias
+
+          const flights = []
+          for (const t of tracks) {
+            if ((t.call || '').startsWith('~')) continue
+            const pts = t.points || []
+            if (pts.length < 2) continue
+            const last = pts[pts.length - 1]
+            if (!last || last[3] == null) continue
+            const ageS = (nowMs - last[3]) / 1000
+            if (ageS > STALE_MAX_S) continue
+            // Currently airborne — last fix above field ground ceiling.
+            if (last[2] == null || last[2] <= groundCeil) continue
+            // Within range of the airport.
+            const dist = distNmAp(last[0], last[1], ap.lat, ap.lon)
+            if (dist > rangeNm) continue
+            const tail = (t.call || '').trim()
+            const tailU = tail.toUpperCase()
+            const inf = info.get(tail) || {}
+            // Three-signal "based at" check (any one qualifies).
+            const dbBase = (inf.base || '').toUpperCase() === airport
+            const schoolEntry = schoolMap.get(tailU)
+            const schoolBase = schoolEntry && schoolEntry.airport === airport
+            const fleetEntry = fleet[(t.hex || '').toLowerCase()]
+            const fleetBase = !!fleetEntry && airport === 'KBDU' // fleet.json is all KBDU operators today
+            const isBased = dbBase || schoolBase || fleetBase
+            if (!isBased && !includeVisitors) continue
+            const basedReason = dbBase ? 'db_base'
+              : schoolBase ? `school:${schoolEntry.school || 'unknown'}`
+              : fleetBase ? `fleet:${fleetEntry.operator || 'unknown'}`
+              : 'visitor'
+
+            // flying_minutes = time since the start of the current contiguous
+            // session's first airborne fix. Walk backward from `last` until
+            // we cross either a > SESSION_GAP_MS gap or a below-ground fix.
+            let takeoffMs = last[3]
+            for (let i = pts.length - 1; i > 0; i--) {
+              const cur = pts[i], prev = pts[i - 1]
+              const gap = (cur[3] || 0) - (prev[3] || 0)
+              if (gap > SESSION_GAP_MS) break
+              // If the prior fix was below ground ceiling, the current
+              // session began here (takeoff).
+              if (prev[2] != null && prev[2] <= groundCeil) { takeoffMs = cur[3]; break }
+              takeoffMs = prev[3] || takeoffMs
+            }
+            const flyingMin = Math.max(0, (nowMs - takeoffMs) / 60000)
+
+            // Derive gs / track / vs from last two points (same math as /live).
+            let gs = 0, trackDeg = 0, vs = 0
+            const prev = pts[pts.length - 2]
+            const dtSec = ((last[3] || 0) - (prev[3] || 0)) / 1000
+            if (dtSec > 0) {
+              const cos = Math.cos(((prev[0] + last[0]) / 2) * Math.PI / 180)
+              const dx = (last[1] - prev[1]) * 364560 * cos
+              const dy = (last[0] - prev[0]) * 364560
+              const dFt = Math.hypot(dx, dy)
+              gs = Math.round((dFt / 6076.12) / (dtSec / 3600))
+              trackDeg = Math.round((Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360)
+              if (prev[2] != null && last[2] != null) vs = Math.round((last[2] - prev[2]) / (dtSec / 60))
+            }
+            const altAgl = (last[2] || ap.elev) - ap.elev
+
+            // Run the phaseML classifier on this aircraft's last
+            // PHASE_WINDOW_S worth of fixes. Use only the current-session
+            // points (computed above as `takeoffMs..last`) so a long
+            // taxi/blackout from earlier in the day doesn't drag the
+            // classifier into stale state.
+            let phase = 'nearby', currentManeuvers = [], intentTop = null
+            try {
+              const windowStartMs = Math.max(takeoffMs, last[3] - PHASE_WINDOW_S * 1000)
+              const phasePts = []
+              for (const p of pts) {
+                if (p[3] == null || p[3] < windowStartMs) continue
+                phasePts.push({ lat: p[0], lon: p[1], altMslFt: p[2], tsUnix: p[3] / 1000 })
+              }
+              if (phasePts.length >= 2) {
+                const { phases, maneuvers, intent } = classifyOneTrack(phasePts, {
+                  typeCode: t.type || '',
+                  intentWindowS: PHASE_WINDOW_S,
+                  priorByAirport,
+                })
+                if (phases && phases.length) phase = phases[phases.length - 1].phase
+                const endTs = phasePts[phasePts.length - 1].tsUnix
+                currentManeuvers = (maneuvers || [])
+                  .filter(m => m.endTsUnix != null && (endTs - m.endTsUnix) <= RECENT_MANEUVER_S)
+                  .map(m => ({
+                    type: m.type, confidence: m.confidence,
+                    decisionCue: m.evidence?.decisionCue || null,
+                    startTs: m.startTsUnix != null ? new Date(m.startTsUnix * 1000).toISOString() : null,
+                    endTs: m.endTsUnix != null ? new Date(m.endTsUnix * 1000).toISOString() : null,
+                  }))
+                if (intent?.top) {
+                  intentTop = {
+                    airport: intent.top.airport,
+                    probability: intent.top.probability ?? null,
+                    runway: intent.top.runway || null,
+                    confidence_gap: intent.confidenceGap ?? null,
+                    explanation: intent.top.explanation || null,
+                  }
+                }
+              }
+            } catch (e) {
+              console.error('[current-flights] phaseML error for', tail, e.message)
+            }
+
+            // Per-flight complaints — match by tail across the current
+            // airborne session, with the same ±10 min pad as everywhere else.
+            const flightComplaints = fsMod.matchComplaintsForKiosk(
+              complaintsRaw, tail, takeoffMs, last[3] || nowMs,
+            )
+
+            flights.push({
+              icao: t.hex,
+              tail,
+              type: t.type || null,
+              desc: inf.descr || expandType(t.type),
+              base: inf.base || (schoolBase ? airport : null) || (fleetBase ? airport : null),
+              based_reason: basedReason,
+              purpose: resolvePurpose(inf.purpose, t.type, tail),
+              school: inf.school || schoolEntry?.school || null,
+              lat: last[0], lon: last[1],
+              alt_ft: last[2], alt_agl: Math.round(altAgl),
+              gs_kts: gs, track_deg: trackDeg, vs_fpm: vs,
+              dist_nm: Math.round(dist * 10) / 10,
+              last_seen_s: Math.round(ageS),
+              flying_minutes: Math.round(flyingMin * 10) / 10,
+              takeoff_ts: new Date(takeoffMs).toISOString(),
+              phase,
+              phase_source: 'phaseML',
+              current_maneuvers: currentManeuvers,
+              intent: intentTop,
+              complaints: flightComplaints,
+            })
+          }
+          flights.sort((a, b) => (a.dist_nm - b.dist_nm))
+          // Top-level complaint feed — recent complaints (last 60 min, matching
+          // the live-flight focus), independent of tail-match. Kiosk filters
+          // to lat/lon-populated entries for map pins; the per-flight
+          // `complaints[]` array above already covers the halo case.
+          const complaintsForWindow = fsMod.recentComplaintsForKiosk(complaintsRaw, 60)
+          res.end(JSON.stringify({
+            generated_at: new Date(nowMs).toISOString(),
+            airport, range_nm: rangeNm,
+            count: flights.length,
+            phase_labels: [
+              'on_ground', 'taxiing', 'pattern', 'landed_full_stop',
+              'practice_area', 'departing', 'inbound', 'en_route', 'nearby',
+            ],
+            phase_source: 'phaseML',
+            phase_note: 'phase comes from noise/web/phaseML (JS port of noise/phase-ml). Each flight also carries `current_maneuvers` (PTS detections whose end is within the last 60 s) and `intent` (Bayesian multi-airport posterior over candidate destinations). Hit /api/phase-ml/health or /classify directly to drive the same engine without going through current-flights.',
+            flights,
+            complaints: {
+              window_minutes: 60,
+              count: complaintsForWindow.length,
+              geocoded_count: complaintsForWindow.filter(c => c.lat != null && c.lon != null).length,
+              items: complaintsForWindow,
+            },
+          }))
+        } catch (err) {
+          console.error('[adsb/current-flights] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+
+      // ── GET /api/adsb/track ────────────────────────────────────────
+      // Two URL shapes (both supported, both return phase data):
+      //   GET /api/adsb/track?icao=<hex>&minutes=<1..60>
+      //     → preferred. Returns raw `[lat, lon, alt, ts_ms]` tuples (the
+      //       same format the live store uses internally), so callers can
+      //       feed them directly into phase-ml without re-parsing dates.
+      //   GET /api/adsb/track/<icao>?since=<iso8601>
+      //     → legacy. Returns `[{ts, lat, lon, alt, gs, vs}]` objects.
+      //
+      // The bare-path registration (`/api/adsb/track`) catches BOTH because
+      // connect's `use()` matches the prefix with `/`, `?`, or end-of-path.
+      server.middlewares.use('/api/adsb/track', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          // connect strips the prefix from req.url; pathname is either '/'
+          // (bare query call) or '/<icao>' (legacy path call).
+          const icaoFromQuery = (u.searchParams.get('icao') || '').trim().toLowerCase()
+          const icaoFromPath = u.pathname.replace(/^\//, '').trim().toLowerCase()
+          const icao = icaoFromQuery || icaoFromPath
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          if (!icao) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: 'icao required: pass ?icao=<hex> or /api/adsb/track/<hex>' }))
+          }
+
+          // Window selection: ?minutes= (preferred, 1..60) > ?since= > 4h default.
+          const minutesParam = u.searchParams.get('minutes')
+          let sinceMs
+          if (minutesParam != null && minutesParam !== '') {
+            const minutes = Math.max(1, Math.min(60, Number(minutesParam) || 30))
+            sinceMs = Date.now() - minutes * 60_000
+          } else {
+            const sinceParam = u.searchParams.get('since')
+            sinceMs = sinceParam ? new Date(sinceParam).getTime() : Date.now() - 4 * 3600 * 1000
+          }
 
           const fleet = await adsb.loadFleet()
           const zoneConfig = await adsb.loadZones()
@@ -4125,28 +5247,35 @@ function adsbApiPlugin() {
 
           if (!track) {
             res.statusCode = 404
-            res.end(JSON.stringify({ error: 'icao not found' }))
-            return
+            return res.end(JSON.stringify({ error: 'icao not found in today\'s live tracks' }))
           }
 
-          // Filter points by since timestamp
-          const filtered = (track.points || []).filter(p =>
-            !p[3] || p[3] >= since
-          )
+          // Filter points by sinceMs (points lacking a timestamp are kept —
+          // they're historical fallback entries with no per-point time).
+          const filtered = (track.points || []).filter(p => !p[3] || p[3] >= sinceMs)
 
           const phases = adsb.detectPhases(filtered, zoneConfig)
           const tail = fleet[icao]?.tail || track.call || icao
+          // Use the raw tuple shape only when the caller used the new
+          // ?icao= form — keeps existing path-based callers byte-stable.
+          const useTuples = icaoFromQuery !== ''
 
-          res.setHeader('Content-Type', 'application/json')
-          res.setHeader('Access-Control-Allow-Origin', '*')
           res.end(JSON.stringify({
-            icao,
-            tail,
-            points: filtered.map(p => ({
-              ts: p[3] ? new Date(p[3]).toISOString() : null,
-              lat: p[0], lon: p[1], alt: p[2],
-              gs: null, vs: null,
-            })),
+            icao, tail,
+            window: {
+              minutes: minutesParam ? Math.max(1, Math.min(60, Number(minutesParam) || 30)) : null,
+              since: new Date(sinceMs).toISOString(),
+              point_count: filtered.length,
+            },
+            // Each tuple: [lat, lon, alt_ft, ts_ms]. ts_ms may be null on
+            // legacy historical fallback fixes that lacked a timestamp.
+            points: useTuples
+              ? filtered.map(p => [p[0], p[1], p[2], p[3] ?? null])
+              : filtered.map(p => ({
+                  ts: p[3] ? new Date(p[3]).toISOString() : null,
+                  lat: p[0], lon: p[1], alt: p[2],
+                  gs: null, vs: null,
+                })),
             phases: phases.map(p => ({
               type: p.type,
               start_ts: p.start_ts ? new Date(p.start_ts).toISOString() : null,
@@ -4525,6 +5654,23 @@ function flightImpactPlugin() {
     } catch { return [] }
   }
 
+  // Mirrors loadComplaints — pulls the raw noise-report records (with
+  // reportedSegments[] when present, or the older `excursion` shape) from
+  // Postgres or the local JSON fallback. Audio attachments are deliberately
+  // untouched here; see flightScore.matchReportSegments for the projection.
+  const loadNoiseReports = async () => {
+    if (db.useDb) {
+      try { return await db.getNoiseReports(null) } catch { return [] }
+    }
+    try {
+      const fs = await import('fs/promises')
+      const path = await import('path')
+      const buf = await fs.default.readFile(path.default.resolve('data/noise_reports.json'), 'utf8')
+      const parsed = JSON.parse(buf)
+      return Array.isArray(parsed) ? parsed : (parsed.reports || [])
+    } catch { return [] }
+  }
+
   const loadLive = async () => {
     if (db.useDb) return db.loadLiveFromDb()
     const fs = await import('fs/promises')
@@ -4538,12 +5684,17 @@ function flightImpactPlugin() {
   // Score every completed flight that touched down near `airport` within the
   // last `minutes`. Returns the scored objects (with track slices attached
   // so the detail/frame routes can reuse them) keyed by id.
-  const scoreRecentLandings = async (airport, minutes) => {
+  //
+  // `opts.reportSource` filters per-segment noise_reports[]: 'manual' (only
+  // human-submitted), 'auto' (only auto-generated), or 'any' (default).
+  const scoreRecentLandings = async (airport, minutes, opts = {}) => {
     const score = await import('./flightScore.js')
-    const [zoneConfig, fleet, live, allZones, complaints, popGrid] = await Promise.all([
+    const [zoneConfig, fleet, live, allZones, complaints, popGrid, noiseReports] = await Promise.all([
       adsb.loadZones(), adsb.loadFleet(), loadLive(),
       loadZonesByName(), loadComplaints(), loadPopGrid(),
+      loadNoiseReports(),
     ])
+    const reportSource = opts.reportSource || 'any'
     const zonesForAirport = allZones.filter(
       z => !airport || (z.airport || '').toUpperCase() === airport
     )
@@ -4590,6 +5741,14 @@ function flightImpactPlugin() {
       })
       result._points = c.points
       result._zones = zonesForAirport
+      // Per-segment noise-report enrichment (separate from voices_heard,
+      // which counts complaints). Each entry is one reportedSegments[]
+      // element, or one synthetic excursion-as-segment fallback.
+      const startMs = c.points[0]?.[3] ?? c.landedMs
+      const endMs = c.points[c.points.length - 1]?.[3] ?? c.landedMs
+      result.noise_reports = score.matchReportSegments(
+        noiseReports, result.tail, startMs, endMs, { source: reportSource },
+      )
       byId.set(result.id, result)
       scored.push(result)
     }
@@ -4603,6 +5762,7 @@ function flightImpactPlugin() {
     landed_ts: r.landed_ts, trip_minutes: r.trip_minutes,
     score: r.score, tier: r.tier, home: r.home, greeting: r.greeting,
     gentleness: r.gentleness, highlights: r.highlights, detail: r.detail,
+    noise_reports: r.noise_reports || [],
   })
 
   const json = (res, code, body) => {
@@ -4636,7 +5796,9 @@ function flightImpactPlugin() {
           // The id encodes the icao + takeoff epoch; widen the lookback so an
           // older-but-still-listed flight resolves regardless of the 30 min feed.
           const minutes = Math.min(720, Math.max(30, Number(u.searchParams.get('minutes')) || 360))
-          const { byId } = await scoreRecentLandings(null, minutes)
+          const reportSource = (u.searchParams.get('reports') || 'any').toLowerCase()
+          const reportSourceOk = ['manual', 'auto', 'any'].includes(reportSource) ? reportSource : 'any'
+          const { byId } = await scoreRecentLandings(null, minutes, { reportSource: reportSourceOk })
           const r = byId.get(id)
           if (!r) {
             if (wantFrame) return html(res, 404, '<!doctype html><meta charset=utf-8><body style="font:16px system-ui;padding:2rem">Flight not found or no longer in the live window.</body>')
@@ -4656,6 +5818,7 @@ function flightImpactPlugin() {
               // multiplies visually by population; the score already did.
               db: grid.db ? Array.from(grid.db).map(v => (isFinite(v) ? +v.toFixed(1) : null)) : null,
             } : null,
+            report_source_filter: reportSourceOk,
           })
         } catch (err) {
           console.error('[flight-impact/detail] error', err)
@@ -4673,11 +5836,16 @@ function flightImpactPlugin() {
         try {
           const airport = (u.searchParams.get('airport') || '').trim().toUpperCase() || null
           const minutes = Math.min(720, Math.max(1, Number(u.searchParams.get('minutes')) || 30))
-          const { scored } = await scoreRecentLandings(airport, minutes)
+          // Accept ?reports=manual|auto|any to filter the per-flight
+          // noise_reports[] enrichment. Default is 'any' (return both).
+          const reportSourceRaw = (u.searchParams.get('reports') || 'any').toLowerCase()
+          const reportSource = ['manual', 'auto', 'any'].includes(reportSourceRaw) ? reportSourceRaw : 'any'
+          const { scored } = await scoreRecentLandings(airport, minutes, { reportSource })
           json(res, 200, {
             airport, window_minutes: minutes,
             generated_at: new Date().toISOString(),
             count: scored.length,
+            report_source_filter: reportSource,
             flights: scored.map(summarize),
           })
         } catch (err) {
@@ -4993,8 +6161,9 @@ const API_MANIFEST = {
             { name: 'limit', type: 'int', default: 100, desc: 'Cap on tracks returned.' },
             { name: 'include', type: 'csv', desc: 'Opt-in joins: reports, notifications.' },
           ],
-          response: { active: '[{tail, worst, counts, pointsHit, lastDate, live}]', tracks: 'array of tracks with bands', live: '{updated_at, tracks}' },
+          response: { active: '[{tail, worst, counts, pointsHit, lastDate, live}]', tracks: 'array of tracks with bands + server-classified phase/descents/hasDescents (same classifier as /api/excursions/segments)', live: '{updated_at, tracks}' },
           example: '/api/excursions/boot?hours=1&include=reports,notifications',
+          notes: 'Each track has phase ∈ {overflight, departure, arrival, pattern} and descents (int). Use these instead of any client-side altitude-trend heuristic — they handle stale fixes, thermalling gliders, and touch-and-goes correctly.',
         },
         {
           method: 'GET',
@@ -5022,10 +6191,38 @@ const API_MANIFEST = {
         },
         {
           method: 'GET',
-          path: '/api/adsb/track/:icao',
-          purpose: 'Full track + detected flight phases for one aircraft.',
-          params: [{ name: 'since', type: 'iso-timestamp', default: '4h ago', desc: 'Only points after this time.' }],
-          response: { icao: 'string', tail: 'string', points: '[{ts, lat, lon, alt, gs, vs}]', phases: '[{type, start_ts, end_ts, alt_start, alt_end}]' },
+          path: '/api/adsb/current-flights',
+          purpose: 'Aircraft BASED at airport that are currently airborne within range, with how long they have been flying and a placeholder flight-phase label.',
+          params: [
+            { name: 'airport', type: 'string', default: 'KBDU', desc: 'ICAO code. Must be in the enrichment list (KBDU/KBJC/KEIK/KLMO/KAPA/KGXY/KFNL/KDEN).' },
+            { name: 'range_nm', type: 'float', default: 10, desc: 'Search radius in nautical miles. Clamped to [0.5, 50].' },
+          ],
+          response: {
+            airport: 'string', range_nm: 'float', count: 'int',
+            phase_labels: '["on_ground","taxiing","pattern","landed_full_stop","practice_area","departing","inbound","en_route","nearby"]',
+            phase_source: '"phaseML"',
+            flights: '[{icao, tail, type, desc, base, purpose, school, lat, lon, alt_ft, alt_agl, gs_kts, track_deg, vs_fpm, dist_nm, last_seen_s, flying_minutes, takeoff_ts, phase, phase_source, current_maneuvers, intent}]',
+          },
+          example: '/api/adsb/current-flights?airport=KBDU&range_nm=10',
+          notes: '`flying_minutes` is wall-clock minutes since the current contiguous session\'s first airborne fix (session = no gap > 30 min and no below-ground-ceiling fix). `phase` comes from noise/web/phaseML — same engine exposed at /api/phase-ml/classify. `current_maneuvers` lists PTS detections (steep_turn, s_turns_across_road, touch_and_go, etc.) whose end is within the last 60 s, each with confidence and decisionCue. `intent` is the Bayesian multi-airport posterior — prior is biased 2× to the requested airport. Skips aircraft whose last fix is > 3 min old, anonymized ~hex tails, and aircraft not based at the requested airport (use ?include=visitors to drop the based filter).',
+        },
+        {
+          method: 'GET',
+          path: '/api/adsb/track',
+          purpose: 'Per-aircraft rolling track window. Two URL shapes — `?icao=<hex>&minutes=<N>` returns raw point tuples (preferred for downstream pipelines like phase-ml); `/track/<hex>?since=<iso>` returns named-object points (legacy).',
+          params: [
+            { name: 'icao', type: 'hex', desc: 'ICAO hex (matches what airplanes.live emits). Query-param form.' },
+            { name: 'minutes', type: 'int', default: 30, desc: 'Window size in minutes, clamped to [1, 60]. Only when `icao` is set via query.' },
+            { name: 'since', type: 'iso-timestamp', default: '4h ago', desc: 'Legacy: only points after this time. Used when caller hits /track/<hex>.' },
+          ],
+          response: {
+            icao: 'string', tail: 'string',
+            window: '{minutes, since, point_count}',
+            points: 'When called as ?icao=&minutes= → [[lat, lon, alt_ft, ts_ms]] tuples. When called as /track/<hex> → [{ts, lat, lon, alt, gs, vs}] objects.',
+            phases: '[{type, start_ts, end_ts, alt_start, alt_end}] — same rule-based phases as before',
+          },
+          example: '/api/adsb/track?icao=a59663&minutes=30',
+          notes: 'Tuple shape `[lat, lon, alt_ft, ts_ms]` matches the live store and noise/phase-ml/phase_ml/data_loader.py — feed directly to the Python classifier without re-parsing dates.',
         },
         {
           method: 'GET',
@@ -5091,6 +6288,37 @@ const API_MANIFEST = {
         },
         { method: 'GET', path: '/api/noise-reports/:id/audio/:slot', purpose: 'Retrieve the raw MP3 bytes for a report+slot.' },
         { method: 'POST/GET', path: '/api/complaints', purpose: 'Quick noise complaints (lighter than full reports).' },
+      ],
+    },
+    {
+      name: 'Flights — Pilot Console CURRENT surface',
+      summary: 'Per-flight CURRENT feed and acknowledge endpoint backing the touch-screen Pilot Console. A "flight" groups T&Gs and taxi-back full-stops into one sortie; only a crew-replacement-sized ground gap (≥ FLIGHT_GAP_MIN, per-airport) starts a new one. See FLIGHT_DATA_SERVICE.md.',
+      endpoints: [
+        {
+          method: 'GET',
+          path: '/api/flights/current',
+          purpose: 'Unified CURRENT feed: airborne flights within range_nm OR landed-at-airport-and-not-yet-acknowledged. V/P/N indicators are zero in v0; Ask #2 wires them in.',
+          params: [
+            { name: 'airport', type: 'string', default: 'KBDU', desc: 'ICAO of the airport whose CURRENT to return.' },
+            { name: 'landed_hours', type: 'number', default: 6, desc: 'Hours to look back for unacked landings (0.5..48).' },
+            { name: 'range_nm', type: 'number', default: 25, desc: 'Range from the airport to include airborne traffic (1..50).' },
+          ],
+        },
+        {
+          method: 'POST',
+          path: '/api/flights/acknowledge',
+          purpose: 'One tap acks every issue on the flight (VNAP crossings, population-impact moments, complaints). Idempotent for same acknowledged_by; 409 with prior attribution for a different operator.',
+          body: 'JSON: { flight_id, acknowledged_by, note?, tail? }',
+        },
+        {
+          method: 'GET',
+          path: '/api/flights/acknowledgements',
+          purpose: 'Read-only dump of flight-ack records — lets the Pilot Console reconcile its localStorage queue on reconnect.',
+          params: [
+            { name: 'airport', type: 'string', desc: 'Filter to flight_ids whose airport prefix matches (e.g. kbdu).' },
+            { name: 'since', type: 'ISO timestamp', desc: 'Only return acks created at or after this time.' },
+          ],
+        },
       ],
     },
     {
@@ -5182,9 +6410,11 @@ export default defineConfig({
     complaintsApiPlugin(),
     noiseReportsApiPlugin(),
     pilotApiPlugin(),
+    flightsApiPlugin(),
     !db.useDb && liveCapturePlugin(),
     livePositionsPlugin(),
     adsbApiPlugin(),
+    phaseMLApiPlugin(), // /api/phase-ml/{health,airports,classify,classify-archive}
     flightImpactPlugin(),
     aircraftIconsPlugin(),
     noiseZonesApiPlugin(),
