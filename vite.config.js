@@ -3250,13 +3250,58 @@ function computeFlightId(airport, tail, takeoffMs) {
 // array of groups; each group is an array of the input cycle objects that
 // belong to the same flight. A new flight begins when the gap between the
 // previous landing (lMs) and the next takeoff (tMs) is >= gapMinMs.
-function groupCyclesIntoFlights(cycles, gapMinMs) {
+// Group cycles into flights. Two cycles merge into one flight when their
+// ground gap is < gapMinMs. The companion guard catches the case where a
+// "long" gap is actually an ADS-B coverage dropout mid-flight (validated
+// by the crew-replacement-gap analysis worker: 97% of 8-12 min "gaps"
+// had < 30% expected coverage AND the aircraft drifted > 2,000 ft between
+// supposed landing and takeoff — meaning the plane was still airborne,
+// not parked on the ramp). When the guard fires, the cycles merge even
+// at gap >= gapMinMs.
+//
+// `allPts` is the tail's full sorted point array. When omitted, the
+// guard is skipped (legacy behavior).
+const COVERAGE_GAP_SAMPLE_MS = 5000     // expected ADS-B fix interval
+const COVERAGE_GAP_THRESHOLD = 0.30     // < 30% expected coverage = dropout
+const COVERAGE_GAP_DRIFT_FT = 2000      // > 2,000 ft drift = still airborne
+
+function groupCyclesIntoFlights(cycles, gapMinMs, allPts = null) {
   if (!cycles || !cycles.length) return []
   const groups = [[cycles[0]]]
   for (let i = 1; i < cycles.length; i++) {
-    const gap = cycles[i].tMs - cycles[i - 1].lMs
-    if (gap >= gapMinMs) groups.push([cycles[i]])
-    else groups[groups.length - 1].push(cycles[i])
+    const prev = cycles[i - 1]
+    const cur = cycles[i]
+    // An in-progress cycle (null lMs) can't merge forward — no later
+    // cycle could exist beyond an open one. Hard-split.
+    if (prev.lMs == null) { groups.push([cur]); continue }
+    const gap = cur.tMs - prev.lMs
+    let merge = gap < gapMinMs
+
+    if (!merge && allPts) {
+      // Coverage-gap guard. Count fixes inside the gap window and the
+      // physical drift between the last pre-gap and first post-gap fixes.
+      const gapStart = prev.lMs
+      const gapEnd = cur.tMs
+      const expected = Math.max(1, Math.round((gapEnd - gapStart) / COVERAGE_GAP_SAMPLE_MS))
+      let inGap = 0
+      let prevFix = null, nextFix = null
+      for (const p of allPts) {
+        if (p[3] == null) continue
+        if (p[3] >= gapStart && p[3] <= gapEnd) inGap++
+        if (p[3] <= gapStart) prevFix = p
+        if (p[3] >= gapEnd && !nextFix) nextFix = p
+      }
+      const coverage = inGap / expected
+      const driftFt = (prevFix && nextFix)
+        ? distFt(prevFix[0], prevFix[1], nextFix[0], nextFix[1])
+        : 0
+      if (coverage < COVERAGE_GAP_THRESHOLD && driftFt > COVERAGE_GAP_DRIFT_FT) {
+        merge = true
+      }
+    }
+
+    if (merge) groups[groups.length - 1].push(cur)
+    else groups.push([cur])
   }
   return groups
 }
@@ -3612,17 +3657,10 @@ function flightsApiPlugin() {
 
             // Group cycles into flights using the per-airport gap. A null
             // lMs (still airborne) ends its group — no later cycle can
-            // merge into an open one.
-            const groups = []
-            let curGrp = [cycles[0]]
-            for (let i = 1; i < cycles.length; i++) {
-              const prev = cycles[i - 1]
-              if (prev.lMs == null) { groups.push(curGrp); curGrp = [cycles[i]]; continue }
-              const gap = cycles[i].tMs - prev.lMs
-              if (gap >= gapMinMs) { groups.push(curGrp); curGrp = [cycles[i]] }
-              else curGrp.push(cycles[i])
-            }
-            groups.push(curGrp)
+            // merge into an open one. Companion guard fires when a gap
+            // looks like an ADS-B coverage dropout, not real ground time
+            // (passed `pts` as the third arg).
+            const groups = groupCyclesIntoFlights(cycles, gapMinMs, pts)
 
             // Most recent track fix — drives airborne/landed decision and
             // the row's position marker.
@@ -3782,7 +3820,7 @@ function flightsApiPlugin() {
             range_nm: rangeNm,
             school_filter: schoolFilter,
             count: flights.length,
-            indicators_note: 'V/P/N indicators wired (Ask #2 + #5a). worst_segment wired (Ask #5b) with AGL-aware dBA proxy. incursion_segments wired (Ask #6) with polygon-edge interpolation, significant/minor severity tiers, and AGL-aware dBA proxy. pop_impact and worst_segment.impact_score return null when calibration would clamp (kiosk-requested while IMPACT_SCALE retunes). pop_impact and worst_segment EXCLUDE the strict airport pattern envelope (within pattern_radius_nm and ≤ 1500 ft AGL). VNAP, complaint, and incursion_segments indicators use the full track. Ask #7 ?school=<slug> filter active when set. phase labels from phaseML classifier (pattern/inbound/departing/en_route/practice_area/nearby) for airborne; landed or ack_pending for landed.',
+            indicators_note: 'V/P/N indicators wired (Ask #2 + #5a). worst_segment wired (Ask #5b) with AGL-aware dBA proxy. incursion_segments wired (Ask #6) with polygon-edge interpolation, significant/minor severity tiers, and AGL-aware dBA proxy. pop_impact and worst_segment.impact_score return null when calibration would clamp (kiosk-requested while IMPACT_SCALE retunes). pop_impact and worst_segment EXCLUDE the strict airport pattern envelope (within pattern_radius_nm and ≤ 1500 ft AGL). VNAP, complaint, and incursion_segments indicators use the full track. Ask #7 ?school=<slug> filter active when set. phase labels from phaseML classifier (pattern/inbound/departing/en_route/practice_area/nearby) for airborne; landed or ack_pending for landed. Flight grouping has a companion coverage-gap guard: cycles with >= FLIGHT_GAP_MIN apart but <30% expected ADS-B coverage AND >2,000 ft aircraft drift in the gap window are merged anyway (the gap was a coverage dropout, not real ground time).',
             pop_impact_scale: 'pop_impact is a 0-100 integer per Ask #5a; impact_index is the legacy small-float for back-compat with the wall kiosk.',
             flights,
           }))
