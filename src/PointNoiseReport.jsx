@@ -1105,23 +1105,25 @@ function TimeWindowChips({ value, onChange, disabled }) {
 
 /* ───────────────────────── loading skeleton ────────────────────────── */
 
-function LoadingSkeleton({ hours, radiusNm }) {
+function LoadingSkeleton({ hours, radiusNm, stage }) {
+  const isRetry = stage === 'retry'
   return (
     <div className="border border-white/10 rounded-lg p-8 bg-white/[0.02] text-center space-y-4">
       <div className="inline-block">
-        <svg width="36" height="36" viewBox="0 0 36 36" className="animate-spin text-sky-400">
+        <svg width="36" height="36" viewBox="0 0 36 36" className={'animate-spin ' + (isRetry ? 'text-amber-400' : 'text-sky-400')}>
           <circle cx="18" cy="18" r="14" stroke="currentColor" strokeWidth="3" strokeLinecap="round"
             fill="none" strokeDasharray="60" strokeDashoffset="20" opacity="0.8" />
         </svg>
       </div>
       <div className="text-sm text-white/80">
-        Pulling {hours}&nbsp;h of tracks within {radiusNm.toFixed(1)}&nbsp;nm of the pin…
+        {isRetry
+          ? <>First call timed out (cold cache). Retrying automatically…</>
+          : <>Pulling {hours}&nbsp;h of tracks within {radiusNm.toFixed(1)}&nbsp;nm of the pin…</>}
       </div>
       <div className="text-xs text-white/40 max-w-md mx-auto leading-snug">
-        Cold queries against Railway Postgres take 5–30&nbsp;s today
-        (see API_REQUEST.md). Wider windows or radii are slower. If this
-        hangs past 60&nbsp;s, the server query timed out — try a smaller
-        window.
+        {isRetry
+          ? <>The second hit usually lands in 5–7 s once the table cache is warm. See API_REQUEST.md § 1 for the server-side fix.</>
+          : <>Cold queries against Railway Postgres take 5–30&nbsp;s today (see API_REQUEST.md § 1). On a cold-cache 500 the page auto-retries once before surfacing an error.</>}
       </div>
     </div>
   )
@@ -1248,22 +1250,41 @@ export default function PointNoiseReport() {
   const [appliedHours, setAppliedHours] = useState(q.hours)
   const [appliedRadius, setAppliedRadius] = useState(q.radiusNm)
 
+  const [loadingStage, setLoadingStage] = useState(null) // null | 'first' | 'retry'
   const runReport = () => {
     if (abortRef.current) abortRef.current.abort()
     const ctrl = new AbortController()
     abortRef.current = ctrl
-    setLoading(true); setError(null)
+    setLoading(true); setError(null); setLoadingStage('first')
     setListener({ lat, lon, elev_ft: elevFt })
     setAppliedHours(windowHours); setAppliedRadius(radiusNm)
-    fetchSegmentsSameOrigin({
-      lat, lng: lon, hours: windowHours, limit: 500, radiusNm: radiusNm, signal: ctrl.signal,
+    const params = { lat, lng: lon, hours: windowHours, limit: 500, radiusNm: radiusNm, signal: ctrl.signal }
+    const succeed = (data) => { setRaw(data); setLoading(false); setLoadingStage(null) }
+    const fail = (e) => {
+      if (e.name === 'AbortError') return
+      setError(String(e.message || e))
+      setLoading(false); setLoadingStage(null)
+    }
+    // Cold-cache 500s on this endpoint are the rule, not the exception —
+    // see API_REQUEST.md § 1 (`pg-pool Query read timeout` on first hit;
+    // the second call lands in 5–7 s once the table cache is warm). Auto-
+    // retry once on 500/504/timeout-shaped errors before surfacing the
+    // failure to the user. A non-5xx error (404/400/network) skips the
+    // retry — those won't recover.
+    const isRetryableErr = (e) => /\b(500|502|503|504|timeout|failed to fetch)\b/i.test(String(e.message || e))
+    fetchSegmentsSameOrigin(params).then(succeed).catch((e) => {
+      if (e.name === 'AbortError' || ctrl.signal.aborted) return
+      if (!isRetryableErr(e)) return fail(e)
+      setLoadingStage('retry')
+      // Brief delay so the pool's in-flight query has a chance to drain
+      // before we slam it again — also lets the cache start populating.
+      setTimeout(() => {
+        if (ctrl.signal.aborted) return
+        fetchSegmentsSameOrigin({ ...params, signal: ctrl.signal })
+          .then(succeed)
+          .catch((err) => { if (err.name !== 'AbortError') fail(err) })
+      }, 1500)
     })
-      .then((data) => { setRaw(data); setLoading(false) })
-      .catch((e) => {
-        if (e.name === 'AbortError') return
-        setError(String(e.message || e))
-        setLoading(false)
-      })
   }
 
   // auto-fetch on initial mount
