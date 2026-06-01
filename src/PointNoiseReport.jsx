@@ -510,11 +510,21 @@ function dbaBandColor(d) {
  *
  * `highlightHour` (optional) dims every other bar so the peak hour stands out.
  */
-function HourlyChart({ buckets, highlightHour, colorBy = 'peak', caption }) {
+function HourlyChart({ buckets, highlightHour, colorBy = 'peak', caption, scenarioBuckets }) {
   // Font sizes are in viewBox units; the SVG scales down to fit its container
   // (typically ~480 px wide for the 720-unit viewBox = 0.67× scale). Tick
   // font 18 → ~12 px rendered, which is the readable floor.
-  const max = Math.max(1, ...buckets.map((b) => b.count))
+  //
+  // §11-CLIENT §6: when `scenarioBuckets` is supplied, the baseline bars
+  // drop to 40% opacity grey and the scenario bars are overlaid in the
+  // colour the bucket's dBA would land in. Tooltips on each pair carry
+  // both values per bin so the user can compare.
+  const scenarioOn = Array.isArray(scenarioBuckets) && scenarioBuckets.length === 24
+  const max = Math.max(
+    1,
+    ...buckets.map((b) => b.count),
+    ...(scenarioOn ? scenarioBuckets.map((b) => b.count) : []),
+  )
   const W = 720, H = 200, padBottom = 44, padTop = 32, padX = 24
   const colW = (W - padX * 2) / 24
   return (
@@ -525,7 +535,16 @@ function HourlyChart({ buckets, highlightHour, colorBy = 'peak', caption }) {
         const dba = colorBy === 'mean'
           ? (b.count > 0 ? b.sumDba / b.count : 0)
           : b.peakDba
-        const color = dbaBandColor(dba)
+        const color = scenarioOn ? '#94a3b8' : dbaBandColor(dba)
+        // Scenario layer: drawn on top of the baseline at full opacity.
+        const sb = scenarioOn ? scenarioBuckets[h] : null
+        const sbH = sb ? (sb.count / max) * (H - padBottom - padTop) : 0
+        const sDba = sb
+          ? (colorBy === 'mean'
+              ? (sb.count > 0 ? sb.sumDba / sb.count : 0)
+              : sb.peakDba)
+          : 0
+        const sColor = sb ? dbaBandColor(sDba) : '#000'
         return (
           <g key={h}>
             <rect
@@ -534,8 +553,26 @@ function HourlyChart({ buckets, highlightHour, colorBy = 'peak', caption }) {
               width={colW - 2}
               height={barH || 0.5}
               fill={color}
-              opacity={highlightHour != null && highlightHour !== h ? 0.4 : 1}
-            />
+              opacity={(scenarioOn ? 0.4 : 1) * (highlightHour != null && highlightHour !== h ? 0.4 : 1)}
+            >
+              <title>
+                {`baseline ${formatHour12(h)}: ${b.count} flights, ${colorBy === 'mean' ? 'mean' : 'peak'} ${Math.round(dba)} dBA`}
+              </title>
+            </rect>
+            {scenarioOn && (
+              <rect
+                x={x + 1}
+                y={H - padBottom - sbH}
+                width={colW - 2}
+                height={sbH || 0.5}
+                fill={sColor}
+                opacity={highlightHour != null && highlightHour !== h ? 0.5 : 1}
+              >
+                <title>
+                  {`scenario ${formatHour12(h)}: ${sb.count} flights, ${colorBy === 'mean' ? 'mean' : 'peak'} ${Math.round(sDba)} dBA`}
+                </title>
+              </rect>
+            )}
             {h % 3 === 0 && (
               <text
                 x={x + colW / 2}
@@ -571,9 +608,11 @@ function HourlyChart({ buckets, highlightHour, colorBy = 'peak', caption }) {
   )
 }
 
-function DbaHistogram({ rows, floor }) {
+function DbaHistogram({ rows, floor, scenarioRows }) {
   // 10 bins from floor → 100 dBA. Same viewBox-font sizing as HourlyChart so
   // they stay legible when rendered side-by-side in the 2-column grid.
+  // §11-CLIENT §6: when scenarioRows is supplied, baseline drops to 40%
+  // grey and the scenario layer is overlaid in the bin's accent colour.
   const lo = floor, hi = 100
   const nBins = 10
   const step = (hi - lo) / nBins
@@ -583,7 +622,16 @@ function DbaHistogram({ rows, floor }) {
     const i = Math.min(nBins - 1, Math.floor((r.dba - lo) / step))
     bins[i]++
   }
-  const max = Math.max(1, ...bins)
+  const scenarioOn = Array.isArray(scenarioRows)
+  const sBins = Array.from({ length: nBins }, () => 0)
+  if (scenarioOn) {
+    for (const r of scenarioRows) {
+      if (r.dba < lo) continue
+      const i = Math.min(nBins - 1, Math.floor((r.dba - lo) / step))
+      sBins[i]++
+    }
+  }
+  const max = Math.max(1, ...bins, ...(scenarioOn ? sBins : []))
   const W = 720, H = 200, padBottom = 44, padTop = 32, padX = 24
   const colW = (W - padX * 2) / nBins
   return (
@@ -593,10 +641,13 @@ function DbaHistogram({ rows, floor }) {
         const barH = (c / max) * (H - padBottom - padTop)
         const labelLo = Math.round(lo + i * step)
         const labelHi = Math.round(lo + (i + 1) * step)
-        const color = labelLo >= 75 ? '#f87171'
+        const colorAccent = labelLo >= 75 ? '#f87171'
           : labelLo >= 65 ? '#fb923c'
           : labelLo >= 55 ? '#facc15'
           : '#38bdf8'
+        const baseColor = scenarioOn ? '#94a3b8' : colorAccent
+        const sC = scenarioOn ? sBins[i] : 0
+        const sBarH = (sC / max) * (H - padBottom - padTop)
         return (
           <g key={i}>
             <rect
@@ -604,8 +655,22 @@ function DbaHistogram({ rows, floor }) {
               y={H - padBottom - barH}
               width={colW - 4}
               height={barH || 0.5}
-              fill={color}
-            />
+              fill={baseColor}
+              opacity={scenarioOn ? 0.4 : 1}
+            >
+              <title>{`baseline ${labelLo}–${labelHi} dBA: ${c} flights`}</title>
+            </rect>
+            {scenarioOn && (
+              <rect
+                x={x + 2}
+                y={H - padBottom - sBarH}
+                width={colW - 4}
+                height={sBarH || 0.5}
+                fill={colorAccent}
+              >
+                <title>{`scenario ${labelLo}–${labelHi} dBA: ${sC} flights`}</title>
+              </rect>
+            )}
             <text
               x={x + colW / 2}
               y={H - 14}
@@ -633,7 +698,9 @@ function DbaHistogram({ rows, floor }) {
       })}
       <line x1={padX} y1={H - padBottom} x2={W - padX} y2={H - padBottom} stroke="rgba(255,255,255,0.15)" />
       <text x={padX} y={20} fill="rgba(255,255,255,0.6)" fontSize="16">
-        flights by estimated peak dBA at listener
+        {scenarioOn
+          ? 'flights by est. peak dBA — grey = baseline, colour = scenario'
+          : 'flights by estimated peak dBA at listener'}
       </text>
     </svg>
   )
@@ -1326,6 +1393,71 @@ export default function PointNoiseReport() {
     return buckets
   }, [filteredRows])
 
+  // §11-CLIENT §6: scenario overlay. Pick the substituted tail Sets from
+  // the slider state, then re-aggregate the histogram using the scenario-
+  // world per-row dBA. When every slider is at default this is a no-op
+  // and `scenarioActive` stays false (the overlay layer is hidden).
+  const scenarioActive = (
+    scenario.electric_pct > 0
+    || scenario.eurofox_pct > 0
+    || scenario.sinus_pct > 0
+    || scenario.winch_agl_ft > 0
+  )
+  const scenarioPicks = useMemo(() => {
+    // Use the full row set (not filteredRows) as the substitution pool so
+    // the picked tails are stable when the user nudges the dBA-floor or
+    // purpose-peak-hour filter. The overlay still respects the active
+    // filters via filteredRows; only the deterministic pick is global.
+    return {
+      VELE: pickSubstituted(allRows, 'VELE', scenario.electric_pct),
+      EFOX: pickSubstituted(allRows, 'EFOX', scenario.eurofox_pct),
+      SINU: pickSubstituted(allRows, 'SINU', scenario.sinus_pct),
+    }
+  }, [allRows, scenario.electric_pct, scenario.eurofox_pct, scenario.sinus_pct])
+
+  // Tail Set for winch — every track that lists WNCH as a segment candidate
+  // becomes a winch participant once the slider is above 0. Per-segment
+  // gating still happens via shouldWinchSegment().
+  const winchTracks = useMemo(() => {
+    if ((scenario.winch_agl_ft || 0) <= 0) return new Set()
+    const s = new Set()
+    for (const r of allRows) {
+      for (const c of r.altSegmentCandidates || []) {
+        if (c?.code === 'WNCH' && r.tail) { s.add(r.tail); break }
+      }
+    }
+    return s
+  }, [allRows, scenario.winch_agl_ft])
+
+  // Bundle the scenario for the per-row projector.
+  const scenarioCtx = useMemo(() => ({
+    ...scenario,
+    substituted: scenarioPicks,
+    winchTracks,
+  }), [scenario, scenarioPicks, winchTracks])
+
+  // Scenario rows — same filters as filteredRows but with per-row dBA
+  // replaced by applyScenarioToRow(). When scenarioActive=false this is
+  // a thin pass-through (the helper short-circuits unsubstituted rows).
+  const scenarioRows = useMemo(() => {
+    if (!scenarioActive) return filteredRows
+    return filteredRows.map((r) => applyScenarioToRow(r, scenarioCtx, listener))
+  }, [filteredRows, scenarioCtx, listener, scenarioActive])
+
+  const scenarioHourly = useMemo(() => {
+    const buckets = Array.from({ length: 24 }, () => ({ count: 0, peakDba: 0, sumDba: 0 }))
+    if (!scenarioActive) return buckets
+    for (const r of scenarioRows) {
+      if (r.closestTs == null) continue
+      const h = new Date(r.closestTs).getHours()
+      const b = buckets[h]
+      b.count++
+      b.sumDba += r.dba
+      if (r.dba > b.peakDba) b.peakDba = r.dba
+    }
+    return buckets
+  }, [scenarioRows, scenarioActive])
+
   const peakHour = useMemo(() => {
     let h = -1, best = -Infinity
     for (let i = 0; i < hourlyBuckets.length; i++) {
@@ -1670,16 +1802,31 @@ export default function PointNoiseReport() {
 
         {/* Hourly (peak-coloured) + dBA distribution side by side */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <Section title="When does the noise happen? — peak dBA" hint="Bar = passes that hour · colour = LOUDEST single pass in that hour">
+          <Section
+            title={scenarioActive ? 'When does the noise happen? — peak dBA (scenario overlay)' : 'When does the noise happen? — peak dBA'}
+            hint={scenarioActive
+              ? 'Grey = baseline. Coloured = what-if scenario from the sliders above.'
+              : 'Bar = passes that hour · colour = LOUDEST single pass in that hour'}
+          >
             <HourlyChart
               buckets={hourlyBuckets}
+              scenarioBuckets={scenarioActive ? scenarioHourly : null}
               highlightHour={peakHour}
               colorBy="peak"
               caption="flights / hour (local) — bar color = peak dBA in that hour"
             />
           </Section>
-          <Section title="How loud were the passes?" hint="Estimated peak dBA at the listener for each audible flight">
-            <DbaHistogram rows={filteredRows} floor={dbaFloor} />
+          <Section
+            title={scenarioActive ? 'How loud were the passes? (scenario overlay)' : 'How loud were the passes?'}
+            hint={scenarioActive
+              ? 'Grey = baseline. Coloured = what-if scenario.'
+              : 'Estimated peak dBA at the listener for each audible flight'}
+          >
+            <DbaHistogram
+              rows={filteredRows}
+              floor={dbaFloor}
+              scenarioRows={scenarioActive ? scenarioRows : null}
+            />
           </Section>
         </div>
 
@@ -1694,6 +1841,7 @@ export default function PointNoiseReport() {
         >
           <HourlyChart
             buckets={hourlyBuckets}
+            scenarioBuckets={scenarioActive ? scenarioHourly : null}
             colorBy="mean"
             caption="flights / hour (local) — bar color = mean dBA across passes that hour"
           />
