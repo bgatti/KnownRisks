@@ -402,30 +402,60 @@ function fmtDay(ts) {
 
 /**
  * §11-CLIENT V3 §4: one-line legend explaining what each source
- * badge means. Renders once on the page (next to the headline
- * purpose section); the "shape" cell links to /api/purpose-ml/buckets
- * so a curious viewer can see the full purposeML bucket taxonomy.
+ * badge means. The "shape" cell links to /api/purpose-ml/buckets so a
+ * curious viewer can see the full purposeML bucket taxonomy.
+ *
+ * Cells are derived from purposeSourceBadgeProps() so legend ↔ badge
+ * never drift: changing a color or label in one place updates both.
+ * The displayed legend text drops the source-specific prefix on the
+ * single-letter / single-symbol variants ("T" → "T type",
+ * "DB" → "DB tracked") for legibility — purposeSourceBadgeProps only
+ * needs the symbol since it sits next to the purpose label, but the
+ * standalone legend needs the qualifier word.
  */
+const PURPOSE_SOURCE_LEGEND_CELLS = [
+  { source: 'special_use', suffix: '' },
+  { source: 'type',        suffix: ' type' },
+  { source: 'tracked',     suffix: ' tracked' },
+  // sample confidence so the legend shows "(N%)" — the value itself
+  // doesn't matter, we substitute the literal "N" below.
+  { source: 'shape',       suffix: '', link: '/api/purpose-ml/buckets' },
+]
+
 function PurposeSourceLegend() {
   return (
     <div className="text-[10px] text-white/50 leading-tight whitespace-nowrap">
       <span className="text-white/40 mr-1">Purpose source:</span>
-      <span style={{ color: '#f59e0b' }} className="font-mono">★ curated</span>
-      <span className="text-white/30 mx-1">·</span>
-      <span style={{ color: '#94a3b8' }} className="font-mono">T type</span>
-      <span className="text-white/30 mx-1">·</span>
-      <span style={{ color: '#94a3b8' }} className="font-mono">DB tracked</span>
-      <span className="text-white/30 mx-1">·</span>
-      <a
-        href="/api/purpose-ml/buckets"
-        target="_blank"
-        rel="noreferrer noopener"
-        title="Open the purposeML bucket taxonomy"
-        className="font-mono hover:underline"
-        style={{ color: '#22d3ee' }}
-      >
-        ~ shape (N%)
-      </a>
+      {PURPOSE_SOURCE_LEGEND_CELLS.map((cell, i) => {
+        const props = purposeSourceBadgeProps(cell.source, 0.5)
+        if (!props) return null
+        const text = cell.source === 'shape'
+          ? '~ shape (N%)'
+          : props.text + cell.suffix
+        const node = cell.link ? (
+          <a
+            key={cell.source}
+            href={cell.link}
+            target="_blank"
+            rel="noreferrer noopener"
+            title="Open the purposeML bucket taxonomy"
+            className="font-mono hover:underline"
+            style={{ color: props.color }}
+          >
+            {text}
+          </a>
+        ) : (
+          <span key={cell.source} className="font-mono" style={{ color: props.color }}>
+            {text}
+          </span>
+        )
+        return (
+          <Fragment key={cell.source}>
+            {i > 0 && <span className="text-white/30 mx-1">·</span>}
+            {node}
+          </Fragment>
+        )
+      })}
     </div>
   )
 }
