@@ -4072,6 +4072,15 @@ function computeFlightId(airport, tail, takeoffMs) {
 const COVERAGE_GAP_SAMPLE_MS = 5000     // expected ADS-B fix interval
 const COVERAGE_GAP_THRESHOLD = 0.30     // < 30% expected coverage = dropout
 const COVERAGE_GAP_DRIFT_FT = 2000      // > 2,000 ft drift = still airborne
+// Maximum gap the coverage guard will EVER bridge. Without this,
+// an overnight ramp tow of > 2,000 ft (routine — hangar repositioning)
+// trips the guard across a 24 h parking gap and merges yesterday's
+// session with today's into one 18-42 h "flight." Operator-filed
+// 2026-06-01: "Journeys school at KBDU shows N333RX takeoff at
+// 00:01:27 UTC and the flight bundle spans 18 hours" — which is
+// the same UTC date-boundary class of bug we fixed in
+// loadLiveFromDb earlier, just at the bundling layer.
+const COVERAGE_GAP_MAX_MS = 60 * 60_000
 
 function groupCyclesIntoFlights(cycles, gapMinMs, allPts = null) {
   if (!cycles || !cycles.length) return []
@@ -4085,7 +4094,7 @@ function groupCyclesIntoFlights(cycles, gapMinMs, allPts = null) {
     const gap = cur.tMs - prev.lMs
     let merge = gap < gapMinMs
 
-    if (!merge && allPts) {
+    if (!merge && allPts && gap <= COVERAGE_GAP_MAX_MS) {
       // Coverage-gap guard. Count fixes inside the gap window and the
       // physical drift between the last pre-gap and first post-gap fixes.
       const gapStart = prev.lMs
