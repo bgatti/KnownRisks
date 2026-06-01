@@ -2024,11 +2024,17 @@ function excursionsApiPlugin() {
                 // so glow lights only the segments actually within earshot
                 // of when the complainant pressed record.
                 fsMod.attachComplaintsToBands(bands, trackComplaints, { pad: 60 * 1000 })
+                // Bridge within-band coverage gaps so the kiosk's edge-
+                // length filter doesn't drop flight-path polylines. Run
+                // AFTER complaints attachment so synth points don't
+                // produce phantom matches. Synth points carry tuple[4]=1.
+                const synthCount = bridgeBandsInPlace(bands)
                 return {
                   ...r, ...(exemptedCounters || {}), bands,
                   phase: ph.phase, descents: ph.descents, hasDescents: ph.hasDescents,
                   vnap_exempt: engineless || undefined,
                   complaints: trackComplaints,
+                  points_synth_count: synthCount,
                 }
               }),
               ...liveTracksFiltered.map(lt => {
@@ -2037,7 +2043,8 @@ function excursionsApiPlugin() {
                   ? fsMod.matchComplaintsForKiosk(complaintsRaw, lt.call, win[0], win[1])
                   : []
                 fsMod.attachComplaintsToBands(lt.bands, trackComplaints, { pad: 60 * 1000 })
-                return { ...lt, complaints: trackComplaints }
+                const synthCount = bridgeBandsInPlace(lt.bands)
+                return { ...lt, complaints: trackComplaints, points_synth_count: synthCount }
               }),
             ],
             live: { updated_at: liveUpdatedAt, tracks: liveCount, filtered_to: airport || null },
@@ -3719,6 +3726,32 @@ function bridgeTrackGaps(pts, opts = {}) {
     out.push(b)
   }
   return out
+}
+
+// Apply bridgeTrackGaps to every band's points[] in place. Skips bands
+// without timestamps (their points are 3-tuples — bridge needs the ts
+// slot). Attaches `points_synth_count` per band when bridging fired so
+// the kiosk can see how many fixes were inferred. Used by the
+// /api/excursions/boot path-rendering surface (the operator reports
+// the kiosk's > 30 s edge filter creating visible rendering gaps in
+// the flight path; the bridge fills them when motion is consistent).
+function bridgeBandsInPlace(bands) {
+  let total = 0
+  if (!Array.isArray(bands)) return 0
+  for (const b of bands) {
+    if (!b || !Array.isArray(b.points) || b.points.length < 2) continue
+    // Need the 4th tuple slot (ts) to compute gap durations.
+    const last = b.points[b.points.length - 1]
+    if (!Array.isArray(last) || last.length < 4 || last[3] == null) continue
+    const bridged = bridgeTrackGaps(b.points)
+    if (bridged.length > b.points.length) {
+      const synth = bridged.reduce((n, p) => n + (p[4] === 1 ? 1 : 0), 0)
+      b.points = bridged
+      b.points_synth_count = synth
+      total += synth
+    }
+  }
+  return total
 }
 
 function computeWorstSegment(flightPts, popAt, airport, engineless, altOffsetFt = 0) {
