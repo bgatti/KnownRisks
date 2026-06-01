@@ -1462,6 +1462,57 @@ export default function PointNoiseReport() {
     return () => { aborted = true }
   }, [])
 
+  // §11-CLIENT §8: URL hash serialization. Parse the existing hash on mount
+  // and seed the scenario state from it (one-shot — `[]` deps). Subsequent
+  // slider changes write back into the hash via history.replaceState so the
+  // URL stays shareable without polluting the back/forward stack.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const raw = window.location.hash?.replace(/^#/, '')
+    if (!raw) return
+    const p = new URLSearchParams(raw)
+    const next = {}
+    const num = (k, fallback) => {
+      const v = Number(p.get(k))
+      return Number.isFinite(v) ? v : fallback
+    }
+    if (p.has('electric'))  next.electric_pct    = num('electric', 0)
+    if (p.has('eurofox'))   next.eurofox_pct     = num('eurofox', 0)
+    if (p.has('sinus'))     next.sinus_pct       = num('sinus', 0)
+    if (p.has('winch_agl')) next.winch_agl_ft    = num('winch_agl', 0)
+    if (p.has('disc'))      next.rate            = num('disc', 5) / 100
+    if (p.has('horizon'))   next.horizon_yr      = num('horizon', 10)
+    if (p.has('fuel'))      next.fuel_multiplier = num('fuel', 1)
+    if (Object.keys(next).length) {
+      setScenario((s) => ({ ...s, ...next }))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  // Push current scenario back into the URL hash on every change.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const params = new URLSearchParams({
+      electric:  String(scenario.electric_pct),
+      eurofox:   String(scenario.eurofox_pct),
+      sinus:     String(scenario.sinus_pct),
+      winch_agl: String(scenario.winch_agl_ft),
+      disc:      (scenario.rate * 100).toFixed(1),
+      horizon:   String(scenario.horizon_yr),
+      fuel:      scenario.fuel_multiplier.toFixed(2),
+    })
+    try {
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${params}`)
+    } catch {}
+  }, [
+    scenario.electric_pct,
+    scenario.eurofox_pct,
+    scenario.sinus_pct,
+    scenario.winch_agl_ft,
+    scenario.rate,
+    scenario.horizon_yr,
+    scenario.fuel_multiplier,
+  ])
+
   /** Convert the raw track payload into per-flight rows at the listener. */
   const allRows = useMemo(() => {
     if (!raw?.tracks) return []
