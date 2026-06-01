@@ -1343,8 +1343,38 @@ function excursionsApiPlugin() {
                 type: t.type || '',
                 src: t.src, date, live: isLive,
                 phase, descents, hasDescents,
+                // base_airport: most-recent observed base from tracks.base_airport.
+                // Null on live-only tracks (the live_tracks JSONB doesn't carry it);
+                // we backfill from historical candidates of the same tail below.
+                base_airport: t.base_airport || null,
                 segments: filtered,
               })
+            }
+          }
+          // Backfill base_airport: the live_tracks JSONB doesn't carry the
+          // column, and a 24-hour window often returns only live rows. Fall
+          // back to the most-recent observed base from the historical tracks
+          // table — same pattern /api/adsb/current-flights uses.
+          if (db.useDb) {
+            const tailsNeedingBase = [...new Set(
+              tracksOut.filter(r => !r.base_airport && r.tail && r.tail !== '?').map(r => r.tail)
+            )]
+            if (tailsNeedingBase.length) {
+              try {
+                const r = await db.queryDb(
+                  `SELECT call,
+                     (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base
+                   FROM tracks WHERE call = ANY($1) GROUP BY call`,
+                  [tailsNeedingBase]
+                )
+                const baseByTail = new Map()
+                for (const row of r.rows) if (row.base) baseByTail.set(row.call, row.base)
+                for (const t of tracksOut) {
+                  if (!t.base_airport && baseByTail.has(t.tail)) t.base_airport = baseByTail.get(t.tail)
+                }
+              } catch (err) {
+                console.error('[excursions-segments-api] base_airport backfill failed', err.message)
+              }
             }
           }
           const payload = {
@@ -3944,14 +3974,21 @@ function flightsApiPlugin() {
   // warm cache survives until the next poll. Picked 8 s exactly because
   // <8 s leaves a stale gap every cycle (poll → miss → 50 s recompute →
   // brief warm → stale by next poll); >8 s would skew the kiosk's
-  // perceived freshness in the wrong direction. With true 8 s alignment,
-  // single-workstation polls are MISS on poll 1, HIT on every poll
-  // thereafter until staleness kicks in mid-window. Request coalescing
-  // (waiting on an in-flight Promise for the same key) is the next-level
-  // optimization — tracked as a follow-up since it requires wrapping the
-  // full handler body in a coalesced async fn.
+  // perceived freshness in the wrong direction.
   const CURRENT_RESPONSE_TTL_MS = 8_000
   const currentResponseCache = new Map()  // key -> { body, fetchedAt }
+  // Request coalescing — the kiosk reported `airport=KBDU&landed_hours=48`
+  // never caching: 3 sequential polls all `X-Cache: MISS`, 30-94 s each,
+  // with intermittent 500s. Root cause: cold response time (30-90 s) is
+  // > 10× the 8 s poll cadence, so subsequent polls arrive before the
+  // first poll's `cache.set` fires. All in-flight requests run their own
+  // computation, the pg pool saturates (max=8), `statement_timeout`
+  // (25 s) trips on waiters, handler returns 500. Coalescing collapses
+  // all concurrent callers for the same key onto one Promise — the
+  // leader does the work, waiters await its result. Same pattern the
+  // recent-landings agent shipped on its endpoint.
+  const currentInFlight = new Map()  // key -> Promise<body>
+
 
   // Cache for /api/schools. The handler used to read + parse
   // public/flight_schools_fleets.json (30 KB), `await import` two node
@@ -4507,7 +4544,7 @@ function flightsApiPlugin() {
           if (!ap) { res.statusCode = 400; return res.end(JSON.stringify({ error: `unknown airport ${airport}` })) }
 
           // Response cache — composite key over the query params that affect
-          // output. With CURRENT_RESPONSE_TTL_MS=4s and kiosk polling every
+          // output. With CURRENT_RESPONSE_TTL_MS=8s and kiosk polling every
           // 8s, every other poll hits cache; multi-workstation polls share
           // one computation. The cached body is the final JSON string so
           // we don't pay re-serialization either.
@@ -4518,6 +4555,31 @@ function flightsApiPlugin() {
             return res.end(cached.body)
           }
 
+          // Coalesce — if a leader is already computing this key, await
+          // its Promise. The kiosk reported `airport=KBDU` never caching:
+          // 30-90 s cold response × 8 s polling means subsequent polls
+          // arrive before the leader's cache.set. Without coalescing,
+          // each poll fires its own pg-pool-burning computation; pool
+          // saturates; statement_timeout (25 s) trips waiters; 500s
+          // cascade. Coalescing collapses all waiters onto the leader.
+          const existing = currentInFlight.get(cacheKey)
+          if (existing) {
+            res.setHeader('X-Cache', 'COALESCED')
+            try {
+              const body = await existing
+              return res.end(body)
+            } catch (err) {
+              // Leader failed — let the next request retry from cold.
+              throw err
+            }
+          }
+
+          // Leader path — define the work as an IIFE, register the
+          // Promise in currentInFlight BEFORE awaiting so concurrent
+          // callers (kiosk polls + multi-workstation) see the
+          // in-flight key and coalesce. The IIFE's `finally` releases
+          // the slot regardless of success or failure.
+          const work = (async () => { try {
           const nowMs = Date.now()
           const landedCutoffMs = nowMs - landedHours * 3600 * 1000
           const gapMinMs = flightGapMinFor(airport) * 60000
@@ -4862,8 +4924,11 @@ function flightsApiPlugin() {
             flights,
           })
           currentResponseCache.set(cacheKey, { body: responseBody, fetchedAt: Date.now() })
+          return responseBody
+          } finally { currentInFlight.delete(cacheKey) } })()
+          currentInFlight.set(cacheKey, work)
           res.setHeader('X-Cache', 'MISS')
-          res.end(responseBody)
+          res.end(await work)
         } catch (err) {
           console.error('[flights/current] error', err)
           res.statusCode = 500
@@ -7991,7 +8056,7 @@ const API_MANIFEST = {
             { name: 'limit', type: 'int', default: 200, desc: 'Cap on number of tracks returned (sorted by recency).' },
           ],
           response: {
-            tracks: '[{tail, type, src, date, live, phase, descents, segments:[{klass, zone, points, startedAt, endedAt}]}]',
+            tracks: '[{tail, type, src, date, live, phase, descents, base_airport, segments:[{klass, zone, points, startedAt, endedAt}]}]',
             center: '{lat, lon, radius_mi, radius_ft} | null',
             window: '{hours, from, to, limit}',
             matched: 'int — total tracks before limit',
