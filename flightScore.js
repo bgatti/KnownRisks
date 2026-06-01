@@ -16,7 +16,7 @@
 // and highlight celebrates considerate flying. There are no penalties here,
 // only opportunities to shine.
 
-import { trackLengthFt, classifyPoint } from './src/geo.js'
+import { trackLengthFt, classifyPoint, isEnginelessType } from './src/geo.js'
 
 // Engine horsepower by ICAO type — the source value the noise model scales
 // from. Mirrors HP_BY_ICAO in src/noise.js; kept here (rather than imported)
@@ -245,11 +245,14 @@ export function buildImpactGrid(points, type, popGrid, opts = {}) {
 // Reports both how far the path ran through an abatement area (feet, from
 // the tested trackLengthFt) and how long it lingered there (seconds, from
 // the point timestamps), banded by closeness.
-export function neighborhoodOverlap(points, zones) {
-  const lengths = trackLengthFt(points, zones || [])
+// `opts.typeCode`: when the aircraft is engineless, all zone/time tallies
+// stay at zero — gliders and balloons are VNAP-exempt.
+export function neighborhoodOverlap(points, zones, opts = {}) {
+  const engineless = isEnginelessType(opts.typeCode)
+  const lengths = trackLengthFt(points, zones || [], { engineless })
 
   let yellowS = 0, orangeS = 0, redS = 0, totalS = 0
-  if (points.length >= 2) {
+  if (points.length >= 2 && !engineless) {
     const tags = points.map((p) => classifyPoint(p[0], p[1], p[2], zones || []))
     const rank = { yellow: 1, orange: 2, red: 3 }
     for (let i = 1; i < points.length; i++) {
@@ -294,6 +297,292 @@ export function matchVoices(complaints, tail, startMs, endMs) {
     if (!isFinite(s)) return false
     return e >= lo && s <= hi
   })
+}
+
+// ── Complaint projection for kiosk overlay ─────────────────────────────
+// Project a raw complaint into the kiosk-friendly shape used by the impact
+// feed and the live-flights feed:
+//   - geocoded complaints (lat/lon present) → map pin colored by klass
+//   - tail-only complaints → halo on the matching flight's track
+//
+// dBFS is parsed from `notes` when present (the form: "... sustained -82 dBFS …").
+// Estimated dBA = dBFS + 132 (caller's calibration constant; keep this in
+// lock-step with the kiosk's calibrator).
+const COMPLAINT_DBFS_RE = /([-+]?\d+(?:\.\d+)?)\s*dBFS/i
+const DBFS_TO_DBA_CALIBRATION = 132
+
+export function projectComplaint(c) {
+  if (!c) return null
+  const m = c.notes ? COMPLAINT_DBFS_RE.exec(c.notes) : null
+  const dbfs = m ? Number(m[1]) : null
+  return {
+    id: c.id || null,
+    tail: c.tail || null,
+    klass: c.klass || null,
+    created_at: c.createdAt || null,
+    started_at: c.startedAt || null,
+    ended_at: c.endedAt || null,
+    lat: c.lat ?? null,
+    lon: c.lon ?? null,
+    distance_miles: c.distanceMiles ?? null,
+    dbfs: Number.isFinite(dbfs) ? dbfs : null,
+    dba_estimate: Number.isFinite(dbfs) ? Math.round(dbfs + DBFS_TO_DBA_CALIBRATION) : null,
+    notes: c.notes || null,
+  }
+}
+
+// Compute a band's [startMs, endMs]. Prefers explicit `start_ms`/`end_ms`
+// fields (set by bandsFromPoints, where points carry impact in slot 3 not
+// timestamps); otherwise reads timestamps from point tuples / object form.
+// Returns null when no usable signal exists (historical 3-tuples) —
+// caller falls back to whole-track attribution.
+function bandTimeWindow(band) {
+  if (!band) return null
+  if (typeof band.start_ms === 'number' && typeof band.end_ms === 'number') {
+    return [band.start_ms, band.end_ms]
+  }
+  let lo = null, hi = null
+  for (const p of (band.points || [])) {
+    // Skip 4-tuples that look like impact (small integers under 1e10) —
+    // ms-since-epoch is always > 1e12 for modern dates.
+    const v = Array.isArray(p) ? p[3] : (p && (p.ts ?? p.tsUnix))
+    const n = typeof v === 'number' ? v : (typeof v === 'string' ? Date.parse(v) : NaN)
+    if (Number.isFinite(n) && n > 1e12) {
+      if (lo == null || n < lo) lo = n
+      if (hi == null || n > hi) hi = n
+    }
+  }
+  return lo != null && hi != null ? [lo, hi] : null
+}
+
+// Per-band complaint enrichment.
+//
+// Mutates `bands` in place adding `complaints[]`, `complaint_dba_max`,
+// `complaint_count`, and `complaint_worst_klass`. Mutates `complaints`
+// adding `band_indices: [n, m, …]` so the kiosk can render either way
+// (per-band glow or per-track halo from the top-level list).
+//
+// Matching: a complaint belongs to a band when their time windows
+// overlap (using the same ±10-min pad as the tail-level match). When a
+// band has no per-point timestamps (historical 3-tuple shape), all
+// complaints attach to all bands — the kiosk falls back to whole-track
+// glow without explicit fallback code.
+//
+// Returns the bands array for chaining.
+const COMPLAINT_KLASS_RANK = { yellow: 1, orange: 2, red: 3 }
+export function attachComplaintsToBands(bands, complaints, opts = {}) {
+  if (!Array.isArray(bands) || !bands.length) return bands
+  const pad = opts.pad ?? 10 * 60 * 1000
+  const list = Array.isArray(complaints) ? complaints : []
+  // Precompute each band's window (null when not timestamped).
+  const windows = bands.map(bandTimeWindow)
+  const anyTimestamped = windows.some(w => w != null)
+  // Initialise per-band fields.
+  for (const b of bands) {
+    b.complaints = []
+    b.complaint_dba_max = null
+    b.complaint_count = 0
+    b.complaint_worst_klass = null
+  }
+  for (const c of list) {
+    c.band_indices = []
+    const cStart = c.started_at ? Date.parse(c.started_at) : NaN
+    const cEnd = c.ended_at ? Date.parse(c.ended_at) : cStart
+    const cLo = isFinite(cStart) ? cStart - pad : null
+    const cHi = isFinite(cEnd) ? cEnd + pad : null
+    for (let i = 0; i < bands.length; i++) {
+      const w = windows[i]
+      let overlap
+      if (w && cLo != null && cHi != null) {
+        overlap = w[1] >= cLo && w[0] <= cHi
+      } else if (!anyTimestamped) {
+        // Whole track has no per-band time info → attach to every band so
+        // the kiosk still highlights everything (degrades to track-level).
+        overlap = true
+      } else {
+        // This band lacks timestamps but others have them → can't decide,
+        // skip (conservative: avoid mislabeling adjacent bands).
+        overlap = false
+      }
+      if (!overlap) continue
+      c.band_indices.push(i)
+      const b = bands[i]
+      b.complaints.push(c)
+      b.complaint_count++
+      if (c.dba_estimate != null && (b.complaint_dba_max == null || c.dba_estimate > b.complaint_dba_max)) {
+        b.complaint_dba_max = c.dba_estimate
+      }
+      if (c.klass && (!b.complaint_worst_klass || COMPLAINT_KLASS_RANK[c.klass] > COMPLAINT_KLASS_RANK[b.complaint_worst_klass])) {
+        b.complaint_worst_klass = c.klass
+      }
+    }
+  }
+  return bands
+}
+
+// Tail+window match (same ±10-min pad as matchVoices), projected for the kiosk.
+export function matchComplaintsForKiosk(complaints, tail, startMs, endMs) {
+  if (!Array.isArray(complaints) || !tail) return []
+  const T = String(tail).toUpperCase()
+  const pad = 10 * 60 * 1000
+  const lo = startMs - pad
+  const hi = endMs + pad
+  const out = []
+  for (const c of complaints) {
+    if ((c.tail || '').toUpperCase() !== T) continue
+    const s = c.startedAt ? Date.parse(c.startedAt) : NaN
+    const e = c.endedAt ? Date.parse(c.endedAt) : s
+    if (!isFinite(s)) continue
+    if (e < lo || s > hi) continue
+    out.push(projectComplaint(c))
+  }
+  return out
+}
+
+// All complaints within a window, projected. Used to drive map pins
+// independent of which flight they're attributed to.
+export function recentComplaintsForKiosk(complaints, windowMinutes) {
+  if (!Array.isArray(complaints)) return []
+  const now = Date.now()
+  const cutoff = now - windowMinutes * 60 * 1000
+  const out = []
+  for (const c of complaints) {
+    const s = c.createdAt ? Date.parse(c.createdAt) : (c.startedAt ? Date.parse(c.startedAt) : NaN)
+    if (!isFinite(s)) continue
+    if (s < cutoff || s > now) continue
+    out.push(projectComplaint(c))
+  }
+  // Newest first.
+  out.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+  return out
+}
+
+// ── Noise reports (per-segment enrichment for /api/adsb/impact) ────────
+// Project the persisted noise-report store into the per-flight `noise_reports[]`
+// array — one entry per reportedSegments[] element. Falls back to a synthetic
+// single-segment when a report has the older `excursion` shape (no points array)
+// so callers don't lose data from before reportedSegments[] was wired in.
+//
+// Pure function, no I/O. Audio attachments (noise_audio, media[], any *.mp3
+// references) are intentionally not consulted — this is metadata-only.
+//
+// `opts.source` filters by inferred submission source: 'manual', 'auto', 'any'.
+
+// Heuristic source classifier. A report is "manual" when a human submitted it
+// (reporter email/name/id present and not a system actor); otherwise "auto".
+// Explicit fields override: r.source, r.autoGenerated, r.mode === 'auto'.
+function inferReportSource(r) {
+  if (r && (r.source === 'manual' || r.source === 'auto')) return r.source
+  // Prod uses `auto: true` on the raw report and on each segment.
+  if (r && (r.autoGenerated === true || r.auto === true)) return 'auto'
+  if (r && r.mode === 'auto') return 'auto'
+  const rep = r && r.reporter
+  // Prod stores reporter as a string like 'anon:phep2io4ah' for auto reports;
+  // when no explicit auto-tag, a string reporter starting with 'anon:' is auto.
+  if (typeof rep === 'string' && rep.startsWith('anon:')) return 'auto'
+  if (rep && typeof rep === 'object' && (rep.email || rep.name || rep.id) && rep.kind !== 'system') return 'manual'
+  if (typeof rep === 'string' && rep) return 'manual'
+  return 'auto'
+}
+
+function parseTsLoose(v) {
+  if (v == null) return NaN
+  if (typeof v === 'number') return v > 1e12 ? v : v * 1000 // accept s or ms
+  if (typeof v === 'string') return Date.parse(v)
+  return NaN
+}
+
+// Segment points come in two shapes in the wild:
+//   tuple  : [lat, lon, alt, ts_ms]   (prod Postgres reportedSegments[].points)
+//   object : { ts, lat, lon, alt }    (proposal contract; matchVoices tests)
+function ptTs(p) {
+  if (Array.isArray(p)) return parseTsLoose(p[3])
+  if (p && typeof p === 'object') return parseTsLoose(p.ts ?? p.tsUnix)
+  return NaN
+}
+function ptToObject(p) {
+  if (Array.isArray(p)) {
+    const ts = parseTsLoose(p[3])
+    return { ts: isFinite(ts) ? new Date(ts).toISOString() : null, lat: p[0], lon: p[1], alt: p[2] }
+  }
+  return p
+}
+
+export function matchReportSegments(reports, tail, startMs, endMs, opts = {}) {
+  if (!Array.isArray(reports) || !tail) return []
+  const T = String(tail).toUpperCase()
+  const pad = 10 * 60 * 1000 // same ±10 min as matchVoices
+  const lo = startMs - pad
+  const hi = endMs + pad
+  const sourceFilter = opts.source || 'any' // 'manual' | 'auto' | 'any'
+
+  const out = []
+  for (const r of reports) {
+    const source = inferReportSource(r)
+    if (sourceFilter !== 'any' && source !== sourceFilter) continue
+
+    // Prefer explicit reportedSegments[]; otherwise treat the legacy
+    // `excursion` field as a single synthetic segment so older reports
+    // still surface here.
+    const explicit = Array.isArray(r.reportedSegments) ? r.reportedSegments : []
+    const segments = explicit.length
+      ? explicit
+      : (r.excursion && r.excursion.tail
+        ? [{ tail: r.excursion.tail, klass: r.excursion.klass, points: [] }]
+        : [])
+
+    for (const seg of segments) {
+      // Free-mode reports (no seg.tail) never match.
+      if (!seg || !seg.tail) continue
+      if (String(seg.tail).toUpperCase() !== T) continue
+
+      const pts = Array.isArray(seg.points) ? seg.points : []
+      let segStartMs = NaN, segEndMs = NaN
+      if (pts.length) {
+        segStartMs = ptTs(pts[0])
+        segEndMs = ptTs(pts[pts.length - 1])
+      }
+      if (!isFinite(segStartMs) || !isFinite(segEndMs)) {
+        const ex = r.excursion || {}
+        segStartMs = parseTsLoose(ex.startedAt)
+        segEndMs = parseTsLoose(ex.endedAt)
+        // Prod data sometimes only has lastSeenMs — use it as a point-in-time
+        // fallback so excursion-only reports without window still surface.
+        if (!isFinite(segStartMs) && isFinite(parseTsLoose(ex.lastSeenMs))) {
+          segStartMs = parseTsLoose(ex.lastSeenMs)
+        }
+        if (!isFinite(segEndMs)) segEndMs = segStartMs
+      }
+      if (!isFinite(segStartMs)) continue
+      if (!isFinite(segEndMs)) segEndMs = segStartMs
+
+      if (segEndMs < lo || segStartMs > hi) continue
+
+      const meter = r.noiseMeter || {}
+      const calc = r.calculatedNoise || {}
+      out.push({
+        report_id: r.id || null,
+        submitted_at: r.submittedAt || r.receivedAt || null,
+        source,
+        klass: seg.klass || (r.excursion && r.excursion.klass) || null,
+        segment: {
+          start_ts: new Date(segStartMs).toISOString(),
+          end_ts: new Date(segEndMs).toISOString(),
+          // Normalise to objects regardless of input shape (prod tuples or
+          // proposal objects), so downstream renderers don't need to guess.
+          points: pts.map(ptToObject),
+        },
+        reported_dba: {
+          live: meter.liveDba ?? null,
+          sustained: meter.sustainedDba ?? null,
+        },
+        calculated_dba: {
+          max: seg.autoMaxCalculatedDba ?? calc.maxDba ?? calc.dba ?? null,
+        },
+      })
+    }
+  }
+  return out
 }
 
 // ── Score helpers ───────────────────────────────────────────────────────
@@ -373,7 +662,7 @@ export function scoreFlight(flight, points, ctx = {}) {
   const voiceLoad = voices.reduce((s, v) => s + (VOICE_WEIGHT[v.klass] || 1), 0)
 
   // 3. Neighborhood overlap (degree + time).
-  const overlap = neighborhoodOverlap(points, zones)
+  const overlap = neighborhoodOverlap(points, zones, { typeCode: type })
   const zoneLoad =
     (overlap.seconds.red * 3 + overlap.seconds.orange * 2 + overlap.seconds.yellow * 1) / 60
 

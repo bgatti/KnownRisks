@@ -1,7 +1,7 @@
 {
   "generated": "2026-04-17",
   "source": "tracks_yearly.json special-use classification",
-  "total": 172,
+  "total": 182,
   "by_use": {
     "firefighting": 7,
     "government": 7,
@@ -10,8 +10,8 @@
     "medivac": 48,
     "medivac_possible": 8,
     "military": 18,
-    "patrol": 17,
-    "science": 9,
+    "patrol": 22,
+    "science": 14,
     "search_rescue": 18,
     "survey": 7
   },
@@ -1658,6 +1658,76 @@
       "aircraft_type": "T206",
       "aircraft_desc": "CESSNA T206 Turbo Stationair",
       "track_count": 1
+    },
+    {
+      "tail": "N617DH",
+      "use": "science",
+      "aircraft_desc": "MOONEY M-20",
+      "owner": "CHAMPIONX LLC (Scientific Aviation atmospheric research)",
+      "description": "Scientific Aviation atmospheric / methane research"
+    },
+    {
+      "tail": "N334FL",
+      "use": "science",
+      "aircraft_desc": "MOONEY M-20",
+      "owner": "CHAMPIONX LLC (Scientific Aviation atmospheric research)",
+      "description": "Scientific Aviation atmospheric / methane research"
+    },
+    {
+      "tail": "N2132X",
+      "use": "science",
+      "aircraft_desc": "MOONEY M-20",
+      "owner": "CHAMPIONX LLC (Scientific Aviation atmospheric research)",
+      "description": "Scientific Aviation atmospheric / methane research"
+    },
+    {
+      "tail": "N331AR",
+      "use": "science",
+      "aircraft_desc": "DE HAVILLAND DHC-6 Twin Otter",
+      "owner": "TWIN OTTER INTERNATIONAL LTD (NEON AOP)",
+      "description": "NEON Airborne Observation Platform — ecological research"
+    },
+    {
+      "tail": "N934MU",
+      "use": "science",
+      "aircraft_desc": "DE HAVILLAND DHC-6 Twin Otter",
+      "owner": "TWIN OTTER INTERNATIONAL LTD (NEON AOP)",
+      "description": "NEON Airborne Observation Platform — ecological research"
+    },
+    {
+      "tail": "N445CP",
+      "use": "patrol",
+      "aircraft_desc": "Cessna (CAP CO Wing)",
+      "owner": "CIVIL AIR PATROL",
+      "description": "Civil Air Patrol — auxiliary/search & rescue"
+    },
+    {
+      "tail": "N447CP",
+      "use": "patrol",
+      "aircraft_desc": "Cessna (CAP CO Wing)",
+      "owner": "CIVIL AIR PATROL",
+      "description": "Civil Air Patrol — auxiliary/search & rescue"
+    },
+    {
+      "tail": "N836CP",
+      "use": "patrol",
+      "aircraft_desc": "Cessna (CAP CO Wing)",
+      "owner": "CIVIL AIR PATROL",
+      "description": "Civil Air Patrol — auxiliary/search & rescue"
+    },
+    {
+      "tail": "N240CP",
+      "use": "patrol",
+      "aircraft_desc": "Cessna (CAP CO Wing)",
+      "owner": "CIVIL AIR PATROL",
+      "description": "Civil Air Patrol — auxiliary/search & rescue"
+    },
+    {
+      "tail": "N9849H",
+      "use": "patrol",
+      "aircraft_desc": "CAP fleet",
+      "owner": "CIVIL AIR PATROL",
+      "description": "Civil Air Patrol — auxiliary/search & rescue"
     }
   ]
 }
