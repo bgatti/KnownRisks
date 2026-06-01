@@ -1742,6 +1742,44 @@ function excursionsApiPlugin() {
                   const slice = startIdx > 0 ? pts.slice(startIdx - 1) : pts.slice(startIdx)
                   if (slice.length >= 2) trimmedBands.push({ ...sanitised, points: slice })
                 }
+                // Synthesize clean fill-in bands from t.points where
+                // existing classified bands don't cover the flight path.
+                // The capture-worker only emits bands for excursion-
+                // classified runs (and the boundary points around them);
+                // a flight that did practice-area work outside the
+                // airport's noise zones has none of that portion in
+                // bands. The kiosk's worst_segment subset check then
+                // can't find a matching band point and drops the
+                // overlay — that's the "missing pop_impact segments"
+                // symptom (operator-filed 2026-06-01). Clean fill-in
+                // bands (klass=null) restore the full polyline.
+                if (Array.isArray(t.points) && t.points.length > 1) {
+                  const sortedPts = t.points
+                    .filter(p => Array.isArray(p) && p.length >= 4 && p[3] != null && p[3] >= windowFromMs)
+                    .sort((a, b) => a[3] - b[3])
+                  if (sortedPts.length >= 2) {
+                    // Per-point: is this ts inside any existing band's range?
+                    const ranges = []
+                    for (const b of trimmedBands) {
+                      const bps = b.points || []
+                      if (bps.length >= 2 && bps[0][3] != null && bps[bps.length-1][3] != null) {
+                        ranges.push([bps[0][3], bps[bps.length-1][3]])
+                      }
+                    }
+                    let cur = null
+                    for (const p of sortedPts) {
+                      const covered = ranges.some(([lo, hi]) => p[3] >= lo && p[3] <= hi)
+                      if (!covered) {
+                        if (!cur) cur = { klass: null, points: [] }
+                        cur.points.push(p)
+                      } else {
+                        if (cur && cur.points.length >= 2) trimmedBands.push(cur)
+                        cur = null
+                      }
+                    }
+                    if (cur && cur.points.length >= 2) trimmedBands.push(cur)
+                  }
+                }
                 if (!trimmedBands.length) continue
                 // Server-classified flight phase for the kiosk — same
                 // classifier as /api/excursions/segments. Replaces the
