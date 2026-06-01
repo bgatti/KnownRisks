@@ -12,7 +12,7 @@ import {
 } from './scenarioSubstitutes.js'
 import { NOISE_ZONES } from './src/noiseZones.js'
 import { classifyOneTrack, phaseMLApiPlugin } from './phaseML/index.js'
-import { sortiesApiPlugin } from './sortiesPlugin.js'
+import { classifyOneTrack as purposeMLClassify, purposeMLApiPlugin } from './purposeML/index.js'
 import { synthesizeInProgressCycle } from './flightCycles.js'
 import {
   computeFlightAltOffset,
@@ -9018,7 +9018,6 @@ export default defineConfig({
     noiseReportsApiPlugin(),
     pilotApiPlugin(),
     flightsApiPlugin(),
-    sortiesApiPlugin({ db, ENRICH_AP, POPGRID }), // GET /api/sorties
     !db.useDb && liveCapturePlugin(),
     livePositionsPlugin(),
     adsbApiPlugin(),
