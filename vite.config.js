@@ -1391,6 +1391,21 @@ function excursionsApiPlugin() {
               .map((s) => s.trim())
               .filter(Boolean),
           )
+          // `airport` filter — when set, the response narrows to tracks
+          // attributed to (or flying through) the named field. Without it
+          // the endpoint is region-wide (every Front Range airport mixed),
+          // which is what the kiosk reported as buggy: painting KBDU
+          // tracks on the KBJC map. Semantic when set: historical tracks
+          // are filtered in SQL on `base_airport = $airport`; live tracks
+          // are filtered post-enrichment on `t.base === airport ||
+          // t.origin === airport || t.dest === airport` (covers transit).
+          const airport = (u.searchParams.get('airport') || '').trim().toUpperCase() || null
+          if (airport && !ENRICH_AP.find(a => a.code === airport)) {
+            res.statusCode = 400
+            res.setHeader('Content-Type', 'application/json')
+            res.setHeader('Access-Control-Allow-Origin', '*')
+            return res.end(JSON.stringify({ error: `unknown airport ${airport}` }))
+          }
           const SEV = { yellow: 1, orange: 2, red: 3, purple: 4 }
           const nowMs = Date.now()
           const fromDate = new Date(nowMs - hours * 3600 * 1000).toISOString().slice(0, 10)
@@ -1423,6 +1438,7 @@ function excursionsApiPlugin() {
               WHERE date >= $1 AND date <= $2
                 AND worst_class IS NOT NULL
                 AND bands IS NOT NULL
+                ${airport ? 'AND base_airport = $4' : ''}
               ORDER BY
                 CASE WHEN seg_purple > 0 THEN 0
                      WHEN worst_class = 'red' THEN 1
@@ -1431,7 +1447,10 @@ function excursionsApiPlugin() {
                 rand_key
               LIMIT $3
             `
-            tracksRes = await db.queryDb(tracksSql, [fromDate, toDate, limit])
+            const tracksParams = airport
+              ? [fromDate, toDate, limit, airport]
+              : [fromDate, toDate, limit]
+            tracksRes = await db.queryDb(tracksSql, tracksParams)
           }
 
           // ── Per-tail active summary ──
@@ -1448,6 +1467,7 @@ function excursionsApiPlugin() {
             FROM tracks
             WHERE date >= $1 AND date <= $2
               AND worst_class IS NOT NULL
+              ${airport ? 'AND base_airport = $3' : ''}
             GROUP BY call, type, school, base_airport
             ORDER BY
               CASE MAX(worst_class)
@@ -1456,7 +1476,10 @@ function excursionsApiPlugin() {
                 ELSE 0 END DESC,
               SUM(seg_red) DESC
           `
-          const activeRes = await db.queryDb(activeSql, [fromDate, toDate])
+          const activeParams = airport
+            ? [fromDate, toDate, airport]
+            : [fromDate, toDate]
+          const activeRes = await db.queryDb(activeSql, activeParams)
           // Engineless aircraft (gliders, balloons) are VNAP-exempt. Even
           // if they have non-null worst_class in the historical tracks
           // table (the backfill ran before this rule existed), they
@@ -1612,6 +1635,18 @@ function excursionsApiPlugin() {
             }
           } catch (e) { console.error('[excursions-boot] enrich error:', e.message) }
 
+          // Apply `airport=` to live tracks. Historical tracks are already
+          // SQL-filtered upstream. A live track is in-scope when it's based
+          // at the airport OR its origin / dest (from nearestAp on the
+          // track's first/last fix, threshold 2.5 nm) matches — captures
+          // transit traffic that flew through the field this window.
+          let liveTracksFiltered = liveTracks
+          if (airport) {
+            liveTracksFiltered = liveTracks.filter(t =>
+              t.base === airport || t.origin === airport || t.dest === airport,
+            )
+          }
+
           // ── Merge live tracks into per-tail active aggregation ──
           // The active SQL above only scans the historical `tracks` table,
           // which doesn't include today's in-progress flights. Without this
@@ -1619,7 +1654,7 @@ function excursionsApiPlugin() {
           // live violations. Counts come from the trimmed bands so they
           // reflect points still in the requested window.
           const liveByTail = new Map()
-          for (const lt of liveTracks) {
+          for (const lt of liveTracksFiltered) {
             const tail = lt.call
             if (!tail || tail === '?') continue
             let trackWorst = null
@@ -1740,6 +1775,7 @@ function excursionsApiPlugin() {
             window: {
               hours, from: fromDate, to: toDate, limit,
               from_ms: windowFromMs, to_ms: nowMs,
+              airport,
               note: hours < 24
                 ? 'Sub-day window: live track points trimmed to last N hours; historical tracks skipped (date-level only).'
                 : 'Historical tracks pulled by date; live track points trimmed to window.',
@@ -1796,7 +1832,7 @@ function excursionsApiPlugin() {
                   complaints: trackComplaints,
                 }
               }),
-              ...liveTracks.map(lt => {
+              ...liveTracksFiltered.map(lt => {
                 const win = trackTimeWindow(lt)
                 const trackComplaints = win
                   ? fsMod.matchComplaintsForKiosk(complaintsRaw, lt.call, win[0], win[1])
@@ -1805,7 +1841,7 @@ function excursionsApiPlugin() {
                 return { ...lt, complaints: trackComplaints }
               }),
             ],
-            live: { updated_at: liveUpdatedAt, tracks: liveCount },
+            live: { updated_at: liveUpdatedAt, tracks: liveCount, filtered_to: airport || null },
             // Top-level complaint feed for the kiosk's map-pin layer.
             // Items contain geocoded entries (lat/lon set) and tail-only
             // entries — kiosk filters to the subset it needs.
@@ -3772,6 +3808,26 @@ function flightsApiPlugin() {
   return {
     name: 'flights-api',
     configureServer(server) {
+      // Warm the per-airport runway cache in parallel at server start.
+      // /api/airports/:icao + /api/runways both call getRunwaysForAirport,
+      // which goes to Overpass on a cache miss (25 s timeout in-query, often
+      // 5-30 s wall-clock). Without warmup, the first kiosk page load on a
+      // cold Railway container stalls 30-90 s — the bug filed in
+      // FLIGHT_DATA_SERVICE.md as "catastrophic endpoint latency."
+      //
+      // Fire-and-forget: don't block plugin registration; just kick off the
+      // 7 Overpass calls in parallel so the cache is hot before the first
+      // kiosk request lands. allSettled so one slow airport doesn't poison
+      // the others.
+      ;(async () => {
+        const t0 = Date.now()
+        const codes = ENRICH_AP.map(a => a.code)
+        const results = await Promise.allSettled(codes.map(c => getRunwaysForAirport(c)))
+        const ok = results.filter(r => r.status === 'fulfilled' && Array.isArray(r.value)).length
+        const slow = Date.now() - t0
+        console.log(`[runways-warmup] ${ok}/${codes.length} airports warmed in ${slow} ms`)
+      })().catch(err => console.error('[runways-warmup] error', err))
+
       server.middlewares.use('/api/flights/acknowledge', async (req, res, next) => {
         if (req.method !== 'POST') return next()
         res.setHeader('Content-Type', 'application/json')
@@ -4027,17 +4083,24 @@ function flightsApiPlugin() {
             res.statusCode = 400
             return res.end(JSON.stringify({ error: `unknown center airport ${center}` }))
           }
+          // Resolve all in-range airports in PARALLEL. Sequential await
+          // serialized 7 potentially-slow Overpass calls; with the warmup
+          // those are usually cache hits, but on a cold container during
+          // the warmup window any single slow airport would still serialize
+          // the whole response. Promise.all + early distance filter keeps
+          // the network fanout tight.
+          const inRange = ENRICH_AP.filter(ap =>
+            distNmAp(centerAp.lat, centerAp.lon, ap.lat, ap.lon) <= radiusNm,
+          )
+          const rwyLists = await Promise.all(
+            inRange.map(ap => getRunwaysForAirport(ap.code).catch(() => null)),
+          )
           const out = []
-          // Iterate every configured airport. Order doesn't matter for
-          // correctness; the result is keyed by (icao, ref). Using
-          // AIRPORT_META_STATIC keys catches every airport the kiosk
-          // knows about; ENRICH_AP supplies the lat/lon for distance.
-          for (const ap of ENRICH_AP) {
-            const dist = distNmAp(centerAp.lat, centerAp.lon, ap.lat, ap.lon)
-            if (dist > radiusNm) continue
-            const meta = AIRPORT_META_STATIC[ap.code] || {}
-            const rwys = await getRunwaysForAirport(ap.code)
+          for (let i = 0; i < inRange.length; i++) {
+            const ap = inRange[i]
+            const rwys = rwyLists[i]
             if (!rwys || rwys.length === 0) continue
+            const meta = AIRPORT_META_STATIC[ap.code] || {}
             for (const r of rwys) {
               out.push({
                 icao: ap.code,
