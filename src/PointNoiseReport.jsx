@@ -1236,6 +1236,11 @@ export default function PointNoiseReport() {
     eurofox_pct: 0,
     sinus_pct: 0,
     winch_agl_ft: 0,
+    // §11-CLIENT V2: regulatory demand-reduction sliders (track_eliminate
+    // scope). Slider value 0..100 maps linearly to 0..max_reduction_pct
+    // from substitutes.json — ATPR caps at 60%, SIMX at 30%.
+    atpr_pct: 0,
+    simx_pct: 0,
     rate: 0.05,
     horizon_yr: 10,
     fuel_multiplier: 1.0,
@@ -1379,6 +1384,10 @@ export default function PointNoiseReport() {
     if (p.has('eurofox'))   next.eurofox_pct     = num('eurofox', 0)
     if (p.has('sinus'))     next.sinus_pct       = num('sinus', 0)
     if (p.has('winch_agl')) next.winch_agl_ft    = num('winch_agl', 0)
+    // §11-CLIENT V2: regulatory demand-reduction keys (parsed on mount; written
+    // back in the corresponding history.replaceState effect below).
+    if (p.has('atpr'))      next.atpr_pct        = num('atpr', 0)
+    if (p.has('simx'))      next.simx_pct        = num('simx', 0)
     if (p.has('disc'))      next.rate            = num('disc', 5) / 100
     if (p.has('horizon'))   next.horizon_yr      = num('horizon', 10)
     if (p.has('fuel'))      next.fuel_multiplier = num('fuel', 1)
