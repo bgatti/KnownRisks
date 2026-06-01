@@ -880,6 +880,20 @@ export default function PointNoiseReport() {
     return () => { aborted = true }
   }, [])
 
+  // §11-CLIENT §1: Fetch the substitute registry once on mount and cache it
+  // for the page lifetime. `null` = still loading (don't render the What-If
+  // section yet); `[]` = either no subs configured or the fetch 404'd — the
+  // panel stays hidden (fail-open) so the rest of the report still renders.
+  const [substitutes, setSubstitutes] = useState(null)
+  useEffect(() => {
+    let aborted = false
+    fetch('/substitutes.json')
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`substitutes ${r.status}`))))
+      .then((d) => { if (!aborted) setSubstitutes(Array.isArray(d?.substitutes) ? d.substitutes : []) })
+      .catch(() => { if (!aborted) setSubstitutes([]) })
+    return () => { aborted = true }
+  }, [])
+
   /** Convert the raw track payload into per-flight rows at the listener. */
   const allRows = useMemo(() => {
     if (!raw?.tracks) return []
