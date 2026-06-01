@@ -1819,6 +1819,11 @@ function excursionsApiPlugin() {
           console.error('[excursions-boot] error', err)
           res.statusCode = 500
           res.setHeader('Content-Type', 'application/json')
+          // CORS must be set on the error path too — otherwise a DB-timeout
+          // 500 (e.g. Query read timeout under load) reaches the browser as
+          // a CORS error, masking the real cause. The success path sets this
+          // header at line ~1736; this catch was missing it.
+          res.setHeader('Access-Control-Allow-Origin', '*')
           res.end(JSON.stringify({ error: String(err) }))
         }
       })
@@ -2970,34 +2975,54 @@ const PATTERN_WEIGHT = 0.3
 //   verified_agl_ft = verified_alt_ft - field_elev_ft
 //
 // Tuning knobs:
-//   CAL_RADIUS_NM    — how close to airport center counts as "over field"
-//   CAL_ALT_BAND_FT  — reported alt must be within ±this of field elev
-//                      (large enough to catch a +200ft transponder bias,
-//                       small enough to exclude pattern legs above 1000 AGL)
-//   MIN_FIXES        — minimum calibration fixes before we trust the offset
-const VERIFIED_ALT_CAL_RADIUS_NM = 0.5
-const VERIFIED_ALT_CAL_BAND_FT = 250
-const VERIFIED_ALT_MIN_FIXES = 3
+//   CAL_RADIUS_NM        — how close to airport center we look for anchors
+//   CAL_COHORT_FRACTION  — what fraction of the lowest fixes to average
+//                          (the lowest fixes are closest to the runway
+//                          surface — touchdown / taxi / start-of-roll)
+//   CAL_MIN_FIXES        — minimum candidate fixes before we attempt
+//   CAL_MAX_AGL_FT       — sanity bound on cohort mean (if it's higher,
+//                          the plane never actually descended to the
+//                          runway and we can't calibrate)
+const VERIFIED_ALT_CAL_RADIUS_NM = 2.0
+const VERIFIED_ALT_CAL_COHORT_FRACTION = 0.25
+const VERIFIED_ALT_CAL_MIN_FIXES = 3
+const VERIFIED_ALT_CAL_MAX_AGL_FT = 500
 
 function computeFlightAltOffset(flightPts, airport) {
   const ap = ENRICH_AP.find(a => a.code === airport)
   if (!ap || !flightPts || !flightPts.length) {
     return { offset_ft: 0, calibration_fixes: 0 }
   }
-  const fixes = []
+  // Gather every fix within 2 nm of the airport. That includes approach,
+  // taxi, takeoff roll — anywhere the plane was near the runway. Earlier
+  // version restricted to ±250 ft of field elev which excluded biased
+  // transponders and pattern legs — both gave the wrong answer.
+  const candidates = []
   for (const p of flightPts) {
     if (p[0] == null || p[1] == null || p[2] == null) continue
     if (distNmAp(p[0], p[1], ap.lat, ap.lon) > VERIFIED_ALT_CAL_RADIUS_NM) continue
-    if (Math.abs(p[2] - ap.elev) > VERIFIED_ALT_CAL_BAND_FT) continue
-    fixes.push(p[2])
+    candidates.push(p[2])
   }
-  if (fixes.length < VERIFIED_ALT_MIN_FIXES) {
-    return { offset_ft: 0, calibration_fixes: fixes.length }
+  if (candidates.length < VERIFIED_ALT_CAL_MIN_FIXES) {
+    return { offset_ft: 0, calibration_fixes: 0 }
   }
-  const avg = fixes.reduce((s, v) => s + v, 0) / fixes.length
+  // Take the lowest 25% of candidates — those are closest to the runway
+  // surface. The mean across them is the per-flight calibration anchor.
+  // 25% picks up touchdown + a bit of rollout, which is what we want;
+  // 100% would dilute with airborne pattern legs.
+  const sorted = candidates.slice().sort((a, b) => a - b)
+  const kFloor = Math.max(VERIFIED_ALT_CAL_MIN_FIXES, Math.ceil(sorted.length * VERIFIED_ALT_CAL_COHORT_FRACTION))
+  const cohort = sorted.slice(0, kFloor)
+  const avg = cohort.reduce((s, v) => s + v, 0) / cohort.length
+  // Sanity bound: if even the lowest 25% sits more than 500 ft above
+  // field, the plane never came close to the runway and we have no
+  // real calibration anchor. Return 0 offset — kiosk renders raw AGL.
+  if ((avg - ap.elev) > VERIFIED_ALT_CAL_MAX_AGL_FT) {
+    return { offset_ft: 0, calibration_fixes: cohort.length }
+  }
   return {
     offset_ft: Math.round(avg - ap.elev),
-    calibration_fixes: fixes.length,
+    calibration_fixes: cohort.length,
   }
 }
 
