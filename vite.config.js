@@ -3315,7 +3315,28 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   }
   const tMs = grpCycles[0].tMs
   const lMs = grpCycles[grpCycles.length - 1].lMs ?? Date.now()
-  const flightPts = allPts.filter(p => p[3] != null && p[3] >= tMs && p[3] <= lMs)
+  let flightPts = allPts.filter(p => p[3] != null && p[3] >= tMs && p[3] <= lMs)
+  if (flightPts.length < 2) return out
+
+  // Trim flightPts to the most recent contiguous block. Without this,
+  // a flight bundle that incorrectly spans an overnight parking gap
+  // (because either extractTowCycles produced a 24+ h cycle, or the
+  // bundler merged across a guard window we missed) would compute
+  // worst_segment from yesterday's sortie's track — which lands 6-13 nm
+  // off the current sortie's actual position. Operator-filed
+  // orphan-bug 2026-06-01.
+  //
+  // FLIGHT_PT_MAX_GAP_MS — gaps longer than this inside flightPts mean
+  // the aircraft was on the ground. Matches the coverage-gap guard cap;
+  // any real ADS-B coverage gap within an actual flight is < 60 min.
+  const FLIGHT_PT_MAX_GAP_MS = 60 * 60_000
+  let lastBigGapIdx = -1
+  for (let i = 1; i < flightPts.length; i++) {
+    if ((flightPts[i][3] || 0) - (flightPts[i - 1][3] || 0) > FLIGHT_PT_MAX_GAP_MS) {
+      lastBigGapIdx = i
+    }
+  }
+  if (lastBigGapIdx > 0) flightPts = flightPts.slice(lastBigGapIdx)
   if (flightPts.length < 2) return out
   const engineless = isEnginelessType(type)
   const ap = ENRICH_AP.find(a => a.code === airport)
