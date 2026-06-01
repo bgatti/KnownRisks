@@ -168,6 +168,18 @@ try {
   const j = JSON.parse(fs.readFileSync('public/aircraft_icons.json', 'utf8'))
   AIRCRAFT_ICONS = { byType: j.byType || (j.byTail ? {} : j) || {}, byTail: j.byTail || {} }
 } catch { /* optional registry */ }
+
+// Scenario-substitution registry — quieter-fleet alternatives keyed by code
+// (EFOX/SINU/VELE/WNCH). Each entry declares which incumbent types/purposes
+// it can replace and whether it applies to the whole track (scope=track) or
+// just a sub-segment (scope=segment, e.g. WNCH below 2000 ft AGL). Loaded
+// once at module scope so the /api/excursions/segments handler can use it
+// without re-reading on every request. See public/substitutes.json + Ask #11.
+let SUBSTITUTES = []
+try {
+  const sj = JSON.parse(fs.readFileSync('public/substitutes.json', 'utf8'))
+  SUBSTITUTES = Array.isArray(sj?.substitutes) ? sj.substitutes : []
+} catch { /* optional registry */ }
 function aircraftIconUrl(type, tail) {
   const T = (type || '').toUpperCase()
   const N = (tail || '').toUpperCase()
