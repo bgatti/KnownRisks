@@ -1396,10 +1396,28 @@ function excursionsApiPlugin() {
           res.setHeader('Access-Control-Allow-Origin', '*')
           res.end(JSON.stringify(payload))
         } catch (err) {
-          console.error('[excursions-segments-api] error', err)
-          res.statusCode = 500
+          // §1 (API_REQUEST.md). Cold-cache loadTracksFromDb / loadLiveFromDb
+          // calls routinely time out on first-of-the-day queries. The page
+          // already has retry-with-Retry-After machinery in `runReport()` —
+          // serving a clean 503 lets it auto-recover (vs a 500 which the
+          // client treats as a hard failure). Pool timeout is intentionally
+          // left at 20 s (below Railway's ~30 s HTTP proxy) so we get a
+          // clean error rather than a 502 / TCP drop.
+          const msg = String(err && err.message || err)
+          const isTimeout = /Query read timeout|statement timeout|\btimeout\b|ETIMEDOUT|ECONNRESET|connection terminated|Connection terminated unexpectedly/i.test(msg)
+          console.error('[excursions-segments-api]', isTimeout ? '503 (cold-cache timeout)' : 'error', err)
+          res.statusCode = isTimeout ? 503 : 500
+          if (isTimeout) res.setHeader('Retry-After', '10')
           res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify({ error: String(err) }))
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.end(JSON.stringify({
+            error: msg,
+            ...(isTimeout && {
+              transient: true,
+              retryAfterS: 10,
+              hint: 'tracks cache is warming up — retry in ~10s',
+            }),
+          }))
         }
       })
       // GET /api/excursions/boot — Returns tracks with pre-computed bands
