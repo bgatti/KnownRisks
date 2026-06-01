@@ -632,6 +632,141 @@ function Empty({ children }) {
   return <div className="text-sm text-white/40 py-6 text-center">{children}</div>
 }
 
+/* ───────────────────────── what-if panel ───────────────────────────── */
+
+/** Lookup a substitute config by code. Returns null if the registry hasn't
+ *  loaded yet or the code isn't in the published table. */
+function findSub(subs, code) {
+  if (!Array.isArray(subs)) return null
+  return subs.find((s) => s?.code === code) || null
+}
+
+function Disclosure({ open, onToggle, label, children }) {
+  return (
+    <div className="border border-white/10 rounded-md bg-white/[0.015]">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="w-full flex items-center justify-between px-3 py-2 text-left text-xs uppercase tracking-wide text-white/60 hover:text-white/90"
+      >
+        <span>{label}</span>
+        <span className="text-white/40 font-mono">{open ? '−' : '+'}</span>
+      </button>
+      {open && (
+        <div className="border-t border-white/10 px-3 py-3 space-y-3">
+          {children}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** §11-CLIENT §3: the four what-if sliders + the Advanced disclosure. State
+ *  lives in the parent (PointNoiseReport) so the rest of the page can read
+ *  it for the overlay histogram + the business-model table. */
+function WhatIfPanel({ scenario, setScenario, substitutes, advancedOpen, setAdvancedOpen }) {
+  const update = (patch) => setScenario((s) => ({ ...s, ...patch }))
+  const updateHours = (code, hours) => setScenario((s) => ({
+    ...s,
+    annual_hours_override: { ...s.annual_hours_override, [code]: hours },
+  }))
+  // Sub registry lookups — used to display the per-substitute default for
+  // the "Annual hours per airframe" knobs and the descriptive blurbs.
+  const subVele = findSub(substitutes, 'VELE')
+  const subEfox = findSub(substitutes, 'EFOX')
+  const subSinu = findSub(substitutes, 'SINU')
+  const subWnch = findSub(substitutes, 'WNCH')
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <Slider
+          label={`Electric trainer % (${subVele?.name || 'VELE'})`}
+          value={scenario.electric_pct}
+          min={0} max={100} step={5}
+          onChange={(v) => update({ electric_pct: v })}
+          fmt={(v) => `${v}%`}
+        />
+        <Slider
+          label={`Eurofox tow % (${subEfox?.name || 'EFOX'})`}
+          value={scenario.eurofox_pct}
+          min={0} max={100} step={5}
+          onChange={(v) => update({ eurofox_pct: v })}
+          fmt={(v) => `${v}%`}
+        />
+        <Slider
+          label={`Sinus glider % (${subSinu?.name || 'SINU'})`}
+          value={scenario.sinus_pct}
+          min={0} max={100} step={5}
+          onChange={(v) => update({ sinus_pct: v })}
+          fmt={(v) => `${v}%`}
+        />
+        <Slider
+          label={`Winch under N ft AGL (${subWnch?.name || 'WNCH'})`}
+          value={scenario.winch_agl_ft}
+          min={0} max={3000} step={100}
+          onChange={(v) => update({ winch_agl_ft: v })}
+          fmt={(v) => (v === 0 ? 'off' : `${v.toLocaleString()} ft`)}
+        />
+      </div>
+      <Disclosure
+        open={advancedOpen}
+        onToggle={() => setAdvancedOpen((x) => !x)}
+        label="Advanced — financial knobs (NPV inputs)"
+      >
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <Slider
+            label="Discount rate"
+            value={scenario.rate * 100}
+            min={3} max={12} step={0.5}
+            onChange={(v) => update({ rate: v / 100 })}
+            fmt={(v) => `${v.toFixed(1)}%`}
+          />
+          <Slider
+            label="Time horizon"
+            value={scenario.horizon_yr}
+            min={5} max={20} step={1}
+            onChange={(v) => update({ horizon_yr: v })}
+            fmt={(v) => `${v} yr`}
+          />
+          <Slider
+            label="Fuel / electricity multiplier"
+            value={scenario.fuel_multiplier}
+            min={0.5} max={2.0} step={0.05}
+            onChange={(v) => update({ fuel_multiplier: v })}
+            fmt={(v) => `${v.toFixed(2)}×`}
+          />
+        </div>
+        <div className="text-[10px] text-white/40 leading-snug">
+          Op-savings multiplier sensitivity test — set to 0.5× to ask "what if
+          fuel halves?", 2.0× to ask "what if it doubles?". Discount rate +
+          time horizon feed the NPV formula.
+        </div>
+        {/* Per-substitute annual-hours overrides — one row each. */}
+        <div className="space-y-3 pt-2 border-t border-white/5">
+          <div className="text-[10px] uppercase tracking-wide text-white/40">
+            Annual hours per airframe (override per substitute)
+          </div>
+          {[subVele, subEfox, subSinu, subWnch].map((sub) => {
+            if (!sub) return null
+            const dflt = sub.annual_hours_typical ?? 400
+            const value = scenario.annual_hours_override[sub.code] ?? dflt
+            return (
+              <Slider
+                key={sub.code}
+                label={`${sub.code} — ${sub.name}`}
+                value={value}
+                min={100} max={1000} step={50}
+                onChange={(v) => updateHours(sub.code, v)}
+                fmt={(v) => `${v} h/yr${v === dflt ? ' (default)' : ''}`}
+              />
+            )
+          })}
+        </div>
+      </Disclosure>
+    </div>
+  )
+}
+
 /* ───────────────────────── mini map pin picker ─────────────────────── */
 
 function MapClickHandler({ onSet }) {
@@ -805,6 +940,26 @@ export default function PointNoiseReport() {
   // filters
   const [dbaFloor, setDbaFloor] = useState(50)
   const [minPerHour, setMinPerHour] = useState(0)
+
+  // §11-CLIENT §3: What-If scenario state. Four "what fraction" sliders +
+  // four financial knobs (collapsed by default behind "Advanced"). Pure
+  // client-side math — no API roundtrip when these change.
+  //
+  // `annual_hours_override` is keyed by substitute code; an entry means
+  // "user has tuned this away from the substitute's default", absence
+  // means "use sub.annual_hours_typical". An empty object on initial
+  // mount = pristine defaults.
+  const [scenario, setScenario] = useState({
+    electric_pct: 0,
+    eurofox_pct: 0,
+    sinus_pct: 0,
+    winch_agl_ft: 0,
+    rate: 0.05,
+    horizon_yr: 10,
+    fuel_multiplier: 1.0,
+    annual_hours_override: {},
+  })
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   const [excludeGliders, setExcludeGliders] = useState(true)
   const [purposeSelected, setPurposeSelected] = useState(new Set())
 
@@ -1334,6 +1489,34 @@ export default function PointNoiseReport() {
             accent={dominantPurpose ? '' : ''}
           />
         </div>
+
+        {/* §11-CLIENT §3: What-If panel. Hidden until (a) the substitutes
+            config has loaded and (b) at least one track in the current
+            window carries the new alt_airframe_candidates field. When
+            those two preconditions hold but no slider has moved, the
+            panel still renders so the user can engage it. */}
+        {(() => {
+          const anyCandidate = allRows.some(
+            (r) => (r.altAirframeCandidates?.length || 0) > 0
+              || (r.altSegmentCandidates?.length || 0) > 0,
+          )
+          if (substitutes == null) return null  // still loading
+          if (!substitutes.length || !anyCandidate) return null
+          return (
+            <Section
+              title="What-If: quieter fleets"
+              hint="Drag a slider to swap a fraction of the current fleet for a quieter alternative. All math is client-side — sliders update the overlay histogram + business-model table instantly."
+            >
+              <WhatIfPanel
+                scenario={scenario}
+                setScenario={setScenario}
+                substitutes={substitutes}
+                advancedOpen={advancedOpen}
+                setAdvancedOpen={setAdvancedOpen}
+              />
+            </Section>
+          )
+        })()}
 
         {/* Purpose rollup — the headline */}
         <Section
