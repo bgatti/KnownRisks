@@ -131,6 +131,15 @@ const PURPOSE_LABEL = {
   survey:          'Survey',
   search_rescue:   'Search & rescue',
   unknown:         'Unknown',
+  // §11-CLIENT V3 §1: purposeML bucket taxonomy (server emits these
+  // verbatim when purpose_source === 'shape' or 'shape-hedged'). The
+  // legacy entries above still apply when purpose_source is anything
+  // else (special_use / type / tracked).
+  glider_local:    'Glider (local soaring)',
+  glider_xc:       'Glider (cross-country)',
+  pattern_solo:    'Pattern (solo / non-school)',
+  ga_local:        'GA local (around-the-pattern)',
+  ga_xc:           'GA cross-country',
 }
 
 const PURPOSE_COLOR = {
@@ -154,6 +163,14 @@ const PURPOSE_COLOR = {
   survey:          '#22d3ee',
   search_rescue:   '#ef4444',
   unknown:         '#6b7280',
+  // §11-CLIENT V3 §1: purposeML bucket colors. Hue-matched to nearest
+  // legacy entry so cross-source visual continuity is preserved
+  // (e.g. glider_local sits next to legacy glider in the rollup chart).
+  glider_local:    '#a78bfa', // violet-400 — pairs with legacy glider
+  glider_xc:       '#7c3aed', // violet-600 — darker XC variant
+  pattern_solo:    '#fbbf24', // amber-400 — close to training, distinct hue
+  ga_local:        '#60a5fa', // blue-400 — pairs with legacy ga_single
+  ga_xc:           '#3b82f6', // blue-500 — darker XC variant
 }
 
 /** Mirrors purposeOf in vite.config.js. */
