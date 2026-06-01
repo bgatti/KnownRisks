@@ -92,7 +92,7 @@ export async function fetchNearbyTracks({ lat, lng, hours = 2, limit = 50, signa
 }
 
 /** Single combined boot call — active excursions + tracks in one request. */
-export async function fetchBoot({ hours = 1, limit = 100, include, signal } = {}) {
+export async function fetchBoot({ hours = 1, limit = 200, include, signal } = {}) {
   const params = new URLSearchParams({ hours: String(hours) })
   if (limit) params.set('limit', String(limit))
   if (include) params.set('include', Array.isArray(include) ? include.join(',') : include)
@@ -142,7 +142,7 @@ export async function postComplaint(payload, { signal } = {}) {
   return res.json()
 }
 
-export async function fetchMyReports({ reporter, signal, limit = 10 } = {}) {
+export async function fetchMyReports({ reporter, signal, limit = 20 } = {}) {
   const params = new URLSearchParams()
   if (reporter) params.set('reporter', reporter)
   if (limit) params.set('limit', String(limit))
@@ -161,7 +161,7 @@ export async function fetchMyReports({ reporter, signal, limit = 10 } = {}) {
   return list.slice(0, limit)
 }
 
-export async function fetchMyComplaints({ reporter, signal, limit = 10 } = {}) {
+export async function fetchMyComplaints({ reporter, signal, limit = 20 } = {}) {
   const params = new URLSearchParams()
   if (reporter) params.set('reporter', reporter)
   if (limit) params.set('limit', String(limit))

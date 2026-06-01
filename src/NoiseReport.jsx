@@ -113,6 +113,9 @@ const AIRCRAFT_TYPE_HINTS = {
   PA28: 'Piper PA-28 Cherokee',
   PA32: 'Piper PA-32',
   PA46: 'Piper PA-46',
+  PA25: 'Piper PA-25 Pawnee',
+  PA18: 'Piper PA-18 Super Cub',
+  HUSK: 'Aviat Husky',
   C172: 'Cessna 172',
   C152: 'Cessna 152',
   C182: 'Cessna 182',
@@ -131,6 +134,18 @@ const AIRCRAFT_TYPE_HINTS = {
   M20J: 'Mooney M20',
   RV7:  'Van\'s Aircraft RV-7',
   RV8:  'Van\'s Aircraft RV-8',
+  AS50: 'Eurocopter AS350 Écureuil helicopter',
+  R22:  'Robinson R22 helicopter',
+  R44:  'Robinson R44 helicopter',
+  R66:  'Robinson R66 helicopter',
+  B06:  'Bell 206 JetRanger helicopter',
+  B407: 'Bell 407 helicopter',
+  H500: 'Hughes MD 500 helicopter',
+  EC30: 'Eurocopter EC130 helicopter',
+  EC35: 'Eurocopter EC135 helicopter',
+  EC45: 'Eurocopter EC145 helicopter',
+  C30J: 'Lockheed Martin C-130J Super Hercules',
+  C130: 'Lockheed C-130 Hercules',
 }
 
 async function fetchAircraftPhoto(type, { signal } = {}) {
@@ -1287,10 +1302,13 @@ export function NoiseStudio() {
 
       const seenTails = new Set()
       const samePt = (a, b) => Math.abs(a[0] - b[0]) < 1e-6 && Math.abs(a[1] - b[1]) < 1e-6
-      // Dedicated pane between the heatmap (350) and selected highlights (450)
+      // Dedicated pane between the heatmap (350) and selected highlights (450).
+      // pointer-events: none lets clicks/hover fall through the canvas-rendered
+      // polylines to the SVG hit polyline on the default overlayPane below.
       if (!map.getPane('flightPaths')) {
         map.createPane('flightPaths')
         map.getPane('flightPaths').style.zIndex = 410
+        map.getPane('flightPaths').style.pointerEvents = 'none'
       }
       // Shared Canvas renderer — flight paths are drawn into a single
       // canvas bitmap rather than one SVG <path> per polyline. With ~40
@@ -1363,6 +1381,7 @@ export function NoiseStudio() {
               className: 'flight-trace',
               pane: 'flightPaths',
               renderer: flightCanvas, // Canvas renderer (no SVG node per pair)
+              interactive: false,     // events pass through to the SVG hit polyline
             }).addTo(map)
             line._lastMs = lastMs
             line._baseOp = baseOp
@@ -1370,8 +1389,12 @@ export function NoiseStudio() {
             prior.pairs.push({ line, a, b, state: 'init' })
           }
           // One full-path hit polyline so hover/click feels like a single track.
+          // Carry each point's timestamp into hoverPoints[i][3] so the hover
+          // tooltip can show "Nm ago" for the exact segment under the cursor.
           const allLatLngs = flat.map((p) => p.latlng)
-          const { showHover, hideHover, clickSelect } = makeHoverHandlers(track.tail, null, { klass: null, zone: null, points: allLatLngs.map((ll) => [ll[0], ll[1]]), type: track.type || '' })
+          const hoverPoints = flat.map((p) => [p.latlng[0], p.latlng[1], null, p.ts ?? null])
+          const lastTs = flat[flat.length - 1]?.ts ?? null
+          const { showHover, hideHover, clickSelect } = makeHoverHandlers(track.tail, lastTs, { klass: null, zone: null, points: hoverPoints, type: track.type || '' })
           const hit = L.polyline(allLatLngs, { color: '#fff', weight: 24, opacity: 0, interactive: true }).addTo(map)
           hit.on('mouseover', showHover); hit.on('mouseout', hideHover); hit.on('click', clickSelect)
           prior.hits.push(hit)
@@ -3392,7 +3415,12 @@ export function NoiseStudio() {
       {/* Hover pill over a flight track */}
       {hoverCard && (() => {
         const isExcursion = !!hoverCard.klass
-        const ago = hoverCard.lastSeenMs ? formatAgo(hoverCard.lastSeenMs) : null
+        // Prefer the timestamp of the hovered point (per-segment "ago"),
+        // fall back to the track's lastSeenMs if the point has no ts.
+        const pointTs = hoverCard.nearestPt?.[3]
+        const ago = (pointTs != null
+          ? formatAgo(pointTs)
+          : (hoverCard.lastSeenMs ? formatAgo(hoverCard.lastSeenMs) : null))
         const pillBg = isExcursion
           ? 'bg-gradient-to-r from-rose-500 to-amber-500 shadow-[0_8px_24px_rgba(244,63,94,0.55)]'
           : 'bg-gradient-to-r from-orange-400 to-amber-400 shadow-[0_8px_24px_rgba(251,146,60,0.55)]'
@@ -3424,11 +3452,19 @@ export function NoiseStudio() {
             }}
           >
             <div
-              className={`flex items-center gap-2 rounded-full text-white text-xs font-medium pl-3 pr-4 py-2 border border-white/15 whitespace-nowrap pointer-events-none ${pillBg}`}
+              className={`flex items-center gap-2 rounded-full text-white text-sm font-medium pl-4 pr-5 py-2 border border-white/15 whitespace-nowrap pointer-events-none ${pillBg}`}
+              style={{
+                // Multiply-style drop shadow on text — three layered dark
+                // shadows give a high-contrast halo that stays readable
+                // over any underlying map/track color.
+                textShadow:
+                  '0 1px 2px rgba(0,0,0,0.95),' +
+                  '0 0 4px rgba(0,0,0,0.85),' +
+                  '0 0 8px rgba(0,0,0,0.5)',
+              }}
             >
-              Tap to select
-              <span className="text-[10px] text-white/80">
-                {hoverCard.type && ` · ${typeLabel}`}
+              <span>
+                {hoverCard.type && typeLabel}
                 {purposeInfo?.specialRole
                   ? ` · ${purposeInfo.specialRole}`
                   : effectivePurpose && ` · ${effectivePurpose}`}

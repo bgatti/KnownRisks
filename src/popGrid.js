@@ -59,3 +59,16 @@ export function impactSegments(points, popAt, distFn) {
 export function trackPopImpact(points, popAt, distFn) {
   return impactSegments(points, popAt, distFn).total
 }
+
+// Instantaneous "noise reaching people" intensity AT a single point — the
+// same factors (people/km² × (REF_AGL/AGL)²) the segment integral uses, but
+// without the segment-length term. Useful for per-point gradient coloring.
+// Same units as `pop × atten` inside impactSegments; scale is consistent
+// across points so clients can autoscale by percentile.
+export function pointImpact(lat, lon, alt, popAt) {
+  if (!popAt) return 0
+  const pop = popAt(lat, lon)
+  if (!(pop > 0)) return 0
+  const agl = Math.max(POP_KERNEL.MIN_AGL_FT, (alt || 0) - POP_KERNEL.GROUND_REF_FT)
+  return pop * ((POP_KERNEL.REF_AGL_FT / agl) ** 2)
+}
