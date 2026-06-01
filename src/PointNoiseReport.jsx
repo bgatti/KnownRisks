@@ -1876,7 +1876,7 @@ export default function PointNoiseReport() {
         {/* Status: error first, then loading skeleton replacing all results. */}
         {error && <ErrorBox message={error} onRetry={runReport} />}
 
-        {loading && !error && <LoadingSkeleton hours={windowHours} radiusNm={radiusNm} />}
+        {loading && !error && <LoadingSkeleton hours={windowHours} radiusNm={radiusNm} stage={loadingStage} />}
 
         {!loading && !error && (
         <>
@@ -1912,52 +1912,6 @@ export default function PointNoiseReport() {
             accent={dominantPurpose ? '' : ''}
           />
         </div>
-
-        {/* §11-CLIENT §3 + §9: What-If panel.
-            Render rules:
-              - substitutes === null → still loading: render nothing
-                (the rest of the page is fine without it).
-              - substitutes.length === 0 (404 / missing config) OR no
-                track in the current window carries alt_airframe_candidates
-                (older deployment) → render a small inline note so the
-                user knows the panel is intentionally absent, not broken.
-              - otherwise → full What-If panel + business-model table. */}
-        {(() => {
-          if (substitutes == null) return null  // still loading
-          const anyCandidate = allRows.some(
-            (r) => (r.altAirframeCandidates?.length || 0) > 0
-              || (r.altSegmentCandidates?.length || 0) > 0,
-          )
-          if (!substitutes.length || !anyCandidate) {
-            // Only surface the note once we know the listener query
-            // succeeded — empty allRows just means "no flights in window"
-            // and the user has bigger problems than the What-If panel.
-            if (allRows.length === 0) return null
-            return (
-              <Section title="What-If: quieter fleets">
-                <div className="text-xs text-white/40 leading-snug">
-                  Scenario substitution data isn't in this segments response
-                  yet — available after the next API deploy. The rest of the
-                  noise report is unaffected.
-                </div>
-              </Section>
-            )
-          }
-          return (
-            <Section
-              title="What-If: quieter fleets"
-              hint="Drag a slider to swap a fraction of the current fleet for a quieter alternative. All math is client-side — sliders update the overlay histogram + business-model table instantly."
-            >
-              <WhatIfPanel
-                scenario={scenario}
-                setScenario={setScenario}
-                substitutes={substitutes}
-                businessModelCols={businessModelCols}
-                dbDelta={dbDelta}
-              />
-            </Section>
-          )
-        })()}
 
         {/* Purpose rollup — the headline */}
         <Section
@@ -2001,6 +1955,50 @@ export default function PointNoiseReport() {
             />
           </Section>
         </div>
+
+        {/* §11-CLIENT §3 + §9: What-If panel.
+            Sits directly under the hourly+dBA-histogram pair on purpose —
+            those two charts carry the scenario overlay, so the sliders
+            and their effect are in the same viewport on most screens.
+            Render rules:
+              - substitutes === null → still loading: render nothing.
+              - substitutes.length === 0 (404 / missing config) OR no
+                track in window carries alt_airframe_candidates (older
+                deployment) → render a small inline note.
+              - otherwise → full What-If panel + business-model table. */}
+        {(() => {
+          if (substitutes == null) return null
+          const anyCandidate = allRows.some(
+            (r) => (r.altAirframeCandidates?.length || 0) > 0
+              || (r.altSegmentCandidates?.length || 0) > 0,
+          )
+          if (!substitutes.length || !anyCandidate) {
+            if (allRows.length === 0) return null
+            return (
+              <Section title="What-If: quieter fleets">
+                <div className="text-xs text-white/40 leading-snug">
+                  Scenario substitution data isn't in this segments response
+                  yet — available after the next API deploy. The rest of the
+                  noise report is unaffected.
+                </div>
+              </Section>
+            )
+          }
+          return (
+            <Section
+              title="What-If: quieter fleets"
+              hint="Drag a slider to swap a fraction of the current fleet for a quieter alternative. The two charts above (hourly + dBA histogram) gain a coloured overlay showing the scenario result. NPV / $-per-dB updates live."
+            >
+              <WhatIfPanel
+                scenario={scenario}
+                setScenario={setScenario}
+                substitutes={substitutes}
+                businessModelCols={businessModelCols}
+                dbDelta={dbDelta}
+              />
+            </Section>
+          )
+        })()}
 
         {/* Hourly mean — same shape, but the colour answers a different
             question: "how loud was the typical pass during that hour?" A
