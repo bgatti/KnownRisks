@@ -12,6 +12,7 @@ import {
 } from './scenarioSubstitutes.js'
 import { NOISE_ZONES } from './src/noiseZones.js'
 import { classifyOneTrack, phaseMLApiPlugin } from './phaseML/index.js'
+import { classifyOneTrack as purposeMLClassify, purposeMLApiPlugin } from './purposeML/index.js'
 import { synthesizeInProgressCycle } from './flightCycles.js'
 import {
   computeFlightAltOffset,
@@ -159,6 +160,43 @@ function resolvePurpose(stored, type, tail) {
   if (/^(GLID|VENT|NIMB|DISC|SGS|ASTR|JS1J|JS\d|LS\d|PIK|ASW|SZD)/.test(T) || /^AS\d/.test(T) || /^DG\d/.test(T)) return 'glider'
   if (stored && stored !== 'unknown') return stored
   return purposeOf(type, tail, false, null)
+}
+
+// Shape-boosted purpose resolver. Mirrors resolvePurpose's priority but
+// inserts a path-shape inference step (purposeML) BEFORE the type-based
+// fallback. Returns `{ purpose, source, confidence?, reasons? }` so the
+// wire can surface where the answer came from (special_use / type /
+// tracked / shape). When `points` is omitted (or too sparse) the shape
+// step is skipped and behaviour collapses back to resolvePurpose.
+// Recipe sourced from purposeML/ADOPTING_PURPOSE_ML_API.md.
+function resolvePurposeWithShape(stored, type, tail, points, opts = {}) {
+  // 1. Special-use registry (curated overrides) — authoritative.
+  const su = tail ? SPECIAL_USE_MAP.get(String(tail).toUpperCase()) : null
+  if (su) return { purpose: purposeOf(type, tail, false, su), source: 'special_use' }
+  // 2. Type-unambiguous airframes (same regex as resolvePurpose).
+  const T = String(type || '').toUpperCase()
+  if (/^(PA25|PA18|PIAT|PC6)$/.test(T)) return { purpose: 'tow_plane', source: 'type' }
+  if (/^(GLID|VENT|NIMB|DISC|SGS|ASTR|JS1J|JS\d|LS\d|PIK|ASW|SZD)/.test(T) || /^AS\d/.test(T) || /^DG\d/.test(T)) return { purpose: 'glider', source: 'type' }
+  // 3. Stored curated value on the tracks row.
+  if (stored && stored !== 'unknown') return { purpose: stored, source: 'tracked' }
+  // 4. Path-shape inference — only when there are enough fixes to be
+  //    meaningful. The classifier itself enforces 30+ points / 5+ min
+  //    active; this gate is cheap and avoids the call entirely for
+  //    fresh airborne flights with sparse history.
+  if (Array.isArray(points) && points.length >= 30) {
+    try {
+      const v = purposeMLClassify(points, {
+        typeCode: type || '',
+        tail: tail || '',
+        isSchoolFleet: !!opts.isSchoolFleet,
+      })
+      if (v && v.confidence >= 0.7) {
+        return { purpose: v.purpose, source: 'shape', confidence: v.confidence, reasons: v.reasons }
+      }
+    } catch { /* swallow — fall through to type-based fallback */ }
+  }
+  // 5. Type-based fallback (original purposeOf behaviour).
+  return { purpose: purposeOf(type, tail, !!opts.isSchoolFleet, null), source: 'type' }
 }
 
 // Aircraft icon URL — placeholder-now, upgradable-later. Resolution order:
@@ -4886,6 +4924,26 @@ function flightsApiPlugin() {
                 const flightSlug = slugifySchool(inf.school)
                 if (!flightSlug || flightSlug !== schoolFilter) continue
               }
+              // Purpose — shape-boosted via purposeML. Builds canonical
+              // points (tsUnix in SECONDS, not ms) over [takeoff, last
+              // cycle landing or now] and lets resolvePurposeWithShape
+              // pick: special_use → type → tracked → shape → fallback.
+              // purpose_source on the wire lets the kiosk distinguish
+              // inferred from curated. See purposeML/ADOPTING_PURPOSE_ML_API.md.
+              const purposeUpperMs = lastCy.lMs ?? nowMs
+              const purposePts = []
+              for (const p of pts) {
+                if (p[3] == null || p[3] < takeoffMs || p[3] > purposeUpperMs) continue
+                if (p[0] == null || p[1] == null || p[2] == null) continue
+                purposePts.push({
+                  lat: p[0], lon: p[1], altMslFt: p[2],
+                  tsUnix: Math.floor(p[3] / 1000),
+                })
+              }
+              const purposeAns = resolvePurposeWithShape(
+                inf.purpose, t.type, tail, purposePts,
+                { isSchoolFleet: !!inf.school },
+              )
               flights.push({
                 id: flightId,
                 tail,
@@ -4895,6 +4953,8 @@ function flightsApiPlugin() {
                 school: inf.school || null,
                 school_slug: slugifySchool(inf.school),
                 icon_url: aircraftIconUrl(t.type, tail),
+                purpose: purposeAns.purpose,
+                purpose_source: purposeAns.source,
                 phase,
                 is_airborne: isAirborne,
                 landed_at: landingMs ? new Date(landingMs).toISOString() : null,
@@ -8886,6 +8946,7 @@ export default defineConfig({
     livePositionsPlugin(),
     adsbApiPlugin(),
     phaseMLApiPlugin(), // /api/phase-ml/{health,airports,classify,classify-archive}
+    purposeMLApiPlugin(), // /api/purpose-ml/{health,buckets,classify,classify-archive,extract}
     flightImpactPlugin(),
     aircraftIconsPlugin(),
     noiseZonesApiPlugin(),
