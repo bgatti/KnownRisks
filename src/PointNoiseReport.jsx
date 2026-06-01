@@ -7,12 +7,13 @@ import { isEnginelessType, distFt } from './geo'
 // external consumer that was importing them off PointNoiseReport.jsx.
 import {
   pickSubstituted,
+  pickEliminated,
   shouldWinchSegment,
   segmentDba,
   npv,
   businessModelColumn,
 } from './whatif.js'
-export { pickSubstituted, shouldWinchSegment, segmentDba, npv, businessModelColumn }
+export { pickSubstituted, pickEliminated, shouldWinchSegment, segmentDba, npv, businessModelColumn }
 
 /* SVG-pin DivIcon for the map pin. Drawn at 26×34 with anchor at base. */
 const PIN_ICON = L.divIcon({

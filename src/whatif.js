@@ -31,6 +31,40 @@ export function pickSubstituted(tracks, code, pct) {
   return new Set(eligible.slice(0, k))
 }
 
+/* ─── pickEliminated ──────────────────────────────────────────────── */
+/**
+ * §11-CLIENT V2 §2a: deterministic track-elimination selection for
+ * `scope: "track_eliminate"` substitutes (ATPR, SIMX). Slider value
+ * is "% of max effect" (0..100); `max_reduction_pct` on the substitute
+ * is the policy-realistic cap. Effective reduction = slider × max / 100.
+ *
+ * Mirrors pickSubstituted's determinism rule — sort eligible tails
+ * ascending, take the first floor(N * effectivePct/100). Same input →
+ * same Set across re-renders.
+ *
+ * Returns empty Set when:
+ *   - slider <= 0
+ *   - code not found in the substitute registry
+ *   - substitute's scope is not "track_eliminate"
+ *   - no tracks match the substitute's replaces_purposes
+ */
+export function pickEliminated(tracks, code, sliderPct, substitutes) {
+  if (!sliderPct || sliderPct <= 0) return new Set()
+  if (!Array.isArray(substitutes)) return new Set()
+  const sub = substitutes.find((s) => s?.code === code)
+  if (!sub || sub.scope !== 'track_eliminate') return new Set()
+  const replaces = sub.replaces_purposes || []
+  const eligible = []
+  for (const t of tracks || []) {
+    if (t?.purpose && replaces.includes(t.purpose) && t.tail) eligible.push(t.tail)
+  }
+  eligible.sort()
+  const maxPct = Number(sub.max_reduction_pct) || 0
+  const effectivePct = (sliderPct * maxPct) / 100
+  const k = Math.floor((eligible.length * effectivePct) / 100)
+  return new Set(eligible.slice(0, k))
+}
+
 /* ─── shouldWinchSegment ──────────────────────────────────────────── */
 /**
  * §11-CLIENT §4: Winch is an AGL threshold rather than a fraction. A
