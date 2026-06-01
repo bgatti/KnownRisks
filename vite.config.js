@@ -3805,6 +3805,37 @@ function flightsApiPlugin() {
     } catch { return { tracks: [], updated_at: null } }
   }
 
+  // ── Caches for /api/flights/current ──────────────────────────────
+  //
+  // The handler runs 5-50 s of work per request: a multi-day live_tracks
+  // pull, a per-tail enrichment JOIN that scans `tracks` for ~600 tails,
+  // and CPU-bound cycle extraction + indicator computation per flight.
+  // Two amplifiers compound it into the 220 s avg the kiosk reported:
+  //
+  //   (a) the kiosk polls every 8 s, response takes >> 8 s → multiple
+  //       in-flight requests per workstation, each running the full
+  //       computation independently;
+  //   (b) multiple workstations on the same airport all run the same
+  //       computation in parallel.
+  //
+  // Two memoize layers fix that:
+  //
+  //   TAIL_INFO_TTL_MS: per-tail (base, school, purpose, desc) result,
+  //   60 s TTL. The data changes slowly (school assignments, base
+  //   airport). On each request, query only tails not already cached.
+  //
+  //   CURRENT_RESPONSE_TTL_MS: full response JSON keyed on (airport,
+  //   landedHours, rangeNm, schoolFilter), 4 s TTL. With 8 s polling,
+  //   every other request hits a warm cache; multi-workstation polls
+  //   all share one computation.
+  //
+  // Both caches are in-process Maps; Railway can have multiple containers
+  // but per-container amortization is already a 10-50x win.
+  const TAIL_INFO_TTL_MS = 60_000
+  const tailInfoCache = new Map()   // call -> { row, fetchedAt }
+  const CURRENT_RESPONSE_TTL_MS = 4_000
+  const currentResponseCache = new Map()  // key -> { body, fetchedAt }
+
   return {
     name: 'flights-api',
     configureServer(server) {
@@ -4304,6 +4335,18 @@ function flightsApiPlugin() {
           const ap = ENRICH_AP.find((a) => a.code === airport)
           if (!ap) { res.statusCode = 400; return res.end(JSON.stringify({ error: `unknown airport ${airport}` })) }
 
+          // Response cache — composite key over the query params that affect
+          // output. With CURRENT_RESPONSE_TTL_MS=4s and kiosk polling every
+          // 8s, every other poll hits cache; multi-workstation polls share
+          // one computation. The cached body is the final JSON string so
+          // we don't pay re-serialization either.
+          const cacheKey = `${airport}|${landedHours}|${rangeNm}|${schoolFilter || ''}`
+          const cached = currentResponseCache.get(cacheKey)
+          if (cached && Date.now() - cached.fetchedAt < CURRENT_RESPONSE_TTL_MS) {
+            res.setHeader('X-Cache', 'HIT')
+            return res.end(cached.body)
+          }
+
           const nowMs = Date.now()
           const landedCutoffMs = nowMs - landedHours * 3600 * 1000
           const gapMinMs = flightGapMinFor(airport) * 60000
@@ -4350,9 +4393,26 @@ function flightsApiPlugin() {
           // use. Without this the row renders the bare ICAO type code
           // ("C172" instead of "CESSNA 172") because the kiosk falls back
           // to `type` when `desc` is null (client-flagged regression).
-          const tails = [...new Set(tracks.map((t) => (t.call || '').trim()).filter(Boolean))]
+          //
+          // Memoized at 60 s per tail (tailInfoCache, module-scope). On
+          // each request, only tails missing from the cache (or stale)
+          // hit Postgres. Steady-state kiosk polling means the per-tail
+          // SQL touches ~0 rows; first poll after process start does the
+          // full ~600-row scan once. This drops the dominant slow path
+          // in the 220 s avg the kiosk reported.
+          const allTails = [...new Set(tracks.map((t) => (t.call || '').trim()).filter(Boolean))]
           const info = new Map()
-          if (tails.length) {
+          const tailsToFetch = []
+          const tailNowMs = Date.now()
+          for (const tail of allTails) {
+            const c = tailInfoCache.get(tail)
+            if (c && tailNowMs - c.fetchedAt < TAIL_INFO_TTL_MS) {
+              if (c.row) info.set(tail, c.row)
+            } else {
+              tailsToFetch.push(tail)
+            }
+          }
+          if (tailsToFetch.length) {
             try {
               const r = await db.queryDb(
                 `SELECT call,
@@ -4361,10 +4421,24 @@ function flightsApiPlugin() {
                    (array_agg(school       ORDER BY date DESC) FILTER (WHERE school       IS NOT NULL))[1] AS school,
                    (array_agg(desc_text    ORDER BY date DESC) FILTER (WHERE desc_text    IS NOT NULL))[1] AS descr
                  FROM tracks WHERE call = ANY($1) GROUP BY call`,
-                [tails],
+                [tailsToFetch],
               )
-              for (const row of r.rows) info.set(row.call, row)
-            } catch {}
+              const rowByCall = new Map()
+              for (const row of r.rows) rowByCall.set(row.call, row)
+              // Populate the cache for ALL fetched tails (including those
+              // with no matching row) so the next request doesn't re-query
+              // unknown tails. Cache hit with row=null is a valid "no
+              // data" answer.
+              for (const tail of tailsToFetch) {
+                const row = rowByCall.get(tail) || null
+                tailInfoCache.set(tail, { row, fetchedAt: tailNowMs })
+                if (row) info.set(tail, row)
+              }
+            } catch {
+              // On failure don't poison the cache — tails not in it stay
+              // missing so the next request retries. Existing cached
+              // entries remain valid.
+            }
           }
 
           const flights = []
@@ -4604,7 +4678,7 @@ function flightsApiPlugin() {
             return (b.landed_at || '').localeCompare(a.landed_at || '')
           })
 
-          res.end(JSON.stringify({
+          const responseBody = JSON.stringify({
             airport,
             generated_at: new Date(nowMs).toISOString(),
             flight_gap_min: flightGapMinFor(airport),
@@ -4615,7 +4689,10 @@ function flightsApiPlugin() {
             indicators_note: 'V/P/N indicators wired (Ask #2 + #5a). worst_segment wired (Ask #5b) with AGL-aware dBA proxy. incursion_segments wired (Ask #6) with polygon-edge interpolation, significant/minor severity tiers, and AGL-aware dBA proxy. pop_impact retuned 2026-05-31: scale=40, null threshold=2.5 (was 50/1.5). p95 of observed impact_index now maps to 88; null cohort drops from ~12% to ~5%. worst_segment.impact_score still nulls when window-scoped raw exceeds 100 (intrinsic to 30 s concentration). pop_impact and worst_segment EXCLUDE the strict airport pattern envelope (within pattern_radius_nm and ≤ 1500 ft AGL). VNAP, complaint, and incursion_segments indicators use the full track. Ask #7 ?school=<slug> filter active when set. phase labels from phaseML classifier (pattern/inbound/departing/en_route/practice_area/nearby) for airborne; landed or ack_pending for landed. Flight grouping has a companion coverage-gap guard: cycles >= FLIGHT_GAP_MIN apart but <30% expected ADS-B coverage AND >2,000 ft aircraft drift merge anyway.',
             pop_impact_scale: 'pop_impact is a 0-100 integer per Ask #5a; impact_index is the legacy small-float for back-compat with the wall kiosk.',
             flights,
-          }))
+          })
+          currentResponseCache.set(cacheKey, { body: responseBody, fetchedAt: Date.now() })
+          res.setHeader('X-Cache', 'MISS')
+          res.end(responseBody)
         } catch (err) {
           console.error('[flights/current] error', err)
           res.statusCode = 500
@@ -7652,6 +7729,64 @@ const API_MANIFEST = {
       ],
     },
     {
+      name: 'Noise exposure (location-centric)',
+      summary: 'Answer "what is my noise exposure?" — for any lat/lon, enumerate flights whose paths came within radius, estimate ground dBA at the listener, and aggregate to a histogram + breakdowns.',
+      endpoints: [
+        {
+          method: 'GET',
+          path: '/api/noise/exposure',
+          purpose: 'Per-listener noise exposure over a window. Scans historical + live ADS-B tracks within radius, scores each pass with the same noise kernel as the Good Neighbor Score, and returns one event per pass plus aggregated histogram + breakdowns.',
+          params: [
+            { name: 'lat', type: 'float', desc: 'Listener latitude (WGS-84). Required.' },
+            { name: 'lon', type: 'float', desc: 'Listener longitude. Required.' },
+            { name: 'radius_nm', type: 'float', default: 5, desc: 'Audible-range cap in nautical miles. Clamped to [0.5, 20].' },
+            { name: 'hours', type: 'int', default: 24, desc: 'Rolling lookback in hours (1..168). Ignored when from/to is set.' },
+            { name: 'from', type: 'iso-8601', desc: 'Window start. Pairs with `to` for arbitrary windows.' },
+            { name: 'to', type: 'iso-8601', desc: 'Window end. Defaults to now when `from` is set.' },
+            { name: 'elev_ft', type: 'float', desc: 'Listener terrain elevation MSL. Defaults to the nearest Front Range airport elevation.' },
+            { name: 'db_floor', type: 'float', desc: 'Drop events with peak dBA below this. Default: no floor (all bins).' },
+            { name: 'bins', type: 'csv', desc: 'Histogram bin edges (ascending dBA). Default: 35,40,45,50,55,60,65,70,75,80,85,90.' },
+          ],
+          response: {
+            listener: '{lat, lon, elev_ft, radius_nm}',
+            window: '{from, to, hours}',
+            summary: '{total_events, peak_db, peak_tail, peak_type, peak_ts, mean_db, median_db, db_floor}',
+            histogram: '{bins: [..], counts: [..]}  — counts[i] is the number of events with est_db ∈ [bins[i], bins[i+1])',
+            by_purpose: '[{key, count, peak_db, mean_db}]',
+            by_operator: '[{key, count, peak_db, mean_db}]',
+            by_base: '[{key, count, peak_db, mean_db}]',
+            by_type: '[{key, count, peak_db, mean_db}]',
+            by_hour_local: '[{hour_local, count, peak_db}] — 24 buckets in America/Denver',
+            events: '[{hex, tail, type, operator, base, purpose, pass_index, est_db, ts_at_closest, dist_ft, alt_agl_ft, slant_ft}]',
+          },
+          example: '/api/noise/exposure?lat=40.005&lon=-105.205&radius_nm=5&hours=24',
+          example2: '/api/noise/exposure?lat=40.04&lon=-105.22&radius_nm=10&from=2026-05-30T00:00:00Z&to=2026-05-31T00:00:00Z&db_floor=50',
+          notes: 'Engineless aircraft (gliders, balloons) are scored silent — they contribute no events. A pass is a contiguous run of in-radius points with no gap > 5 min. The est_db is LMax (the loudest single segment) at the listener, computed by flightScore.dbAtListener using the same kernel as buildImpactGrid.',
+        },
+        {
+          method: 'GET',
+          path: '/api/noise/exposure/flight/:hex',
+          purpose: 'Per-pass dBA trace at the listener for one aircraft (drill-down from /api/noise/exposure).',
+          params: [
+            { name: 'lat', type: 'float', desc: 'Listener lat. Required.' },
+            { name: 'lon', type: 'float', desc: 'Listener lon. Required.' },
+            { name: 'pass', type: 'int', default: 0, desc: 'Which pass to return (chronological, 0-indexed).' },
+            { name: 'hours', type: 'int', default: 24, desc: 'Rolling lookback (1..168).' },
+            { name: 'radius_nm', type: 'float', default: 5 },
+            { name: 'elev_ft', type: 'float' },
+          ],
+          response: {
+            hex: 'string', tail: 'string', type: 'string',
+            listener: '{lat, lon, elev_ft}',
+            pass_index: 'int', pass_count: 'int',
+            peak: '{peakDb, peakTs, closestSlantFt, closestHorizFt, closestAglFt, closestLat, closestLon, closestAltFt, closestTs}',
+            samples: '[{ts, db, dist_ft, alt_agl_ft}] — one per segment in the pass',
+          },
+          example: '/api/noise/exposure/flight/a59663?lat=40.005&lon=-105.205&pass=0',
+        },
+      ],
+    },
+    {
       name: 'Noise reports & complaints',
       summary: 'User-submitted noise reports with optional MP3 audio attachments.',
       endpoints: [
@@ -7763,6 +7898,435 @@ function manifestToMarkdown(m) {
   return lines.join('\n')
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// Noise Exposure — "what did THIS point on the ground hear?"
+//
+// Answers "what is my noise exposure?" for any lat/lon over a time window.
+// Walks historical + recent ADS-B tracks, filters to flights whose paths
+// passed within `radius_nm` of the listener, and scores each pass with
+// flightScore.dbAtListener (same noise kernel as the impact heatmap).
+//
+//   GET /api/noise/exposure?lat=&lon=[&radius_nm=5][&hours=24|&from=&to=][&elev_ft=]
+//   GET /api/noise/exposure/flight/:hex?lat=&lon=[&pass=N]
+function noiseExposurePlugin() {
+  const FIELD_ELEV_FT = { KBDU: 5288, KBJC: 5673, KEIK: 5130, KLMO: 5055, KAPA: 5885, KFNL: 5016, KGXY: 4697, KDEN: 5434 }
+  const AIRPORTS = {
+    KBDU: [40.0394, -105.2258], KBJC: [39.9088, -105.1172], KEIK: [40.0098, -105.0488],
+    KLMO: [40.1636, -105.1636], KAPA: [39.5701, -104.8493], KDEN: [39.8617, -104.6731],
+    KGXY: [40.4348, -104.6331], KFNL: [40.4517, -105.0114],
+  }
+  const DEFAULT_HIST_BINS = [35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90]
+  const PASS_GAP_MS = 5 * 60 * 1000 // > 5 min gap inside the radius starts a new pass
+
+  const nearestAirportElev = (lat, lon) => {
+    let best = null, bestD = Infinity
+    for (const [code, [aLat, aLon]] of Object.entries(AIRPORTS)) {
+      const dLat = (lat - aLat) * 60
+      const dLon = (lon - aLon) * 60 * Math.cos(((lat + aLat) / 2) * Math.PI / 180)
+      const d = Math.hypot(dLat, dLon)
+      if (d < bestD) { bestD = d; best = code }
+    }
+    return best ? FIELD_ELEV_FT[best] : 5288
+  }
+
+  // Local hour-of-day in America/Denver. Avoids pulling Intl into hot path
+  // per flight by precomputing the offset once per request.
+  function hourLocalFor(ts, denverOffsetMin) {
+    const localMs = ts + denverOffsetMin * 60_000
+    const d = new Date(localMs)
+    return d.getUTCHours()
+  }
+  function denverOffsetAt(ts) {
+    // Use Intl once: returns the UTC offset (minutes) for America/Denver
+    // at `ts`. DST-aware (UTC-7 winter, UTC-6 summer).
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Denver', timeZoneName: 'shortOffset',
+    })
+    const parts = fmt.formatToParts(new Date(ts))
+    const tz = parts.find(p => p.type === 'timeZoneName')?.value || 'GMT-7'
+    const m = /GMT([+-])(\d{1,2})(?::(\d{2}))?/.exec(tz)
+    if (!m) return -420
+    const sign = m[1] === '-' ? -1 : 1
+    return sign * (parseInt(m[2], 10) * 60 + parseInt(m[3] || '0', 10))
+  }
+
+  async function loadTracksInWindow(fromMs, toMs) {
+    const out = []
+    if (db.useDb) {
+      const fromDate = new Date(fromMs).toISOString().slice(0, 10)
+      const toDate = new Date(toMs).toISOString().slice(0, 10)
+      // Historical aggregated tracks.
+      try {
+        const hist = await db.loadTracksFromDb({ fromDate, toDate })
+        for (const t of hist.tracks || []) out.push(t)
+      } catch (err) { console.error('[noise/exposure] hist load err', err.message) }
+      // Live tracks for any window touching the last week (the aggregation
+      // job may not yet have rolled today/yesterday into the tracks table).
+      if (toMs > Date.now() - 7 * 86400000) {
+        try {
+          const hoursBack = Math.min(168, Math.ceil((Date.now() - fromMs) / 3600000) + 24)
+          const live = await db.loadLiveFromDb(hoursBack)
+          for (const t of live.tracks || []) out.push(t)
+        } catch (err) { console.error('[noise/exposure] live load err', err.message) }
+      }
+    } else {
+      try {
+        const buf = await fs.promises.readFile(path.resolve('public/tracks_live.json'), 'utf8')
+        const j = JSON.parse(buf)
+        for (const t of j.tracks || []) out.push(t)
+      } catch { /* no local file */ }
+    }
+    return out
+  }
+
+  // Split a contiguous run of in-radius points into individual passes —
+  // gaps > PASS_GAP_MS (or no timestamps at all → treat as one pass).
+  function segmentPasses(inRadiusPoints) {
+    if (inRadiusPoints.length < 2) return [inRadiusPoints]
+    const passes = []
+    let cur = [inRadiusPoints[0]]
+    for (let i = 1; i < inRadiusPoints.length; i++) {
+      const prev = inRadiusPoints[i - 1]
+      const p = inRadiusPoints[i]
+      const ta = prev[3], tb = p[3]
+      const gap = ta != null && tb != null ? tb - ta : 0
+      if (gap > PASS_GAP_MS) {
+        if (cur.length >= 2) passes.push(cur)
+        cur = [p]
+      } else {
+        cur.push(p)
+      }
+    }
+    if (cur.length >= 2) passes.push(cur)
+    return passes
+  }
+
+  // Per-tail base/purpose/school lookup — same query the
+  // /api/adsb/current-flights endpoint uses (db_base, school, desc_text).
+  async function loadBaseMap(tails) {
+    const m = new Map()
+    if (!db.useDb || !tails.length) return m
+    try {
+      const r = await db.queryDb(
+        `SELECT call,
+           (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base,
+           (array_agg(purpose      ORDER BY date DESC) FILTER (WHERE purpose      IS NOT NULL))[1] AS purpose,
+           (array_agg(school       ORDER BY date DESC) FILTER (WHERE school       IS NOT NULL))[1] AS school,
+           (array_agg(own_op       ORDER BY date DESC) FILTER (WHERE own_op       IS NOT NULL))[1] AS own_op
+         FROM tracks WHERE call = ANY($1) GROUP BY call`, [tails])
+      for (const row of r.rows) m.set(row.call, row)
+    } catch (err) { console.error('[noise/exposure] base lookup err', err.message) }
+    return m
+  }
+
+  async function loadSchoolTailMap() {
+    if (global.__SCHOOL_TAIL_AIRPORT) return global.__SCHOOL_TAIL_AIRPORT
+    try {
+      const raw = await fs.promises.readFile('public/flight_schools_fleets.json', 'utf8')
+      const sf = JSON.parse(raw)
+      const m = new Map()
+      for (const s of sf.schools || []) {
+        const sAp = (s.airport || '').split(/\s+/)[0].trim().toUpperCase()
+        if (!sAp) continue
+        for (const ac of s.aircraft || []) {
+          const t = (ac.tail || '').trim().toUpperCase()
+          if (t && !m.has(t)) m.set(t, { airport: sAp, school: s.name || null })
+        }
+      }
+      global.__SCHOOL_TAIL_AIRPORT = m
+      return m
+    } catch { return new Map() }
+  }
+
+  function aggregate(events, bins, denverOffset) {
+    // Histogram (counts per dBA bin; last bin is overflow).
+    const counts = new Array(bins.length).fill(0)
+    for (const e of events) {
+      if (e.est_db == null) continue
+      let placed = false
+      for (let i = bins.length - 1; i >= 0; i--) {
+        if (e.est_db >= bins[i]) { counts[i]++; placed = true; break }
+      }
+      if (!placed) {
+        // Below the lowest bin — drop. Listener didn't really "hear" it.
+      }
+    }
+
+    const byKey = (keyFn) => {
+      const m = new Map()
+      for (const e of events) {
+        if (e.est_db == null) continue
+        const k = keyFn(e) || 'unknown'
+        let row = m.get(k)
+        if (!row) { row = { key: k, count: 0, peak_db: -Infinity, sum_db: 0 }; m.set(k, row) }
+        row.count++
+        if (e.est_db > row.peak_db) row.peak_db = e.est_db
+        row.sum_db += e.est_db
+      }
+      return [...m.values()]
+        .map(r => ({ key: r.key, count: r.count, peak_db: +r.peak_db.toFixed(1), mean_db: +(r.sum_db / r.count).toFixed(1) }))
+        .sort((a, b) => b.count - a.count)
+    }
+
+    const byHour = new Array(24).fill(null).map((_, h) => ({ hour_local: h, count: 0, peak_db: null }))
+    for (const e of events) {
+      if (e.est_db == null || e.ts_at_closest == null) continue
+      const h = hourLocalFor(e.ts_at_closest, denverOffset)
+      const row = byHour[h]
+      row.count++
+      if (row.peak_db == null || e.est_db > row.peak_db) row.peak_db = +e.est_db.toFixed(1)
+    }
+
+    return {
+      histogram: { bins, counts },
+      by_purpose: byKey(e => e.purpose),
+      by_operator: byKey(e => e.operator),
+      by_base: byKey(e => e.base),
+      by_type: byKey(e => e.type),
+      by_hour_local: byHour,
+    }
+  }
+
+  return {
+    name: 'noise-exposure-api',
+    configureServer(server) {
+      server.middlewares.use('/api/noise/exposure/flight', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const hex = (u.pathname.replace(/^\/+/, '').split('/').pop() || '').toLowerCase()
+          const latRaw = u.searchParams.get('lat')
+          const lonRaw = u.searchParams.get('lon')
+          const lat = latRaw == null ? NaN : Number(latRaw)
+          const lon = lonRaw == null ? NaN : Number(lonRaw)
+          if (!hex || !isFinite(lat) || !isFinite(lon)) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: 'hex (path), lat, lon required' }))
+          }
+          const passIdx = Math.max(0, parseInt(u.searchParams.get('pass') || '0', 10))
+          const hours = Math.max(1, Math.min(168, Number(u.searchParams.get('hours')) || 24))
+          const elevFt = Number(u.searchParams.get('elev_ft')) || nearestAirportElev(lat, lon)
+          const toMs = Date.now()
+          const fromMs = toMs - hours * 3600_000
+          const tracks = await loadTracksInWindow(fromMs, toMs)
+          const fs2 = await import('./flightScore.js')
+
+          // Collect every track segment for this hex within the window;
+          // there may be multiple rows (one per day).
+          const all = []
+          for (const t of tracks) {
+            if ((t.hex || '').toLowerCase() !== hex) continue
+            for (const p of t.points || []) {
+              const ts = p[3]
+              if (ts != null && (ts < fromMs || ts > toMs)) continue
+              all.push(p)
+            }
+            // capture type/call from the first matching row
+            if (!all.type && t.type) all.type = t.type
+            if (!all.tail && t.call) all.tail = t.call
+          }
+          if (all.length < 2) {
+            res.statusCode = 404
+            return res.end(JSON.stringify({ error: 'no track points for hex in window' }))
+          }
+          all.sort((a, b) => (a[3] || 0) - (b[3] || 0))
+
+          // Filter to in-radius and split into passes.
+          const RADIUS_NM = Math.max(0.5, Math.min(20, Number(u.searchParams.get('radius_nm')) || 5))
+          const radFt = RADIUS_NM * 6076.12
+          const inRad = all.filter(p => distFt(p[0], p[1], lat, lon) <= radFt)
+          const passes = segmentPasses(inRad)
+          if (!passes[passIdx]) {
+            res.statusCode = 404
+            return res.end(JSON.stringify({ error: `pass ${passIdx} not found (have ${passes.length})` }))
+          }
+          const seg = passes[passIdx]
+          const type = all.type || null
+          const peak = fs2.dbAtListener(seg, type, { lat, lon }, { listenerElevFt: elevFt })
+
+          // Per-segment dB samples so callers can plot the dB(t) trace.
+          const samples = []
+          for (let i = 1; i < seg.length; i++) {
+            const pair = [seg[i - 1], seg[i]]
+            const r = fs2.dbAtListener(pair, type, { lat, lon }, { listenerElevFt: elevFt })
+            samples.push({
+              ts: r.peakTs ?? seg[i][3] ?? null,
+              db: r.peakDb,
+              dist_ft: r.closestHorizFt,
+              alt_agl_ft: r.closestAglFt,
+            })
+          }
+          res.end(JSON.stringify({
+            hex, tail: all.tail || null, type,
+            listener: { lat, lon, elev_ft: elevFt },
+            pass_index: passIdx, pass_count: passes.length,
+            peak, samples,
+          }))
+        } catch (err) {
+          console.error('[noise/exposure/flight] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err && err.message || err) }))
+        }
+      })
+
+      server.middlewares.use('/api/noise/exposure', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        try {
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const latRaw = u.searchParams.get('lat')
+          const lonRaw = u.searchParams.get('lon')
+          const lat = latRaw == null ? NaN : Number(latRaw)
+          const lon = lonRaw == null ? NaN : Number(lonRaw)
+          if (!isFinite(lat) || !isFinite(lon)) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: 'lat and lon are required query params' }))
+          }
+          const radiusNm = Math.max(0.5, Math.min(20, Number(u.searchParams.get('radius_nm')) || 5))
+          const radFt = radiusNm * 6076.12
+
+          // Time window: explicit ?from=&to= (ISO) takes precedence over ?hours=.
+          const nowMs = Date.now()
+          const fromParam = u.searchParams.get('from')
+          const toParam = u.searchParams.get('to')
+          let fromMs, toMs
+          if (fromParam || toParam) {
+            toMs = toParam ? Date.parse(toParam) : nowMs
+            fromMs = fromParam ? Date.parse(fromParam) : (toMs - 24 * 3600_000)
+            if (!isFinite(fromMs) || !isFinite(toMs) || toMs <= fromMs) {
+              res.statusCode = 400
+              return res.end(JSON.stringify({ error: 'from/to must be valid ISO datetimes with to > from' }))
+            }
+          } else {
+            const hours = Math.max(1, Math.min(168, Number(u.searchParams.get('hours')) || 24))
+            toMs = nowMs
+            fromMs = nowMs - hours * 3600_000
+          }
+          const elevFt = Number(u.searchParams.get('elev_ft')) || nearestAirportElev(lat, lon)
+          const dbFloor = Number(u.searchParams.get('db_floor'))
+          const histBins = (u.searchParams.get('bins') || '').trim()
+            ? u.searchParams.get('bins').split(',').map(Number).filter(n => isFinite(n)).sort((a, b) => a - b)
+            : DEFAULT_HIST_BINS
+
+          res.setHeader('Cache-Control', 'public, max-age=30')
+
+          const tracks = await loadTracksInWindow(fromMs, toMs)
+          const fleet = await adsb.loadFleet()
+          const schoolMap = await loadSchoolTailMap()
+          const tails = [...new Set(tracks.map(t => (t.call || '').trim()).filter(Boolean))]
+          const baseInfo = await loadBaseMap(tails)
+          const fs2 = await import('./flightScore.js')
+
+          // Dedup: a single (hex, day) may appear in both the live and
+          // tracks tables. Prefer whichever has more points.
+          const byHexDay = new Map()
+          for (const t of tracks) {
+            const hex = (t.hex || '').toLowerCase()
+            if (!hex) continue
+            // Group by hex first; we'll split into passes by time gap later.
+            let row = byHexDay.get(hex)
+            if (!row) { row = { hex, type: t.type || null, tail: t.call || null, points: [] }; byHexDay.set(hex, row) }
+            if (!row.type && t.type) row.type = t.type
+            if (!row.tail && t.call) row.tail = t.call
+            for (const p of t.points || []) {
+              const ts = p[3]
+              if (ts != null && (ts < fromMs || ts > toMs)) continue
+              row.points.push(p)
+            }
+          }
+
+          const denverOffset = denverOffsetAt(nowMs)
+          const events = []
+          for (const row of byHexDay.values()) {
+            if (row.points.length < 2) continue
+            row.points.sort((a, b) => (a[3] || 0) - (b[3] || 0))
+            // Pre-filter: any point within radius? If not, skip the track.
+            const inRad = []
+            for (const p of row.points) {
+              if (p[0] == null || p[1] == null) continue
+              if (distFt(p[0], p[1], lat, lon) <= radFt) inRad.push(p)
+            }
+            if (inRad.length < 2) continue
+            const passes = segmentPasses(inRad)
+            const tailU = (row.tail || '').toUpperCase()
+            const inf = baseInfo.get(row.tail || '') || {}
+            const schoolEntry = schoolMap.get(tailU)
+            const fleetEntry = fleet[row.hex]
+            const operator =
+              fleetEntry?.operator ||
+              (inf.own_op || null) ||
+              (schoolEntry?.school || null) ||
+              null
+            const base = (inf.base || schoolEntry?.airport || (fleetEntry ? 'KBDU' : null) || null)
+            const purpose = resolvePurpose(inf.purpose, row.type, row.tail)
+            const tailDisplay = fleetEntry?.tail || row.tail || row.hex
+
+            for (let pi = 0; pi < passes.length; pi++) {
+              const seg = passes[pi]
+              const r = fs2.dbAtListener(seg, row.type, { lat, lon }, { listenerElevFt: elevFt })
+              if (r.silent) continue
+              if (r.peakDb == null) continue
+              if (isFinite(dbFloor) && r.peakDb < dbFloor) continue
+              events.push({
+                hex: row.hex,
+                tail: tailDisplay,
+                type: row.type,
+                operator,
+                base,
+                purpose,
+                pass_index: pi,
+                est_db: r.peakDb,
+                ts_at_closest: r.closestTs ?? r.peakTs ?? null,
+                dist_ft: r.closestHorizFt,
+                alt_agl_ft: r.closestAglFt,
+                slant_ft: r.closestSlantFt,
+              })
+            }
+          }
+
+          events.sort((a, b) => b.est_db - a.est_db)
+          const dbs = events.map(e => e.est_db).sort((a, b) => a - b)
+          const median = dbs.length ? dbs[Math.floor(dbs.length / 2)] : null
+          const mean = dbs.length ? dbs.reduce((s, x) => s + x, 0) / dbs.length : null
+          const top = events[0] || null
+
+          const aggregates = aggregate(events, histBins, denverOffset)
+
+          res.end(JSON.stringify({
+            listener: { lat, lon, elev_ft: elevFt, radius_nm: radiusNm },
+            window: {
+              from: new Date(fromMs).toISOString(),
+              to: new Date(toMs).toISOString(),
+              hours: +((toMs - fromMs) / 3600_000).toFixed(2),
+            },
+            summary: {
+              total_events: events.length,
+              peak_db: top ? top.est_db : null,
+              peak_tail: top ? top.tail : null,
+              peak_type: top ? top.type : null,
+              peak_ts: top ? top.ts_at_closest : null,
+              mean_db: mean != null ? +mean.toFixed(1) : null,
+              median_db: median != null ? +median.toFixed(1) : null,
+              db_floor: isFinite(dbFloor) ? dbFloor : null,
+            },
+            ...aggregates,
+            events,
+          }))
+        } catch (err) {
+          console.error('[noise/exposure] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err && err.message || err) }))
+        }
+      })
+
+      console.log('[noise-exposure-api] endpoints registered: /api/noise/exposure[/flight/:hex]')
+    },
+  }
+}
+
 function discoverPlugin() {
   return {
     name: 'discover-api',
@@ -7804,6 +8368,7 @@ export default defineConfig({
     flightImpactPlugin(),
     aircraftIconsPlugin(),
     noiseZonesApiPlugin(),
+    noiseExposurePlugin(),
     discoverPlugin(),
     // On Railway, strip the @vite/client HMR script from HTML to prevent
     // reload loops (the dev server WebSocket is unreachable via the proxy).
