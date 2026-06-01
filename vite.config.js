@@ -7,6 +7,7 @@ import { loadPopGrid, impactSegments, pointImpact, POP_KERNEL } from './src/popG
 import { distFt, classifyPoint, isEnginelessType } from './src/geo.js'
 import { NOISE_ZONES } from './src/noiseZones.js'
 import { classifyOneTrack, phaseMLApiPlugin } from './phaseML/index.js'
+import { synthesizeInProgressCycle } from './flightCycles.js'
 
 // Load .env.local into process.env BEFORE importing db.js (which reads
 // DATABASE_URL at module load). Lets local dev point at Railway's Postgres
@@ -4324,31 +4325,11 @@ function flightsApiPlugin() {
             // exact case `/api/adsb/current-flights` handles by walking back
             // from the latest fix. Without this fallback, airborne practice-
             // area / training flights silently drop out of CURRENT until
-            // they land (kiosk bug report 2026-06-01). Mirror the same
-            // session-gap walk-back here so an in-progress cycle gets
-            // synthesized for the latest contiguous airborne session.
+            // they land (kiosk bug report 2026-06-01). See flightCycles.js
+            // for the pure helper + its regression net.
             if (!cycles.length) {
-              const SESSION_GAP_MS = 30 * 60_000
-              const STALE_MAX_S = 180
-              const lastFix = pts[pts.length - 1]
-              if (lastFix && lastFix[3] != null) {
-                const ageS = (nowMs - lastFix[3]) / 1000
-                if (ageS <= STALE_MAX_S
-                    && lastFix[2] != null && lastFix[2] > groundCeil) {
-                  let takeoffMs = lastFix[3]
-                  for (let i = pts.length - 1; i > 0; i--) {
-                    const cur = pts[i], prev = pts[i - 1]
-                    const gap = (cur[3] || 0) - (prev[3] || 0)
-                    if (gap > SESSION_GAP_MS) break
-                    if (prev[2] != null && prev[2] <= groundCeil) {
-                      takeoffMs = cur[3]
-                      break
-                    }
-                    takeoffMs = prev[3] || takeoffMs
-                  }
-                  cycles.push({ tMs: takeoffMs, lMs: null })
-                }
-              }
+              const synth = synthesizeInProgressCycle(pts, groundCeil, nowMs)
+              if (synth) cycles.push(synth)
             }
             if (!cycles.length) continue
             cycles.sort((a, b) => a.tMs - b.tMs)
