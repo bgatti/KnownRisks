@@ -173,6 +173,61 @@ const PURPOSE_COLOR = {
   ga_xc:           '#3b82f6', // blue-500 — darker XC variant
 }
 
+/**
+ * §11-CLIENT V3 §2: shape the per-row provenance badge.
+ *
+ * Pure helper — returns the badge's visible text, color, and tooltip
+ * for a given (purpose_source, purpose_confidence) pair, or null when
+ * the source is missing (older API, no badge to render). Lives at
+ * module scope so the test suite can import it without pulling React
+ * + leaflet through PointNoiseReport.jsx.
+ *
+ * Source → badge spec (matches API_REQUEST.md §11 V3 §2):
+ *   special_use   →  "★ curated"     gold      "Authoritative registry entry"
+ *   type          →  "T"             slate     "Inferred from ICAO type code"
+ *   tracked       →  "DB"            slate     "Stored in the tracks database"
+ *   shape         →  "~ shape (N%)"  cyan      "Inferred from flight-path shape via purposeML"
+ *   shape-hedged  →  "~ hedge (N%)"  cyan-fade "Hedged purposeML verdict — treat as advisory"
+ */
+export function purposeSourceBadgeProps(source, confidence) {
+  if (!source) return null
+  const pct = Number.isFinite(confidence) ? Math.round(confidence * 100) : null
+  switch (source) {
+    case 'special_use':
+      return {
+        text: '★ curated',
+        color: '#f59e0b', // amber-500 — gold tone
+        title: 'Authoritative registry entry',
+      }
+    case 'type':
+      return {
+        text: 'T',
+        color: '#94a3b8', // slate-400
+        title: 'Inferred from ICAO type code',
+      }
+    case 'tracked':
+      return {
+        text: 'DB',
+        color: '#94a3b8', // slate-400
+        title: 'Stored in the tracks database',
+      }
+    case 'shape':
+      return {
+        text: pct != null ? `~ shape (${pct}%)` : '~ shape',
+        color: '#22d3ee', // cyan-400
+        title: 'Inferred from flight-path shape via purposeML',
+      }
+    case 'shape-hedged':
+      return {
+        text: pct != null ? `~ hedge (${pct}%)` : '~ hedge',
+        color: '#67e8f9', // cyan-300 — faded
+        title: 'Hedged purposeML verdict — treat as advisory',
+      }
+    default:
+      return null
+  }
+}
+
 /** Mirrors purposeOf in vite.config.js. */
 function purposeFromType(type) {
   if (!type) return 'unknown'
@@ -310,10 +365,20 @@ function analyzeTrack(track, listener, fleetIndex) {
   // can't resolve one — covers transients/live-only windows with no
   // prior `tracks` row to project from.
   const baseAirport = track.base_airport || fleet?.airport || null
+  // §11-CLIENT V3 §2: carry purpose_source + purpose_confidence through
+  // so the per-row badge can show provenance ("★ curated" / "T" / "DB" /
+  // "~ shape (NN%)") without a second roundtrip. Older deployments that
+  // don't ship these fields just render no badge (defensive defaults).
+  const purposeSource = typeof track.purpose_source === 'string'
+    ? track.purpose_source : null
+  const purposeConfidence = Number.isFinite(track.purpose_confidence)
+    ? track.purpose_confidence : null
   return {
     tail: normTail || track.tail,
     type: normType,
     purpose,
+    purposeSource,
+    purposeConfidence,
     school: fleet?.school || null,
     baseAirport,
     schoolAirport: fleet?.airport || null,
@@ -384,6 +449,26 @@ function fmtLocalTime(ts) {
 function fmtDay(ts) {
   if (!ts) return '—'
   return new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric' })
+}
+
+/**
+ * §11-CLIENT V3 §2: render the provenance badge produced by
+ * purposeSourceBadgeProps(). Returns null when no badge applies
+ * (older API rows). Small monospace pill — sits to the right of the
+ * purpose label without dominating the row.
+ */
+function PurposeSourceBadge({ source, confidence }) {
+  const props = purposeSourceBadgeProps(source, confidence)
+  if (!props) return null
+  return (
+    <span
+      title={props.title}
+      className="ml-1.5 inline-flex items-center px-1.5 py-px rounded-full font-mono text-[10px] leading-none whitespace-nowrap"
+      style={{ color: props.color, border: `1px solid ${props.color}66` }}
+    >
+      {props.text}
+    </span>
+  )
 }
 
 /* ───────────────────────── SVG charts ──────────────────────────────── */
@@ -1772,6 +1857,29 @@ export default function PointNoiseReport() {
       // from the per-type aggregates) so the mean is weighted correctly
       // by flight count, not by type bucket.
       const rollup = summarize(allRowsForPurpose)
+      // §11-CLIENT V3 §2: derive a single representative
+      // (purposeSource, purposeConfidence) for the rollup badge. Use
+      // the mode (most common source); for shape/shape-hedged the
+      // confidence is the mean over rows that share that source.
+      // When the rollup is unanimous the badge is unambiguous; when
+      // it's split the rollup just shows the dominant source — the
+      // per-type detail rows below already carry their own badges.
+      const srcCounts = new Map()
+      let confSum = 0, confN = 0
+      for (const r of allRowsForPurpose) {
+        if (r.purposeSource) {
+          srcCounts.set(r.purposeSource, (srcCounts.get(r.purposeSource) || 0) + 1)
+        }
+        if (Number.isFinite(r.purposeConfidence)) {
+          confSum += r.purposeConfidence
+          confN++
+        }
+      }
+      let dominantSource = null, dominantSourceCount = 0
+      for (const [s, c] of srcCounts) {
+        if (c > dominantSourceCount) { dominantSource = s; dominantSourceCount = c }
+      }
+      const dominantConfidence = confN > 0 ? confSum / confN : null
       groups.push({
         purpose,
         total: allRowsForPurpose.length,
@@ -1780,6 +1888,8 @@ export default function PointNoiseReport() {
         meanDba: rollup.meanDba,
         minAlt: rollup.minAlt,
         types,
+        dominantSource,
+        dominantConfidence,
       })
     }
     groups.sort((a, b) => b.total - a.total)
@@ -2234,6 +2344,11 @@ export default function PointNoiseReport() {
                               style={{ background: PURPOSE_COLOR[g.purpose] || '#999' }}
                             />
                             {PURPOSE_LABEL[g.purpose] || g.purpose}
+                            {/* §11-CLIENT V3 §2: dominant source for this rollup. */}
+                            <PurposeSourceBadge
+                              source={g.dominantSource}
+                              confidence={g.dominantConfidence}
+                            />
                             <span className="text-white/40 text-xs font-normal">
                               ({g.types.length} {g.types.length === 1 ? 'type' : 'types'})
                             </span>
@@ -2573,8 +2688,11 @@ function EventTable({ rows }) {
               </td>
               <td className="pr-3 font-mono">{r.tail}</td>
               <td className="pr-3 font-mono text-white/70">{r.type || '?'}</td>
-              <td className="pr-3 text-xs" style={{ color: PURPOSE_COLOR[r.purpose] || '#999' }}>
-                {PURPOSE_LABEL[r.purpose] || r.purpose}
+              <td className="pr-3 text-xs">
+                <span style={{ color: PURPOSE_COLOR[r.purpose] || '#999' }}>
+                  {PURPOSE_LABEL[r.purpose] || r.purpose}
+                </span>
+                <PurposeSourceBadge source={r.purposeSource} confidence={r.purposeConfidence} />
               </td>
               <td className="text-right pr-3 tabular-nums font-semibold">{fmtDba(r.dba)}</td>
               <td className="text-right pr-3 tabular-nums text-white/60">{fmtFt(r.altAglFt)}</td>
