@@ -183,6 +183,80 @@ function estDbaAtListener({
   return Math.max(0, base - vert - lateral)
 }
 
+/* ───────────────────────── npv helpers ─────────────────────────────── */
+
+/**
+ * §11-CLIENT §7: Net Present Value of a substitution program.
+ * NPV = −CapEx + Σ (annualSavings / (1 + r)^t) for t = 1..years
+ *     + salvage / (1 + r)^years
+ * Returns a rounded integer for display.
+ */
+export function npv({ capex, annualSavings, salvage, rate, years }) {
+  let pv = -capex
+  for (let t = 1; t <= years; t++) pv += annualSavings / Math.pow(1 + rate, t)
+  pv += salvage / Math.pow(1 + rate, years)
+  return Math.round(pv)
+}
+
+/**
+ * §11-CLIENT §7: Build one column of the business-model table for an
+ * active substitute. Returns the inputs + the rolled-up NPV / op-savings
+ * / salvage / break-even.
+ *
+ * `nAirframes` is the distinct count of substituted tails for airframe
+ * subs, or 1 for the shared-system winch.
+ *
+ * Break-even hours/year is the inverse of NPV: how many hours per
+ * airframe would zero the NPV out (positive when the program is
+ * NPV-negative; null when it's already paying for itself).
+ */
+export function businessModelColumn({ sub, scenario, nAirframes, dbDelta }) {
+  if (!sub || nAirframes <= 0) return null
+  const hours = scenario.annual_hours_override?.[sub.code]
+    ?? sub.annual_hours_typical ?? 400
+  const opSavingsPerHr = (sub.op_savings_per_hr_usd ?? 0) * (scenario.fuel_multiplier ?? 1)
+  const annualSavings = opSavingsPerHr * hours * nAirframes
+  const capexPerUnit = sub.cap_ex_usd ?? 0
+  const capex = capexPerUnit * nAirframes
+  const salvage = capex * (sub.residual_value_pct ?? 0)
+  const years = scenario.horizon_yr ?? 10
+  const rate = scenario.rate ?? 0.05
+  const totalNpv = npv({ capex, annualSavings, salvage, rate, years })
+  const opSavingsUndiscounted = annualSavings * years
+  // Break-even hours/year per airframe: solve annualSavings * X = capex
+  // - salvage_pv  (annuity present value). Approximate by ratio against
+  // current annualSavings.
+  let breakEvenHours = null
+  if (totalNpv < 0 && opSavingsPerHr > 0 && nAirframes > 0) {
+    // Required annualSavings to hit NPV = 0 = capex - salvage_pv divided
+    // by the PV-of-annuity factor.
+    let pvFactor = 0
+    for (let t = 1; t <= years; t++) pvFactor += 1 / Math.pow(1 + rate, t)
+    const salvagePv = salvage / Math.pow(1 + rate, years)
+    const requiredAnnual = (capex - salvagePv) / pvFactor
+    breakEvenHours = Math.round(requiredAnnual / (opSavingsPerHr * nAirframes))
+  }
+  const dollarsPerDb = (dbDelta != null && dbDelta > 0 && totalNpv < 0)
+    ? Math.round(Math.abs(totalNpv) / dbDelta)
+    : null
+  return {
+    code: sub.code,
+    name: sub.name,
+    nAirframes,
+    capex,
+    annualSavings,
+    opSavingsUndiscounted,
+    salvage,
+    npv: totalNpv,
+    dollarsPerDb,
+    breakEvenHours,
+    hoursPerYr: hours,
+    opSavingsPerHr,
+    years,
+    rate,
+  }
+}
+
 /* ───────────────────────── what-if helpers ─────────────────────────── */
 
 /**
@@ -865,10 +939,122 @@ function Disclosure({ open, onToggle, label, children }) {
   )
 }
 
+/** §11-CLIENT §7: format USD amounts in a board-meeting-friendly way:
+ *  $2.4M, $57k, −$2.0M. Compact enough to fit table cells. */
+function fmtUsd(n) {
+  if (n == null || !Number.isFinite(n)) return '—'
+  const abs = Math.abs(n)
+  const sign = n < 0 ? '−' : ''
+  if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(abs >= 10e6 ? 1 : 2)}M`
+  if (abs >= 1e3) return `${sign}$${Math.round(abs / 1e3)}k`
+  return `${sign}$${Math.round(abs)}`
+}
+
+/** §11-CLIENT §7: mini business-model table — one column per active
+ *  substitute, rows for CapEx / op savings / salvage / NPV / break-even.
+ *  Hidden entirely when nothing is active (every slider at default). */
+function BusinessModelTable({ cols, dbDelta }) {
+  if (!cols || cols.length === 0) return null
+  return (
+    <div className="border border-white/10 rounded-md bg-white/[0.015] overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead className="text-xs uppercase text-white/50">
+          <tr>
+            <th className="text-left py-2 px-3">Line</th>
+            {cols.map((c) => (
+              <th key={c.code} className="text-right px-3">
+                {c.code} × {c.nAirframes}
+                <div className="text-[10px] normal-case text-white/40 font-normal">
+                  {c.name}
+                </div>
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          <tr className="border-t border-white/10">
+            <td className="py-1.5 px-3 text-white/70">CapEx</td>
+            {cols.map((c) => (
+              <td key={c.code} className="text-right px-3 tabular-nums">
+                {fmtUsd(-c.capex)}
+              </td>
+            ))}
+          </tr>
+          <tr className="border-t border-white/5">
+            <td className="py-1.5 px-3 text-white/70">
+              Op savings ({cols[0]?.years ?? 10} yr, undiscounted)
+            </td>
+            {cols.map((c) => (
+              <td key={c.code} className="text-right px-3 tabular-nums">
+                {fmtUsd(c.opSavingsUndiscounted)}
+              </td>
+            ))}
+          </tr>
+          <tr className="border-t border-white/5">
+            <td className="py-1.5 px-3 text-white/70">Salvage @ EoL</td>
+            {cols.map((c) => (
+              <td key={c.code} className="text-right px-3 tabular-nums text-white/70">
+                {fmtUsd(c.salvage)}
+              </td>
+            ))}
+          </tr>
+          <tr className="border-t-2 border-white/30 bg-white/[0.04]">
+            <td className="py-1.5 px-3 text-sm font-semibold uppercase tracking-wide">
+              NPV @ {((cols[0]?.rate ?? 0.05) * 100).toFixed(1)}% / {cols[0]?.years ?? 10} yr
+            </td>
+            {cols.map((c) => (
+              <td
+                key={c.code}
+                className={`text-right px-3 tabular-nums font-semibold ${c.npv >= 0 ? 'text-emerald-300' : 'text-red-300'}`}
+              >
+                {fmtUsd(c.npv)}
+              </td>
+            ))}
+          </tr>
+          <tr className="border-t border-white/10">
+            <td className="py-1.5 px-3 text-white/70">Peak dB reduction @ listener</td>
+            {cols.map((c) => (
+              <td key={c.code} className="text-right px-3 tabular-nums">
+                {dbDelta > 0 ? `−${dbDelta.toFixed(1)} dB` : '—'}
+              </td>
+            ))}
+          </tr>
+          <tr className="border-t border-white/5">
+            <td className="py-1.5 px-3 text-white/70">$/dB-reduction</td>
+            {cols.map((c) => (
+              <td key={c.code} className="text-right px-3 tabular-nums text-white/70">
+                {c.npv >= 0
+                  ? <span className="text-emerald-300/80">pays for itself</span>
+                  : (c.dollarsPerDb != null ? fmtUsd(c.dollarsPerDb) : '—')}
+              </td>
+            ))}
+          </tr>
+          <tr className="border-t border-white/5">
+            <td className="py-1.5 px-3 text-white/70">Break-even hr/yr</td>
+            {cols.map((c) => (
+              <td key={c.code} className="text-right px-3 tabular-nums text-white/70">
+                {c.npv >= 0
+                  ? <span className="text-emerald-300/80">already</span>
+                  : (c.breakEvenHours != null ? `${c.breakEvenHours.toLocaleString()} h` : '—')}
+              </td>
+            ))}
+          </tr>
+        </tbody>
+      </table>
+      <div className="px-3 py-2 text-[10px] text-white/40 border-t border-white/5">
+        N airframes = distinct tails picked at the current slider position
+        (or 1 shared winch system). Op savings use the substitute's default
+        annual hours unless overridden in Advanced. NPV negative = the
+        program costs money on net even before counting noise reduction.
+      </div>
+    </div>
+  )
+}
+
 /** §11-CLIENT §3: the four what-if sliders + the Advanced disclosure. State
  *  lives in the parent (PointNoiseReport) so the rest of the page can read
  *  it for the overlay histogram + the business-model table. */
-function WhatIfPanel({ scenario, setScenario, substitutes, advancedOpen, setAdvancedOpen }) {
+function WhatIfPanel({ scenario, setScenario, substitutes, advancedOpen, setAdvancedOpen, businessModelCols, dbDelta }) {
   const update = (patch) => setScenario((s) => ({ ...s, ...patch }))
   const updateHours = (code, hours) => setScenario((s) => ({
     ...s,
@@ -967,6 +1153,17 @@ function WhatIfPanel({ scenario, setScenario, substitutes, advancedOpen, setAdva
           })}
         </div>
       </Disclosure>
+      {/* §11-CLIENT §7: business-model table — only renders when at least
+          one substitute is active. dB delta is supplied by the parent
+          (baseline peak minus scenario peak at the listener). */}
+      {businessModelCols && businessModelCols.length > 0 && (
+        <div className="space-y-2">
+          <div className="text-xs uppercase tracking-wide text-white/60">
+            Business model — NPV per active substitute
+          </div>
+          <BusinessModelTable cols={businessModelCols} dbDelta={dbDelta} />
+        </div>
+      )}
     </div>
   )
 }
@@ -1458,6 +1655,38 @@ export default function PointNoiseReport() {
     return buckets
   }, [scenarioRows, scenarioActive])
 
+  // §11-CLIENT §7: business-model table. Only render columns for active
+  // substitutes (slider > 0). dB delta is the listener-side peak drop —
+  // baseline peak minus scenario peak across the filtered window.
+  const businessModelCols = useMemo(() => {
+    if (!scenarioActive || !substitutes?.length) return []
+    const baselinePeak = filteredRows.reduce((m, r) => Math.max(m, r.dba || 0), 0)
+    const scenarioPeak = scenarioRows.reduce((m, r) => Math.max(m, r.dba || 0), 0)
+    const dbDelta = baselinePeak - scenarioPeak
+    const cols = []
+    const slot = (code, pct, isWinch = false) => {
+      if (!pct || pct <= 0) return
+      const sub = findSub(substitutes, code)
+      if (!sub) return
+      const n = isWinch
+        ? (winchTracks.size > 0 ? 1 : 0)  // single shared winch system
+        : scenarioPicks[code]?.size || 0
+      if (n <= 0) return
+      const col = businessModelColumn({
+        sub,
+        scenario,
+        nAirframes: n,
+        dbDelta,
+      })
+      if (col) cols.push(col)
+    }
+    slot('VELE', scenario.electric_pct)
+    slot('EFOX', scenario.eurofox_pct)
+    slot('SINU', scenario.sinus_pct)
+    slot('WNCH', scenario.winch_agl_ft, true)
+    return cols
+  }, [scenarioActive, substitutes, filteredRows, scenarioRows, scenarioPicks, winchTracks, scenario])
+
   const peakHour = useMemo(() => {
     let h = -1, best = -Infinity
     for (let i = 0; i < hourlyBuckets.length; i++) {
@@ -1782,6 +2011,13 @@ export default function PointNoiseReport() {
                 substitutes={substitutes}
                 advancedOpen={advancedOpen}
                 setAdvancedOpen={setAdvancedOpen}
+                businessModelCols={businessModelCols}
+                dbDelta={(() => {
+                  if (!scenarioActive) return 0
+                  const baselinePeak = filteredRows.reduce((m, r) => Math.max(m, r.dba || 0), 0)
+                  const scenarioPeak = scenarioRows.reduce((m, r) => Math.max(m, r.dba || 0), 0)
+                  return Math.max(0, baselinePeak - scenarioPeak)
+                })()}
               />
             </Section>
           )
