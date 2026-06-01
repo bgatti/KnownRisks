@@ -3762,12 +3762,19 @@ function computeWorstSegment(flightPts, popAt, airport, engineless, altOffsetFt 
     const rawScore = peakPop > 0
       ? Math.round(impact_index * scale)
       : Math.round(peakDba)
-    // Null-when-clamping per kiosk's calibration request: while the
-    // window-scoped IMPACT_SCALE is provisional, a rawScore > 100 means
-    // we'd clamp; emit null instead. Internal rawScore is kept on the
-    // best record so window selection stays correct (the worst window
-    // still wins, it just doesn't surface a misleading 100).
-    const impact_score = rawScore > 100 ? null : Math.max(0, rawScore)
+    // Null-when-clamping per kiosk's calibration request: a rawScore > 100
+    // would clamp; emit null instead so the kiosk doesn't show a
+    // misleading 100. Internal rawScore stays on the best record so
+    // window selection still ranks correctly.
+    //
+    // EXCEPTION — permissive (pattern-only fallback): the kiosk drops
+    // worst_segments with null impact_score, which would defeat the
+    // purpose of the fallback. Clamp at 100 here and accept the
+    // imprecision; the operator-relevant signal is "this flight had a
+    // noteworthy 30 s window," not the exact rank.
+    const impact_score = rawScore > 100
+      ? (permissive ? Math.min(100, Math.round(peakDba)) : null)
+      : Math.max(0, rawScore)
     if (!best || rawScore > best._rawScore) {
       // Ask #9 info-box stats: AGL min/mean/peak, length_nm, people_exposed.
       // people_exposed is the people-seconds aggregate the kiosk wants
