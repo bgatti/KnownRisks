@@ -3833,8 +3833,19 @@ function flightsApiPlugin() {
   // but per-container amortization is already a 10-50x win.
   const TAIL_INFO_TTL_MS = 60_000
   const tailInfoCache = new Map()   // call -> { row, fetchedAt }
-  const CURRENT_RESPONSE_TTL_MS = 4_000
+  // Response-cache TTL is matched to the kiosk's 8 s polling interval so a
+  // warm cache survives until the next poll. Picked 8 s exactly because
+  // <8 s leaves a stale gap every cycle (poll → miss → 50 s recompute →
+  // brief warm → stale by next poll); >8 s would skew the kiosk's
+  // perceived freshness in the wrong direction. With true 8 s alignment,
+  // single-workstation polls are MISS on poll 1, HIT on every poll
+  // thereafter until staleness kicks in mid-window. Request coalescing
+  // (waiting on an in-flight Promise for the same key) is the next-level
+  // optimization — tracked as a follow-up since it requires wrapping the
+  // full handler body in a coalesced async fn.
+  const CURRENT_RESPONSE_TTL_MS = 8_000
   const currentResponseCache = new Map()  // key -> { body, fetchedAt }
+
 
   return {
     name: 'flights-api',
