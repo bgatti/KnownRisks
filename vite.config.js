@@ -3035,15 +3035,81 @@ const VERIFIED_ALT_CAL_COHORT_FRACTION = 0.25
 const VERIFIED_ALT_CAL_MIN_FIXES = 3
 const VERIFIED_ALT_CAL_MAX_AGL_FT = 500
 
+// Signal weights for runway-anchor scoring. Stationary indicators
+// (gs < 20 kts, multiple consecutive fixes at the same alt) are
+// highest-confidence; vs ≈ 0 (level flight) is meaningful but weaker
+// since level flight at any altitude scores too. Anchors with stronger
+// scores win the cohort selection; same-score ties break to lower alt.
+const RUNWAY_GS_KTS_MAX = 20
+const RUNWAY_VS_FPM_MAX = 100
+const RUNWAY_ALT_CLUSTER_FT = 10
+const RUNWAY_ALT_CLUSTER_NEIGHBORS = 2
+const RUNWAY_SCORE_W_GS = 3
+const RUNWAY_SCORE_W_VS = 2
+const RUNWAY_SCORE_W_CLUSTER = 2
+
+// Find high-confidence runway-anchor fixes from a flight track. Combines
+// stationary signals (low ground speed, low vertical speed, alt-clustered
+// neighbors) into a per-fix score. Returns anchors sorted by score
+// descending (and alt ascending as a tiebreaker). Per operator: vs=0,
+// gs<20 kts, and several consecutive datums at the same alt are strong
+// hints the aircraft is on the runway. Sometimes we won't see these —
+// in which case the caller falls back to the lowest-25% method.
+function findRunwayAnchors(flightPts, ap) {
+  const out = []
+  for (let i = 0; i < flightPts.length; i++) {
+    const p = flightPts[i]
+    if (p[0] == null || p[1] == null || p[2] == null) continue
+    if (distNmAp(p[0], p[1], ap.lat, ap.lon) > VERIFIED_ALT_CAL_RADIUS_NM) continue
+    let vs = null, gs = null
+    if (i > 0) {
+      const prev = flightPts[i - 1]
+      const dtSec = ((p[3] || 0) - (prev[3] || 0)) / 1000
+      if (dtSec > 0 && dtSec < 60 && prev[2] != null) {
+        vs = ((p[2] - prev[2]) / dtSec) * 60 // ft/min
+        const dFt = distFt(prev[0], prev[1], p[0], p[1])
+        gs = (dFt / dtSec) / 1.68781 // ft/s → knots
+      }
+    }
+    let score = 0
+    if (gs != null && gs < RUNWAY_GS_KTS_MAX) score += RUNWAY_SCORE_W_GS
+    if (vs != null && Math.abs(vs) < RUNWAY_VS_FPM_MAX) score += RUNWAY_SCORE_W_VS
+    let altNeighbors = 0
+    for (let j = Math.max(0, i - 2); j <= Math.min(flightPts.length - 1, i + 2); j++) {
+      if (j === i) continue
+      const q = flightPts[j]
+      if (q && q[2] != null && Math.abs(q[2] - p[2]) <= RUNWAY_ALT_CLUSTER_FT) altNeighbors++
+    }
+    if (altNeighbors >= RUNWAY_ALT_CLUSTER_NEIGHBORS) score += RUNWAY_SCORE_W_CLUSTER
+    if (score > 0) out.push({ alt: p[2], score })
+  }
+  out.sort((a, b) => (b.score - a.score) || (a.alt - b.alt))
+  return out
+}
+
 function computeFlightAltOffset(flightPts, airport) {
   const ap = ENRICH_AP.find(a => a.code === airport)
   if (!ap || !flightPts || !flightPts.length) {
     return { offset_ft: 0, calibration_fixes: 0 }
   }
-  // Gather every fix within 2 nm of the airport. That includes approach,
-  // taxi, takeoff roll — anywhere the plane was near the runway. Earlier
-  // version restricted to ±250 ft of field elev which excluded biased
-  // transponders and pattern legs — both gave the wrong answer.
+  // Primary: high-confidence runway anchors from low gs/vs/alt-clustered
+  // fixes. Use anchors with score ≥ topScore/2 (keeps the best cohort).
+  const anchors = findRunwayAnchors(flightPts, ap)
+  if (anchors.length >= VERIFIED_ALT_CAL_MIN_FIXES) {
+    const topScore = anchors[0].score
+    const cohort = anchors.filter(a => a.score >= Math.max(1, topScore / 2))
+    if (cohort.length >= VERIFIED_ALT_CAL_MIN_FIXES) {
+      const avg = cohort.reduce((s, a) => s + a.alt, 0) / cohort.length
+      if ((avg - ap.elev) <= VERIFIED_ALT_CAL_MAX_AGL_FT) {
+        return {
+          offset_ft: Math.round(avg - ap.elev),
+          calibration_fixes: cohort.length,
+        }
+      }
+    }
+  }
+  // Fallback: lowest-25% of in-range fixes (the prior algorithm). Catches
+  // flights where we lack the speed/vs signals but did dip near the field.
   const candidates = []
   for (const p of flightPts) {
     if (p[0] == null || p[1] == null || p[2] == null) continue
@@ -3053,17 +3119,10 @@ function computeFlightAltOffset(flightPts, airport) {
   if (candidates.length < VERIFIED_ALT_CAL_MIN_FIXES) {
     return { offset_ft: 0, calibration_fixes: 0 }
   }
-  // Take the lowest 25% of candidates — those are closest to the runway
-  // surface. The mean across them is the per-flight calibration anchor.
-  // 25% picks up touchdown + a bit of rollout, which is what we want;
-  // 100% would dilute with airborne pattern legs.
   const sorted = candidates.slice().sort((a, b) => a - b)
   const kFloor = Math.max(VERIFIED_ALT_CAL_MIN_FIXES, Math.ceil(sorted.length * VERIFIED_ALT_CAL_COHORT_FRACTION))
   const cohort = sorted.slice(0, kFloor)
   const avg = cohort.reduce((s, v) => s + v, 0) / cohort.length
-  // Sanity bound: if even the lowest 25% sits more than 500 ft above
-  // field, the plane never came close to the runway and we have no
-  // real calibration anchor. Return 0 offset — kiosk renders raw AGL.
   if ((avg - ap.elev) > VERIFIED_ALT_CAL_MAX_AGL_FT) {
     return { offset_ft: 0, calibration_fixes: cohort.length }
   }
