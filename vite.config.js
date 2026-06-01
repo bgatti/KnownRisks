@@ -4549,7 +4549,10 @@ function flightsApiPlugin() {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const airport = (u.searchParams.get('airport') || 'KBDU').trim().toUpperCase()
           const landedHours = Math.max(0.5, Math.min(48, Number(u.searchParams.get('landed_hours')) || 6))
-          const rangeNm = Math.max(1, Math.min(50, Number(u.searchParams.get('range_nm')) || 25))
+          // range_nm bounds: 5..100 (Ask #12). Front Range practice areas
+          // routinely fan to 75 nm toward the foothills + DEN class B
+          // periphery; 50 was clipping legitimate home-airport flights.
+          const rangeNm = Math.max(5, Math.min(100, Number(u.searchParams.get('range_nm')) || 25))
           const schoolFilter = (u.searchParams.get('school') || '').trim().toLowerCase() || null
           const ap = ENRICH_AP.find((a) => a.code === airport)
           if (!ap) { res.statusCode = 400; return res.end(JSON.stringify({ error: `unknown airport ${airport}` })) }
