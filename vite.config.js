@@ -1540,7 +1540,22 @@ function excursionsApiPlugin() {
               // /api/excursions/boot calls the same helper so the kiosk sees
               // identical phase values from either source.
               const { phase, descents, hasDescents } = classifyTrackPhase(walk)
-              const trackPurpose = resolvePurpose(t.purpose, t.type, t.call || t.reg)
+              // Shape-boosted purpose via purposeML. Walk already carries
+              // the alt-corrected 4-tuples ([lat, lon, alt_msl_ft, ts_ms])
+              // we need; resolvePurposeWithShape converts internally to
+              // the canonical Point shape and only invokes the classifier
+              // when there are >= 30 fixes. schoolMap is the lazily-cached
+              // global registry built by current-flights / boot — when not
+              // yet populated, the recipe degrades to "isSchoolFleet=false"
+              // (only effect: pattern_solo not upgraded to training).
+              // purpose_source on the wire lets consumers distinguish
+              // inferred (`shape`) from curated (`special_use` / `type`
+              // / `tracked`). See purposeML/ADOPTING_PURPOSE_ML_API.md.
+              const segSchoolMap = global.__SCHOOL_TAIL_AIRPORT || null
+              const purposeAns = resolvePurposeWithShape(
+                t.purpose, t.type, t.call || t.reg, walk, segSchoolMap,
+              )
+              const trackPurpose = purposeAns.purpose
               const matchT = { type: t.type || '', purpose: trackPurpose }
               const trackCands = pickTrackCandidates(matchT, SUBSTITUTES)
               const segCands = pickSegmentCandidates(matchT, SUBSTITUTES)
@@ -1581,10 +1596,13 @@ function excursionsApiPlugin() {
                   s.alt_dba_by_substitute = sub
                 }
               }
-              tracksOut.push({
+              const trackRow = {
                 tail: t.call || t.reg || tail || '?',
                 type: t.type || '',
                 purpose: trackPurpose,
+                // Provenance of `purpose`: special_use / type / tracked /
+                // shape. See purposeML/ADOPTING_PURPOSE_ML_API.md.
+                purpose_source: purposeAns.source,
                 src: t.src, date, live: isLive,
                 phase, descents, hasDescents,
                 // base_airport: most-recent observed base from tracks.base_airport.
@@ -1599,7 +1617,11 @@ function excursionsApiPlugin() {
                 alt_airframe_candidates: trackCands,
                 alt_segment_candidates: segCands,
                 segments: filtered,
-              })
+              }
+              // purpose_confidence only present on shape-inferred verdicts
+              // (purposeML returns it; the other branches don't have one).
+              if (purposeAns.confidence != null) trackRow.purpose_confidence = purposeAns.confidence
+              tracksOut.push(trackRow)
             }
           }
           // Backfill base_airport: the live_tracks JSONB doesn't carry the
