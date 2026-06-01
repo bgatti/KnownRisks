@@ -1559,7 +1559,24 @@ export default function PointNoiseReport() {
     || scenario.eurofox_pct > 0
     || scenario.sinus_pct > 0
     || scenario.winch_agl_ft > 0
+    || scenario.atpr_pct > 0
+    || scenario.simx_pct > 0
   )
+  // §11-CLIENT V2 §2b: regulatory demand-reduction picks the tails whose
+  // tracks disappear entirely (the regulatory demand for those flights
+  // dropped — no airframe substitution, the flight simply doesn't happen).
+  // Computed against the full row pool so it stays stable when the user
+  // nudges the dBA-floor / purpose filter; the active filters still apply
+  // downstream via filteredRows. Eliminate wins over any airframe
+  // substitution (a track can be both VELE-picked and ATPR-eliminated
+  // — the latter just means it doesn't fly at all).
+  const eliminatedTails = useMemo(() => {
+    if (!substitutes?.length) return new Set()
+    const set = new Set()
+    pickEliminated(allRows, 'ATPR', scenario.atpr_pct, substitutes).forEach((t) => set.add(t))
+    pickEliminated(allRows, 'SIMX', scenario.simx_pct, substitutes).forEach((t) => set.add(t))
+    return set
+  }, [allRows, scenario.atpr_pct, scenario.simx_pct, substitutes])
   const scenarioPicks = useMemo(() => {
     // Use the full row set (not filteredRows) as the substitution pool so
     // the picked tails are stable when the user nudges the dBA-floor or
@@ -1596,10 +1613,19 @@ export default function PointNoiseReport() {
   // Scenario rows — same filters as filteredRows but with per-row dBA
   // replaced by applyScenarioToRow(). When scenarioActive=false this is
   // a thin pass-through (the helper short-circuits unsubstituted rows).
+  //
+  // §11-CLIENT V2 §2b: regulatory demand-reduction tracks are dropped
+  // *before* the per-row scenario projection runs — they don't contribute
+  // any dBA to the scenario histogram at all (the flight simply doesn't
+  // happen). Baseline `filteredRows` is unchanged so the baseline bars
+  // still show what actually flew.
   const scenarioRows = useMemo(() => {
     if (!scenarioActive) return filteredRows
-    return filteredRows.map((r) => applyScenarioToRow(r, scenarioCtx, listener))
-  }, [filteredRows, scenarioCtx, listener, scenarioActive])
+    const survivors = eliminatedTails.size > 0
+      ? filteredRows.filter((r) => !eliminatedTails.has(r.tail))
+      : filteredRows
+    return survivors.map((r) => applyScenarioToRow(r, scenarioCtx, listener))
+  }, [filteredRows, scenarioCtx, listener, scenarioActive, eliminatedTails])
 
   const scenarioHourly = useMemo(() => {
     const buckets = Array.from({ length: 24 }, () => ({ count: 0, peakDba: 0, sumDba: 0 }))
