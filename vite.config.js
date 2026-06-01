@@ -1471,9 +1471,18 @@ function excursionsApiPlugin() {
               // /api/excursions/boot calls the same helper so the kiosk sees
               // identical phase values from either source.
               const { phase, descents, hasDescents } = classifyTrackPhase(walk)
+              // Resolve purpose for substitute matching — uses the same module
+              // helper as the kiosk so the same track classifies the same way
+              // from either endpoint. The track's stored purpose (if any) +
+              // type + tail feed into the resolver. The resulting purpose
+              // also gets emitted on the response so the client can mirror
+              // server-side scenario logic without a second lookup.
+              const trackPurpose = resolvePurpose(t.purpose, t.type, t.call || t.reg)
+              const matchT = { type: t.type || '', purpose: trackPurpose }
               tracksOut.push({
                 tail: t.call || t.reg || tail || '?',
                 type: t.type || '',
+                purpose: trackPurpose,
                 src: t.src, date, live: isLive,
                 phase, descents, hasDescents,
                 // base_airport: most-recent observed base from tracks.base_airport.
@@ -1484,6 +1493,15 @@ function excursionsApiPlugin() {
                 // altitude correction (subtracted from raw alt before
                 // classification). 0 when no calibration was available.
                 alt_offset_ft: trackOffset,
+                // Scenario substitutes — Ask #11. The client uses these to
+                // power the What-If panel (electric trainer %, eurofox tow %,
+                // sinus glider %, winch under N ft AGL).
+                //   alt_airframe_candidates → whole-track substitutes (VELE,
+                //     EFOX, SINU) that match this track's type or purpose.
+                //   alt_segment_candidates  → sub-segment substitutes (WNCH)
+                //     with the AGL cutoff they apply below.
+                alt_airframe_candidates: pickTrackCandidates(matchT, SUBSTITUTES),
+                alt_segment_candidates: pickSegmentCandidates(matchT, SUBSTITUTES),
                 segments: filtered,
               })
             }
