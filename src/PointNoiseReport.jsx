@@ -1381,6 +1381,11 @@ export default function PointNoiseReport() {
   })
   const [excludeGliders, setExcludeGliders] = useState(true)
   const [purposeSelected, setPurposeSelected] = useState(new Set())
+  // §11-CLIENT V3 §3: optional filter — when on, only rows with
+  // purpose_source === 'shape' AND purpose_confidence ≥ 0.7 survive.
+  // Lets a viewer audit purposeML's output independently of the
+  // curated path. Defaults off so the page stays inclusive.
+  const [onlyShapeHighConf, setOnlyShapeHighConf] = useState(false)
 
   // Browser geolocation. Permission-prompted; resolves quickly on success,
   // surfaces a short error string on denial / timeout.
@@ -1573,9 +1578,14 @@ export default function PointNoiseReport() {
       if (excludeGliders && (r.purpose === 'glider' || r.dba === 0)) return false
       if (r.dba < dbaFloor) return false
       if (purposeSelected.size && !purposeSelected.has(r.purpose)) return false
+      // §11-CLIENT V3 §3: high-confidence shape-only filter (opt-in).
+      if (onlyShapeHighConf) {
+        if (r.purposeSource !== 'shape') return false
+        if (!Number.isFinite(r.purposeConfidence) || r.purposeConfidence < 0.7) return false
+      }
       return true
     })
-  }, [allRows, appliedRadius, excludeGliders, dbaFloor, purposeSelected])
+  }, [allRows, appliedRadius, excludeGliders, dbaFloor, purposeSelected, onlyShapeHighConf])
 
   // Stage 2 — drop purposes whose busiest hour is below the slider threshold.
   // Built per-purpose (not per-type) so a "morning training rush" purpose
@@ -2088,6 +2098,12 @@ export default function PointNoiseReport() {
               label="Exclude gliders (engineless)"
               checked={excludeGliders}
               onChange={setExcludeGliders}
+            />
+            {/* §11-CLIENT V3 §3: opt-in filter for auditing purposeML. */}
+            <Toggle
+              label="Only shape-inferred high-confidence (purposeML ≥ 70%)"
+              checked={onlyShapeHighConf}
+              onChange={setOnlyShapeHighConf}
             />
             {purposeSelected.size > 0 && (
               <button
