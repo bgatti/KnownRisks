@@ -15,11 +15,155 @@
 import { describe, it, expect } from 'vitest'
 import {
   pickSubstituted,
+  pickEliminated,
   shouldWinchSegment,
   segmentDba,
   npv,
   businessModelColumn,
+  regulatoryColumn,
 } from './whatif.js'
+
+/* ─── pickEliminated (V2 — regulatory demand reduction) ───────────── */
+
+// Fixture: 10 training tracks + 2 tow tracks + 2 glider tracks. Only
+// training matches ATPR/SIMX's `replaces_purposes: ["training"]`.
+const V2_TRACKS = [
+  ...['N10','N02','N05','N07','N03','N09','N01','N06','N08','N04']
+    .map((tail) => ({ tail, purpose: 'training' })),
+  { tail: 'NTOW1', purpose: 'tow_plane' },
+  { tail: 'NTOW2', purpose: 'tow_plane' },
+  { tail: 'NGLI1', purpose: 'glider' },
+  { tail: 'NGLI2', purpose: 'glider' },
+]
+const V2_SUBSTITUTES = [
+  { code: 'ATPR', scope: 'track_eliminate', replaces_purposes: ['training'], max_reduction_pct: 60 },
+  { code: 'SIMX', scope: 'track_eliminate', replaces_purposes: ['training'], max_reduction_pct: 30 },
+  { code: 'VELE', scope: 'track', replaces_purposes: ['training'] }, // non-eliminate, must be ignored
+]
+
+describe('pickEliminated (V2 regulatory demand reduction)', () => {
+  it('returns an empty Set when slider is 0', () => {
+    expect(pickEliminated(V2_TRACKS, 'ATPR', 0, V2_SUBSTITUTES).size).toBe(0)
+  })
+  it('at slider=100 + max_reduction_pct=60 removes 60% of training tracks (6/10)', () => {
+    const picked = pickEliminated(V2_TRACKS, 'ATPR', 100, V2_SUBSTITUTES)
+    expect(picked.size).toBe(6)
+    // Eligible sorted ascending: N01, N02, N03, N04, N05, N06, N07, N08, N09, N10
+    // Take the first 6 = N01..N06.
+    expect([...picked].sort()).toEqual(['N01','N02','N03','N04','N05','N06'])
+  })
+  it('scales linearly — slider=50 + max=60 → 30% reduction → 3 tracks', () => {
+    const picked = pickEliminated(V2_TRACKS, 'ATPR', 50, V2_SUBSTITUTES)
+    expect(picked.size).toBe(3)
+    expect([...picked].sort()).toEqual(['N01','N02','N03'])
+  })
+  it('respects per-substitute max_reduction_pct — SIMX caps at 30%', () => {
+    const picked = pickEliminated(V2_TRACKS, 'SIMX', 100, V2_SUBSTITUTES)
+    expect(picked.size).toBe(3) // 10 × 30% = 3
+  })
+  it('returns empty Set for an unknown code', () => {
+    expect(pickEliminated(V2_TRACKS, 'NOPE', 100, V2_SUBSTITUTES).size).toBe(0)
+  })
+  it('returns empty Set when scope is not track_eliminate (VELE has scope:"track")', () => {
+    expect(pickEliminated(V2_TRACKS, 'VELE', 100, V2_SUBSTITUTES).size).toBe(0)
+  })
+  it('returns empty Set when substitutes array is missing', () => {
+    expect(pickEliminated(V2_TRACKS, 'ATPR', 100, null).size).toBe(0)
+    expect(pickEliminated(V2_TRACKS, 'ATPR', 100, undefined).size).toBe(0)
+  })
+  it('is deterministic — same input → identical output across calls', () => {
+    const a = pickEliminated(V2_TRACKS, 'ATPR', 50, V2_SUBSTITUTES)
+    const b = pickEliminated(V2_TRACKS, 'ATPR', 50, V2_SUBSTITUTES)
+    expect([...a].sort()).toEqual([...b].sort())
+  })
+  it('ignores tracks whose purpose does not match replaces_purposes', () => {
+    // Even at 100% slider, tow + glider tracks are never picked.
+    const picked = pickEliminated(V2_TRACKS, 'ATPR', 100, V2_SUBSTITUTES)
+    for (const t of picked) {
+      expect(['NTOW1','NTOW2','NGLI1','NGLI2']).not.toContain(t)
+    }
+  })
+})
+
+/* ─── scenario integration — demand-reduction drops events ────────── */
+
+describe('demand-reduction histogram (V2 §2b)', () => {
+  // Simulate the page's aggregation: scenario count = filteredRows.length
+  // minus the eliminated tails.
+  it('ATPR slider=50 (→30% effective) drops ~30% of the histogram event count', () => {
+    // Build 20 training rows so the math is unambiguous integer-wise.
+    const rows = Array.from({ length: 20 }, (_, i) => ({
+      tail: `N${String(i + 1).padStart(2, '0')}`,
+      purpose: 'training',
+    }))
+    const baselineCount = rows.length
+    const eliminated = pickEliminated(rows, 'ATPR', 50, V2_SUBSTITUTES)
+    const scenarioRows = rows.filter((r) => !eliminated.has(r.tail))
+    // 20 × (50 × 60 / 100) / 100 = 20 × 30% = 6 eliminated → 14 surviving.
+    expect(eliminated.size).toBe(6)
+    expect(scenarioRows.length).toBe(14)
+    expect(scenarioRows.length / baselineCount).toBeCloseTo(0.7, 5)
+  })
+  it('eliminate wins over substitute — a track in both Sets is still gone', () => {
+    const rows = [
+      { tail: 'N01', purpose: 'training', altAirframeCandidates: ['VELE'] },
+      { tail: 'N02', purpose: 'training', altAirframeCandidates: ['VELE'] },
+    ]
+    const substituted = pickSubstituted(rows, 'VELE', 100) // both picked
+    const eliminated = pickEliminated(rows, 'ATPR', 100, V2_SUBSTITUTES) // 1 picked (60% of 2 = 1)
+    expect(substituted.size).toBe(2)
+    expect(eliminated.size).toBe(1)
+    const survivors = rows.filter((r) => !eliminated.has(r.tail))
+    expect(survivors.length).toBe(1)
+    // Only N02 survives; N01 is gone (not substituted-with-VELE, just gone).
+    expect(survivors[0].tail).toBe('N02')
+  })
+})
+
+/* ─── regulatoryColumn (V2 §4) ────────────────────────────────────── */
+
+describe('regulatoryColumn (V2 §4 business-model)', () => {
+  const scenario = {
+    rate: 0.05, horizon_yr: 10, fuel_multiplier: 1, annual_hours_override: {},
+  }
+  const atprSub = {
+    code: 'ATPR', scope: 'track_eliminate', replaces_purposes: ['training'],
+    max_reduction_pct: 60, advocacy_capex_usd: 250000,
+    cap_ex_usd: 0, op_savings_per_hr_usd: 0,
+  }
+  const simxSub = {
+    code: 'SIMX', scope: 'track_eliminate', replaces_purposes: ['training'],
+    max_reduction_pct: 30, cap_ex_usd: 350000, op_savings_per_hr_usd: -50,
+    annual_hours_typical: 1500, useful_life_years: 15, residual_value_pct: 0.20,
+  }
+  it('returns null when nSchoolsAffected <= 0', () => {
+    expect(regulatoryColumn({ sub: atprSub, scenario, nSchoolsAffected: 0, dbDelta: 5 })).toBeNull()
+  })
+  it('returns null when scope is not track_eliminate', () => {
+    const bogus = { ...atprSub, scope: 'track' }
+    expect(regulatoryColumn({ sub: bogus, scenario, nSchoolsAffected: 1, dbDelta: 5 })).toBeNull()
+  })
+  it('ATPR — NPV equals -advocacy_capex_usd (one-time, no savings)', () => {
+    const col = regulatoryColumn({ sub: atprSub, scenario, nSchoolsAffected: 6, dbDelta: 3 })
+    expect(col.npv).toBe(-250000)
+    expect(col.capex).toBe(250000)
+    expect(col.annualSavings).toBe(0)
+    expect(col.mechanism).toBe('Regulatory rollback')
+    // dB-cost: 250k / 3 dB ≈ $83,333/dB
+    expect(col.dollarsPerDb).toBe(83333)
+  })
+  it('SIMX — flips negative op_savings_per_hr_usd to positive school savings', () => {
+    const col = regulatoryColumn({ sub: simxSub, scenario, nSchoolsAffected: 2, dbDelta: 5 })
+    // School saves $50/hr × 1500 hr/yr × 2 schools = $150k/yr
+    expect(col.annualSavings).toBe(150000)
+    expect(col.opSavingsPerHr).toBe(50)
+    // Capex = 2 schools × $350k = $700k
+    expect(col.capex).toBe(700000)
+    expect(col.mechanism).toBe('FAA Part 61 rulemaking + per-school FTD')
+    // Salvage = 700k × 20% = 140k
+    expect(col.salvage).toBe(140000)
+  })
+})
 
 /* ─── pickSubstituted ─────────────────────────────────────────────── */
 
