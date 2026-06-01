@@ -2959,6 +2959,53 @@ function patternEnvelopeFor(airport) {
 // constant per-airport.
 const PATTERN_WEIGHT = 0.3
 
+// Region-wide alt-offset smoother. Each "landing-anchor" measurement from
+// any flight (its own lowest-25% cohort vs field elev) feeds an in-memory
+// per-airport time series. For any given flight we look at the 2 landings
+// before and 2 after its midtime and average — outliers further than
+// max(50, stddev) from the cohort mean get dropped before the final mean.
+// Smoothing across multiple flights catches baro drift during long flights,
+// rescues flights that never approached the runway, and reduces single-
+// transponder noise from any one calibration.
+const REGIONAL_OFFSET_WINDOW_MS = 12 * 3600 * 1000 // keep last 12 h of events
+const REGIONAL_OFFSET_NEAR_N = 2 // 2 landings before + 2 after
+
+function regionalOffsetSeriesFromFlights(flights) {
+  // Build per-airport time series from the per-flight self-calibration
+  // measurements. Each flight contributes one event { landingMs, offsetFt }
+  // when its own cohort yields a non-zero offset. landingMs is the flight's
+  // midtime (best proxy for when that transponder/baro state held).
+  const byAirport = new Map()
+  const now = Date.now()
+  for (const f of flights) {
+    if (!f._selfOffset || !f._selfOffsetCohort) continue
+    const mid = f._midMs
+    if (now - mid > REGIONAL_OFFSET_WINDOW_MS) continue
+    const a = f._airport
+    if (!a) continue
+    if (!byAirport.has(a)) byAirport.set(a, [])
+    byAirport.get(a).push({ landingMs: mid, offsetFt: f._selfOffset })
+  }
+  for (const series of byAirport.values()) series.sort((a, b) => a.landingMs - b.landingMs)
+  return byAirport
+}
+
+function smoothedOffsetFor(airport, midMs, series) {
+  const events = series.get(airport)
+  if (!events || events.length === 0) return null
+  const before = events.filter(e => e.landingMs < midMs).slice(-REGIONAL_OFFSET_NEAR_N)
+  const after = events.filter(e => e.landingMs >= midMs).slice(0, REGIONAL_OFFSET_NEAR_N)
+  const sample = [...before, ...after].map(e => e.offsetFt)
+  if (sample.length === 0) return null
+  const mean = sample.reduce((s, v) => s + v, 0) / sample.length
+  const variance = sample.reduce((s, v) => s + (v - mean) * (v - mean), 0) / sample.length
+  const stddev = Math.sqrt(variance)
+  const band = Math.max(50, stddev)
+  const filtered = sample.filter(v => Math.abs(v - mean) <= band)
+  const finalMean = (filtered.length > 0 ? filtered : sample).reduce((s, v) => s + v, 0) / (filtered.length || sample.length)
+  return { offset_ft: Math.round(finalMean), n_landings: sample.length }
+}
+
 // `verified_alt` — back out ADS-B reporting drift on a per-flight basis.
 // Mode-S barometric altitude is calibrated to standard-pressure (29.92)
 // while the published runway elevation is true MSL. Local pressure and
@@ -4342,6 +4389,55 @@ function flightsApiPlugin() {
                 last_seen_s: lastSeenS,
                 dist_nm: Math.round(dist * 10) / 10,
               })
+            }
+          }
+
+          // ── verified_alt post-pass: regional time-smoothed offset ────
+          // Each flight's own touchdown calibration (self-offset) feeds a
+          // per-airport time series. We then re-derive each flight's
+          // final offset as the smoothed average of the 2 landings before
+          // and 2 after its midtime (outliers > max(50, stddev) dropped).
+          // This catches baro drift across a long flight, rescues
+          // flights that never approached the runway, and reduces single-
+          // transponder noise. The delta gets folded back into alt_agl_*
+          // on worst_segment and incursion_segments so noise items
+          // report the smoothed-corrected AGL.
+          const seriesByAirport = new Map()
+          for (const f of flights) {
+            const off = f.indicators?.alt_offset_ft
+            const cohort = f.indicators?.alt_offset_calibration_fixes || 0
+            if (!cohort || off === 0) continue
+            const takeoffMs = Date.parse(f.takeoff_ts || '')
+            const landMs = f.landed_at ? Date.parse(f.landed_at) : takeoffMs
+            const midMs = Number.isFinite(takeoffMs) && Number.isFinite(landMs)
+              ? (takeoffMs + landMs) / 2 : nowMs
+            if (!seriesByAirport.has(airport)) seriesByAirport.set(airport, [])
+            seriesByAirport.get(airport).push({ landingMs: midMs, offsetFt: off })
+          }
+          for (const arr of seriesByAirport.values()) arr.sort((a, b) => a.landingMs - b.landingMs)
+          for (const f of flights) {
+            const takeoffMs = Date.parse(f.takeoff_ts || '')
+            const landMs = f.landed_at ? Date.parse(f.landed_at) : takeoffMs
+            const midMs = Number.isFinite(takeoffMs) && Number.isFinite(landMs)
+              ? (takeoffMs + landMs) / 2 : nowMs
+            const smoothed = smoothedOffsetFor(airport, midMs, seriesByAirport)
+            if (!smoothed) continue
+            const oldOff = f.indicators.alt_offset_ft || 0
+            const delta = smoothed.offset_ft - oldOff
+            f.indicators.alt_offset_ft = smoothed.offset_ft
+            f.indicators.alt_offset_smoothing_landings = smoothed.n_landings
+            if (delta !== 0) {
+              const shift = (v) => v != null ? Math.round(v - delta) : null
+              if (f.worst_segment) {
+                f.worst_segment.alt_agl_min = shift(f.worst_segment.alt_agl_min)
+                f.worst_segment.alt_agl_mean = shift(f.worst_segment.alt_agl_mean)
+                f.worst_segment.alt_agl_peak = shift(f.worst_segment.alt_agl_peak)
+              }
+              for (const s of f.incursion_segments || []) {
+                s.alt_agl_min = shift(s.alt_agl_min)
+                s.alt_agl_mean = shift(s.alt_agl_mean)
+                s.alt_agl_peak = shift(s.alt_agl_peak)
+              }
             }
           }
 
