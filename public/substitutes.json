@@ -62,6 +62,48 @@
       "op_savings_per_launch_usd": 35,
       "useful_life_years": 25,
       "residual_value_pct": 0.30
+    },
+    {
+      "code": "ATPR",
+      "name": "ATP rule rollback (250 hr restricted-ATP)",
+      "kind": "demand_reduction",
+      "base_dba": null,
+      "replaces_purposes": ["training"],
+      "scope": "track_eliminate",
+      "max_reduction_pct": 60,
+      "powertrain": "(none — regulatory change, not an aircraft)",
+      "note": "Restoring the pre-2013 commercial-to-ATP pathway at 250 hr would cut industry-driven hour-building flights by ~60% at full uptake. Slider value 0..100 maps to 0..60% reduction in training tracks at the listener. No airframe change — these tracks simply disappear because the regulatory demand for them disappears.",
+      "regulatory_action": "FAA Part 121 rulemaking (rollback of 14 CFR 121.436)",
+      "cap_ex_usd": 0,
+      "op_savings_per_hr_usd": 0,
+      "useful_life_years": 0,
+      "residual_value_pct": 0,
+      "annual_hours_typical": 0,
+      "policy_cost_per_pilot_usd": -50000,
+      "policy_cost_note": "Net per-pilot training cost drops ~$50k (1500hr@$150 → 500hr@$150 + R-ATP fees). Cost to the noise model is $0; cost to the regulatory conversation is political.",
+      "advocacy_capex_usd": 250000,
+      "advocacy_capex_note": "Approximate cost of a multi-year FAA rulemaking advocacy campaign (industry group dues, expert testimony, legal review). One-time, shared across all proponents."
+    },
+    {
+      "code": "SIMX",
+      "name": "Expanded simulator credit (200 hr toward ATP)",
+      "kind": "demand_reduction",
+      "base_dba": null,
+      "replaces_purposes": ["training"],
+      "scope": "track_eliminate",
+      "max_reduction_pct": 30,
+      "powertrain": "(none — simulator hours displace flight hours)",
+      "note": "Today (14 CFR 61.65) ATP candidates can credit up to 100 hr of full-motion simulator time against the 1500 hr requirement; restricted-ATP graduates of 4-yr aviation programs can credit up to 200 hr in some combinations. Expanding the general cap to 200 hr (or further toward EASA's 250 hr cap) would shift ~30% of in-air training onto sims. Slider value 0..100 maps to 0..30% reduction in training tracks at the listener.",
+      "regulatory_action": "FAA Part 61 rulemaking + per-school simulator capex",
+      "cap_ex_usd": 350000,
+      "cap_ex_note": "Per-school cost of a Level 5+ FTD (flight training device). Roughly $350k for a fixed-base FTD that satisfies the expanded credit; full-motion Level D sims are $5M+ and not realistic for small school fleets.",
+      "op_savings_per_hr_usd": -50,
+      "op_savings_per_hr_note": "Net per-training-hour delta when an hour shifts from plane ($200/hr wet) to sim ($150/hr). School saves ~$50/hr on the substituted portion but has to absorb the FTD capex.",
+      "useful_life_years": 15,
+      "residual_value_pct": 0.20,
+      "annual_hours_typical": 1500,
+      "policy_cost_per_pilot_usd": 5000,
+      "policy_cost_note": "Net per-pilot cost roughly +$5k (sim time is cheaper per hour but the FTD has to be amortized over a smaller hour pool than a fleet plane)."
     }
   ]
 }
