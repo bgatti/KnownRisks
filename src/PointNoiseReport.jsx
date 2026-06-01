@@ -1708,6 +1708,14 @@ export default function PointNoiseReport() {
     return buckets
   }, [filteredRows])
 
+  // §11-CLIENT §13: per-hour × per-dBA-band counts for the stacked-bands
+  // hourly chart (the one that replaced the peak-coloured variant).
+  // Pre-bucketise once per filtered-rows change so the SVG render is cheap.
+  const hourlyBandBuckets = useMemo(
+    () => bucketizeHourlyBands(filteredRows),
+    [filteredRows],
+  )
+
   // §11-CLIENT §6: scenario overlay. Pick the substituted tail Sets from
   // the slider state, then re-aggregate the histogram using the scenario-
   // world per-row dBA. When every slider is at default this is a no-op
@@ -1798,6 +1806,13 @@ export default function PointNoiseReport() {
     }
     return buckets
   }, [scenarioRows, scenarioActive])
+
+  // §11-CLIENT §13: scenario-world per-hour × per-band counts. Drives the
+  // right-half stack of the stacked-bands chart when scenario is active.
+  const scenarioHourlyBandBuckets = useMemo(
+    () => scenarioActive ? bucketizeHourlyBands(scenarioRows) : null,
+    [scenarioRows, scenarioActive],
+  )
 
   // §11-CLIENT §7: listener-side peak drop — baseline peak minus scenario
   // peak across the filtered window. Used by both the business-model table
