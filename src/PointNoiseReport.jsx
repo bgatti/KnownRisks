@@ -2,6 +2,17 @@ import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { MapContainer, TileLayer, Marker, useMap, useMapEvents } from 'react-leaflet'
 import L from 'leaflet'
 import { isEnginelessType, distFt } from './geo'
+// §11-CLIENT helpers live in a leaflet-free module so the test suite can
+// import them without bringing in React + leaflet. Re-export here for any
+// external consumer that was importing them off PointNoiseReport.jsx.
+import {
+  pickSubstituted,
+  shouldWinchSegment,
+  segmentDba,
+  npv,
+  businessModelColumn,
+} from './whatif.js'
+export { pickSubstituted, shouldWinchSegment, segmentDba, npv, businessModelColumn }
 
 /* SVG-pin DivIcon for the map pin. Drawn at 26×34 with anchor at base. */
 const PIN_ICON = L.divIcon({
@@ -183,167 +194,7 @@ function estDbaAtListener({
   return Math.max(0, base - vert - lateral)
 }
 
-/* ───────────────────────── npv helpers ─────────────────────────────── */
-
-/**
- * §11-CLIENT §7: Net Present Value of a substitution program.
- * NPV = −CapEx + Σ (annualSavings / (1 + r)^t) for t = 1..years
- *     + salvage / (1 + r)^years
- * Returns a rounded integer for display.
- */
-export function npv({ capex, annualSavings, salvage, rate, years }) {
-  let pv = -capex
-  for (let t = 1; t <= years; t++) pv += annualSavings / Math.pow(1 + rate, t)
-  pv += salvage / Math.pow(1 + rate, years)
-  return Math.round(pv)
-}
-
-/**
- * §11-CLIENT §7: Build one column of the business-model table for an
- * active substitute. Returns the inputs + the rolled-up NPV / op-savings
- * / salvage / break-even.
- *
- * `nAirframes` is the distinct count of substituted tails for airframe
- * subs, or 1 for the shared-system winch.
- *
- * Break-even hours/year is the inverse of NPV: how many hours per
- * airframe would zero the NPV out (positive when the program is
- * NPV-negative; null when it's already paying for itself).
- */
-export function businessModelColumn({ sub, scenario, nAirframes, dbDelta }) {
-  if (!sub || nAirframes <= 0) return null
-  const hours = scenario.annual_hours_override?.[sub.code]
-    ?? sub.annual_hours_typical ?? 400
-  const opSavingsPerHr = (sub.op_savings_per_hr_usd ?? 0) * (scenario.fuel_multiplier ?? 1)
-  const annualSavings = opSavingsPerHr * hours * nAirframes
-  const capexPerUnit = sub.cap_ex_usd ?? 0
-  const capex = capexPerUnit * nAirframes
-  const salvage = capex * (sub.residual_value_pct ?? 0)
-  const years = scenario.horizon_yr ?? 10
-  const rate = scenario.rate ?? 0.05
-  const totalNpv = npv({ capex, annualSavings, salvage, rate, years })
-  const opSavingsUndiscounted = annualSavings * years
-  // Break-even hours/year per airframe: solve annualSavings * X = capex
-  // - salvage_pv  (annuity present value). Approximate by ratio against
-  // current annualSavings.
-  let breakEvenHours = null
-  if (totalNpv < 0 && opSavingsPerHr > 0 && nAirframes > 0) {
-    // Required annualSavings to hit NPV = 0 = capex - salvage_pv divided
-    // by the PV-of-annuity factor.
-    let pvFactor = 0
-    for (let t = 1; t <= years; t++) pvFactor += 1 / Math.pow(1 + rate, t)
-    const salvagePv = salvage / Math.pow(1 + rate, years)
-    const requiredAnnual = (capex - salvagePv) / pvFactor
-    breakEvenHours = Math.round(requiredAnnual / (opSavingsPerHr * nAirframes))
-  }
-  const dollarsPerDb = (dbDelta != null && dbDelta > 0 && totalNpv < 0)
-    ? Math.round(Math.abs(totalNpv) / dbDelta)
-    : null
-  return {
-    code: sub.code,
-    name: sub.name,
-    nAirframes,
-    capex,
-    annualSavings,
-    opSavingsUndiscounted,
-    salvage,
-    npv: totalNpv,
-    dollarsPerDb,
-    breakEvenHours,
-    hoursPerYr: hours,
-    opSavingsPerHr,
-    years,
-    rate,
-  }
-}
-
-/* ───────────────────────── what-if helpers ─────────────────────────── */
-
-/**
- * §11-CLIENT §4: Deterministic substitution selection.
- *
- * Given the current track list and a slider percentage for a substitute
- * code, return the set of tails that should be substituted. Sort by tail
- * ascending and take the first `floor(N * pct/100)` so the selection is
- * stable across re-renders — no random seed, no flicker when the slider
- * tick repeats the same value.
- *
- * `tracks` items must carry `tail` + `altAirframeCandidates` (the shape
- * analyzeTrack produces).
- */
-export function pickSubstituted(tracks, code, pct) {
-  if (!pct || pct <= 0) return new Set()
-  const eligible = []
-  for (const t of tracks || []) {
-    const cands = t?.altAirframeCandidates || []
-    if (cands.includes(code) && t.tail) eligible.push(t.tail)
-  }
-  eligible.sort()
-  const k = Math.floor((eligible.length * pct) / 100)
-  return new Set(eligible.slice(0, k))
-}
-
-/**
- * §11-CLIENT §4: Winch is an AGL threshold rather than a track fraction —
- * any segment of a tow track whose lowest AGL point falls below the
- * threshold should be substituted with WNCH (base_dba = 0). Returns true
- * iff the segment qualifies under the current threshold.
- *
- * `seg.points` is the raw [lat, lon, alt_msl, ts?] tuple shape the server
- * emits; we read alt_msl from index 2 and compare against
- * `listenerElevFt`. Threshold <= 0 means winch is off entirely.
- */
-export function shouldWinchSegment(seg, threshold_ft, listenerElevFt) {
-  if (!threshold_ft || threshold_ft <= 0) return false
-  const pts = seg?.points
-  if (!Array.isArray(pts) || pts.length === 0) return false
-  let lowest = Infinity
-  for (const p of pts) {
-    const altMsl = p?.[2]
-    if (altMsl == null) continue
-    const agl = altMsl - listenerElevFt
-    if (agl < lowest) lowest = agl
-  }
-  if (!Number.isFinite(lowest)) return false
-  return lowest < threshold_ft
-}
-
-/**
- * §11-CLIENT §5: Project the per-segment dBA in the scenario world.
- *
- * Decision tree:
- *   1. Winch on AND track was picked for winch AND this segment qualifies
- *      under the AGL threshold → 0 dBA.
- *   2. Track was picked for an airframe-scope substitute (VELE / EFOX /
- *      SINU) → use `seg.alt_dba_by_substitute[code]` for that segment
- *      (skip codes whose entry is null — substitute is a track candidate
- *      but doesn't apply to this individual segment).
- *   3. Otherwise → caller's baseline dBA for the segment (no scenario).
- *
- * The caller supplies `baseDbaForSeg` so this helper stays decoupled
- * from the page's per-point dBA kernel — it just plays scenario-world
- * substitution rules on top.
- */
-export function segmentDba(track, seg, scenario, listenerElevFt, baseDbaForSeg) {
-  const tail = track?.tail
-  if (!tail) return baseDbaForSeg
-  // Winch first — it overrides any airframe-scope substitution because the
-  // segment isn't airborne (winch is a launch system, not an aircraft swap).
-  if (scenario?.winchTracks?.has(tail)
-      && shouldWinchSegment(seg, scenario.winch_agl_ft, listenerElevFt)) {
-    return 0
-  }
-  const map = seg?.alt_dba_by_substitute
-  if (map && scenario?.substituted) {
-    for (const code of ['VELE', 'EFOX', 'SINU']) {
-      if (scenario.substituted[code]?.has(tail)) {
-        const v = map[code]
-        if (v != null) return v
-      }
-    }
-  }
-  return baseDbaForSeg
-}
+/* ───────────────────────── scenario row projector ──────────────────── */
 
 /**
  * §11-CLIENT §5: Re-compute the per-row peak dBA at the listener under
@@ -351,10 +202,9 @@ export function segmentDba(track, seg, scenario, listenerElevFt, baseDbaForSeg) 
  * post-substitution segment-level dBA, and returns the scenario row
  * (same shape as the baseline row but with `dba` overridden).
  *
- * For the baseline per-segment dBA we re-derive the geometry against the
- * listener and reuse `estDbaAtListener` so the kernel stays consistent
- * with the rest of the page. When a track has no scenario applied, the
- * baseline row is returned untouched.
+ * Uses estDbaAtListener / distFt from this file (the page's dBA kernel
+ * + leaflet-free distance helper). The pure substitution rules live in
+ * ./whatif.js → segmentDba.
  */
 export function applyScenarioToRow(row, scenario, listener) {
   if (!row) return null
@@ -2039,18 +1889,36 @@ export default function PointNoiseReport() {
           />
         </div>
 
-        {/* §11-CLIENT §3: What-If panel. Hidden until (a) the substitutes
-            config has loaded and (b) at least one track in the current
-            window carries the new alt_airframe_candidates field. When
-            those two preconditions hold but no slider has moved, the
-            panel still renders so the user can engage it. */}
+        {/* §11-CLIENT §3 + §9: What-If panel.
+            Render rules:
+              - substitutes === null → still loading: render nothing
+                (the rest of the page is fine without it).
+              - substitutes.length === 0 (404 / missing config) OR no
+                track in the current window carries alt_airframe_candidates
+                (older deployment) → render a small inline note so the
+                user knows the panel is intentionally absent, not broken.
+              - otherwise → full What-If panel + business-model table. */}
         {(() => {
+          if (substitutes == null) return null  // still loading
           const anyCandidate = allRows.some(
             (r) => (r.altAirframeCandidates?.length || 0) > 0
               || (r.altSegmentCandidates?.length || 0) > 0,
           )
-          if (substitutes == null) return null  // still loading
-          if (!substitutes.length || !anyCandidate) return null
+          if (!substitutes.length || !anyCandidate) {
+            // Only surface the note once we know the listener query
+            // succeeded — empty allRows just means "no flights in window"
+            // and the user has bigger problems than the What-If panel.
+            if (allRows.length === 0) return null
+            return (
+              <Section title="What-If: quieter fleets">
+                <div className="text-xs text-white/40 leading-snug">
+                  Scenario substitution data isn't in this segments response
+                  yet — available after the next API deploy. The rest of the
+                  noise report is unaffected.
+                </div>
+              </Section>
+            )
+          }
           return (
             <Section
               title="What-If: quieter fleets"
