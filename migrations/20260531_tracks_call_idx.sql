@@ -1,0 +1,25 @@
+-- 2026-05-31 — index for /api/adsb/current-flights and /api/flights/current
+--
+-- The per-tail metadata query both endpoints run:
+--
+--   SELECT call,
+--     (array_agg(base_airport ORDER BY date DESC) FILTER (...))[1] AS base,
+--     (array_agg(purpose      ORDER BY date DESC) FILTER (...))[1] AS purpose,
+--     (array_agg(school       ORDER BY date DESC) FILTER (...))[1] AS school,
+--     (array_agg(desc_text    ORDER BY date DESC) FILTER (...))[1] AS descr
+--   FROM tracks WHERE call = ANY($1) GROUP BY call;
+--
+-- runs against tracks.call but there is no index on that column today.
+-- backfill.js declares indexes on (year, worst_class, base_airport, school,
+-- origin) — `call` was missed. On a multi-million-row `tracks` table this
+-- forces a sequential scan every request, which is the dominant slow path
+-- the kiosk team measured (72 s avg, 193 s p100 on /api/adsb/current-flights).
+--
+-- The JS-level mitigation (tail-info + response cache, this branch) hides
+-- this for steady-state polling, but the FIRST request after a cold start
+-- still pays the seq scan. Adding the index drops cold-start latency from
+-- minutes to under a second.
+--
+-- Safe to run online: CREATE INDEX CONCURRENTLY does not block writes, and
+-- IF NOT EXISTS makes the migration idempotent.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tracks_call ON tracks (call);

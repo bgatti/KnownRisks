@@ -6308,6 +6308,41 @@ function adsbApiPlugin() {
     } catch { return { tracks: [], updated_at: null } }
   }
 
+  // ── /api/adsb/current-flights memoization ─────────────────────────────
+  // The kiosk team measured 72 s avg / 193 s p100 on this endpoint. The
+  // dominant slow paths are:
+  //
+  //   1. loadLive() — full live-tracks JSON or db.loadLiveFromDb() read
+  //      and JSONB deserialization of ~600 active tracks.
+  //   2. Per-tail metadata SQL — a GROUP BY scan over the `tracks` table
+  //      that runs every request, even though base_airport/school/desc
+  //      change at most once per day.
+  //   3. classifyOneTrack() per aircraft — the phaseML/intent pipeline
+  //      executed for every track that passes the range filter.
+  //
+  // Mirroring the two-layer cache pattern from /api/flights/current
+  // (flightsApiPlugin) handles all three for the warm-cache case:
+  //
+  //   CURRENT_FLIGHTS_TAIL_INFO_TTL_MS: per-tail (base, school, purpose,
+  //   desc) row, 60 s TTL. Each request queries only tails missing from
+  //   the cache. Steady-state kiosk polling hits zero rows.
+  //
+  //   CURRENT_FLIGHTS_RESPONSE_TTL_MS: full response JSON keyed on
+  //   (airport, rangeNm, includeVisitors), 6 s TTL. The kiosk team's
+  //   real-world polling cadence is ~5–8 s; 6 s ensures the second poll
+  //   in any pair sees a warm cache, and multi-workstation polls share
+  //   one computation. Picked under the 8 s response cache used by
+  //   /api/flights/current to keep the phase data slightly fresher
+  //   since current-flights surfaces in-progress maneuvers.
+  //
+  // Both caches are in-process Maps; Railway can run multiple containers
+  // but per-container amortization is the meaningful win here. The
+  // X-Cache header (HIT/MISS) is set on every response for observability.
+  const CURRENT_FLIGHTS_TAIL_INFO_TTL_MS = 60_000
+  const currentFlightsTailInfoCache = new Map()  // call -> { row, fetchedAt }
+  const CURRENT_FLIGHTS_RESPONSE_TTL_MS = 6_000
+  const currentFlightsResponseCache = new Map()  // key -> { body, fetchedAt }
+
   const buildFlights = async (zoneConfig, fleet, filterTail, filterFrom, filterTo) => {
     const now = Date.now()
     if (now - flightsCache.ts < FLIGHTS_TTL && !filterTail && !filterFrom) {
@@ -6444,6 +6479,19 @@ function adsbApiPlugin() {
           res.setHeader('Cache-Control', 'public, max-age=5')
           if (!ap) { res.statusCode = 400; return res.end(JSON.stringify({ error: `unknown airport ${airport}` })) }
 
+          // Response cache — composite key over the query params that affect
+          // output. The kiosk team measured 72 s avg on a cold call; with
+          // CURRENT_FLIGHTS_RESPONSE_TTL_MS=6s, the second poll in any
+          // ~5–8 s polling pair is a HIT and replies in sub-millisecond
+          // time. Cached body is the final JSON string so we don't pay
+          // re-serialization either. Errors are NOT cached.
+          const cacheKey = `${airport}|${rangeNm}|${includeVisitors ? 1 : 0}`
+          const cached = currentFlightsResponseCache.get(cacheKey)
+          if (cached && Date.now() - cached.fetchedAt < CURRENT_FLIGHTS_RESPONSE_TTL_MS) {
+            res.setHeader('X-Cache', 'HIT')
+            return res.end(cached.body)
+          }
+
           const live = await loadLive()
           const tracks = live.tracks || []
           const nowMs = Date.now()
@@ -6458,17 +6506,49 @@ function adsbApiPlugin() {
           const complaintsRaw = await loadComplaintsCached()
 
           // Per-tail base lookup (same shape as other endpoints).
+          //
+          // Memoized at 60 s per tail (currentFlightsTailInfoCache, plugin
+          // scope). On each request we query Postgres only for tails missing
+          // from the cache; steady-state kiosk polling means the per-tail
+          // SQL touches ~0 rows. base_airport / school / desc_text change at
+          // most once per day, so a 60 s TTL is more than safe. Cold start
+          // pays the full GROUP BY scan once. This is the dominant slow
+          // path the kiosk team reported.
           const tails = [...new Set(tracks.map((t) => (t.call || '').trim()).filter(Boolean))]
           const info = new Map()
-          if (tails.length) {
-            const r = await db.queryDb(
-              `SELECT call,
-                 (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base,
-                 (array_agg(purpose      ORDER BY date DESC) FILTER (WHERE purpose      IS NOT NULL))[1] AS purpose,
-                 (array_agg(school       ORDER BY date DESC) FILTER (WHERE school       IS NOT NULL))[1] AS school,
-                 (array_agg(desc_text    ORDER BY date DESC) FILTER (WHERE desc_text    IS NOT NULL))[1] AS descr
-               FROM tracks WHERE call = ANY($1) GROUP BY call`, [tails])
-            for (const row of r.rows) info.set(row.call, row)
+          const tailsToFetch = []
+          const tailNowMs = Date.now()
+          for (const tail of tails) {
+            const c = currentFlightsTailInfoCache.get(tail)
+            if (c && tailNowMs - c.fetchedAt < CURRENT_FLIGHTS_TAIL_INFO_TTL_MS) {
+              if (c.row) info.set(tail, c.row)
+            } else {
+              tailsToFetch.push(tail)
+            }
+          }
+          if (tailsToFetch.length) {
+            try {
+              const r = await db.queryDb(
+                `SELECT call,
+                   (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base,
+                   (array_agg(purpose      ORDER BY date DESC) FILTER (WHERE purpose      IS NOT NULL))[1] AS purpose,
+                   (array_agg(school       ORDER BY date DESC) FILTER (WHERE school       IS NOT NULL))[1] AS school,
+                   (array_agg(desc_text    ORDER BY date DESC) FILTER (WHERE desc_text    IS NOT NULL))[1] AS descr
+                 FROM tracks WHERE call = ANY($1) GROUP BY call`, [tailsToFetch])
+              const rowByCall = new Map()
+              for (const row of r.rows) rowByCall.set(row.call, row)
+              // Cache ALL fetched tails (including tails with no matching
+              // row) so the next request doesn't re-query unknowns.
+              for (const tail of tailsToFetch) {
+                const row = rowByCall.get(tail) || null
+                currentFlightsTailInfoCache.set(tail, { row, fetchedAt: tailNowMs })
+                if (row) info.set(tail, row)
+              }
+            } catch {
+              // On DB failure don't poison the cache. Unfetched tails stay
+              // missing so the next request retries; existing cached
+              // entries remain valid.
+            }
           }
 
           // Build tail→airport map from flight_schools_fleets.json. Many
@@ -6644,7 +6724,7 @@ function adsbApiPlugin() {
           // to lat/lon-populated entries for map pins; the per-flight
           // `complaints[]` array above already covers the halo case.
           const complaintsForWindow = fsMod.recentComplaintsForKiosk(complaintsRaw, 60)
-          res.end(JSON.stringify({
+          const responseBody = JSON.stringify({
             generated_at: new Date(nowMs).toISOString(),
             airport, range_nm: rangeNm,
             count: flights.length,
@@ -6661,7 +6741,10 @@ function adsbApiPlugin() {
               geocoded_count: complaintsForWindow.filter(c => c.lat != null && c.lon != null).length,
               items: complaintsForWindow,
             },
-          }))
+          })
+          currentFlightsResponseCache.set(cacheKey, { body: responseBody, fetchedAt: Date.now() })
+          res.setHeader('X-Cache', 'MISS')
+          res.end(responseBody)
         } catch (err) {
           console.error('[adsb/current-flights] error', err)
           res.statusCode = 500
