@@ -3303,6 +3303,13 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
     }
     out.complaint_count = matched.length
     let worstK = null, maxDba = null
+    // reported_segments — Ask #11: each entry is a geocoded complaint
+    // point (NOT a polyline; complaints belong to the reporter location,
+    // not the aircraft path). Kiosk renders triangle markers + popups.
+    // Notes truncated to 140 chars (Twitter-ish) to bound wire size on
+    // outlier reports; full notes available via
+    // /api/flights/:id/complaints if needed.
+    const reportedSegments = []
     for (const c of matched) {
       const m = c.notes ? /(-?\d+(?:\.\d+)?)\s*dbfs/i.exec(c.notes) : null
       const dbfs = m ? Number(m[1]) : null
@@ -3310,9 +3317,23 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
       if (dba != null && (maxDba == null || dba > maxDba)) maxDba = dba
       const k = c.klass
       if (k && (!worstK || (VNAP_KLASS_RANK[k] || 0) > (VNAP_KLASS_RANK[worstK] || 0))) worstK = k
+      if (c.lat != null && c.lon != null) {
+        const notes = (c.notes || '').length > 140 ? c.notes.slice(0, 137) + '...' : (c.notes || null)
+        reportedSegments.push({
+          lat: c.lat,
+          lon: c.lon,
+          dba_estimate: dba,
+          klass: k || null,
+          started_at: c.startedAt || null,
+          notes,
+        })
+      }
     }
     out.complaint_dba_max = maxDba
     out.complaint_worst_klass = worstK
+    out.reported_segments = reportedSegments
+  } else {
+    out.reported_segments = []
   }
 
   // ── worst_segment — 30 s sliding window over pattern-excluded fixes ──
@@ -3733,12 +3754,12 @@ function groupCyclesIntoFlights(cycles, gapMinMs, allPts = null) {
 //              esizes ids before the server emits them; rejecting would
 //              break the queued-POST replay).
 function flightsApiPlugin() {
-  // Same shape the live-positions / flight-impact / adsb plugins use —
-  // each plugin keeps its own closure rather than sharing a module-scope
-  // helper (a low-risk dup; refactor to module scope when more than 3-4
-  // plugins need it).
-  const loadLive = async () => {
-    if (db.useDb) return db.loadLiveFromDb()
+  // Live-tracks loader. UTC-boundary correctness is enforced upstream by
+  // db.loadLiveFromDb(hoursBack) — see db.js for the architectural
+  // explanation. Pass the requested lookback through so the date range
+  // is sized to fit the actual window, not 4 h fallback.
+  const loadLive = async (hoursBack = 1) => {
+    if (db.useDb) return db.loadLiveFromDb(hoursBack)
     const fs = await import('fs/promises')
     const path = await import('path')
     try {
@@ -4253,7 +4274,9 @@ function flightsApiPlugin() {
           try { complaintsRaw = await loadComplaintsCached() } catch { complaintsRaw = [] }
 
           // ── Tracks + zones ────────────────────────────────────────────
-          const live = await loadLive()
+          // Pass landedHours through so the date range is sized for the
+          // actual window (covers UTC-midnight crossings cleanly).
+          const live = await loadLive(landedHours)
           const tracks = live.tracks || []
           const baseZones = await adsb.loadZones()
           const zoneConfig = { ...baseZones, field_elevation_ft: ap.elev }
@@ -4438,7 +4461,7 @@ function flightsApiPlugin() {
               const indFull = computeFlightIndicators(
                 grp, pts, tail, t.type, airport, complaintsRaw,
               )
-              const { worst_segment, incursion_segments, impact_index, ...indicators } = indFull
+              const { worst_segment, incursion_segments, reported_segments, impact_index, ...indicators } = indFull
 
               const inf = info.get(tail) || {}
               // Ask #7 — filter to flights registered to this school. The
@@ -4470,6 +4493,7 @@ function flightsApiPlugin() {
                 indicators,
                 worst_segment,
                 incursion_segments,
+                reported_segments,
                 impact_index,
                 lat: refPt?.[0] ?? null,
                 lon: refPt?.[1] ?? null,
