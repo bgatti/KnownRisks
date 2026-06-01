@@ -1971,7 +1971,28 @@ export default function PointNoiseReport() {
           <Section
             title={scenarioActive ? 'When does the noise happen? — peak dBA (scenario overlay)' : 'When does the noise happen? — peak dBA'}
             hint={scenarioActive
-              ? 'Grey = baseline. Coloured = what-if scenario from the sliders above.'
+              ? (() => {
+                // §11-CLIENT §12: show whether the PEAK chart actually
+                // responded to the scenario sliders, and explain it when
+                // it didn't. Peak in each hour is driven by the loudest
+                // pass — if that pass is a non-substituted aircraft
+                // (typical when only training is being swapped), the
+                // colour stays put. Compute the per-hour peak delta to
+                // surface the response (or honest lack thereof).
+                let movedHours = 0, totalPeakDrop = 0, hoursWithPasses = 0
+                for (let h = 0; h < 24; h++) {
+                  const b = hourlyBuckets[h]; const sb = scenarioHourly[h]
+                  if (!b || b.count === 0) continue
+                  hoursWithPasses++
+                  const drop = b.peakDba - (sb?.peakDba || 0)
+                  if (drop > 0.5) { movedHours++; totalPeakDrop += drop }
+                }
+                if (movedHours === 0) {
+                  return 'Grey = baseline. No hour\'s peak changed — the loudest pass each hour is a non-substituted aircraft. Look at the avg-dBA chart below for the typical-pass impact.'
+                }
+                const avgDrop = (totalPeakDrop / movedHours).toFixed(1)
+                return `Grey = baseline. Coloured = scenario. ${movedHours} of ${hoursWithPasses} hours got a quieter peak (avg −${avgDrop} dBA).`
+              })()
               : 'Bar = passes that hour · colour = LOUDEST single pass in that hour'}
           >
             <HourlyChart
@@ -2043,8 +2064,30 @@ export default function PointNoiseReport() {
             in an otherwise empty hour spikes the peak chart but not this
             one. */}
         <Section
-          title="When does the noise happen? — average dBA"
-          hint="Same bars (passes per local hour) but colour = AVERAGE dBA of those passes, so a busy quiet hour looks different from a single-loud-pass hour"
+          title={scenarioActive ? 'When does the noise happen? — average dBA (scenario overlay)' : 'When does the noise happen? — average dBA'}
+          hint={scenarioActive
+            ? (() => {
+              // §11-CLIENT §12: average pulls down whenever any pass in
+              // an hour gets quieter, so this chart is much more
+              // responsive to training-purpose substitutions than the
+              // peak chart above. Surface the avg drop so the user sees
+              // the substitution working here even when the peak chart
+              // looks frozen.
+              let movedHours = 0, totalDrop = 0, hoursWithPasses = 0
+              for (let h = 0; h < 24; h++) {
+                const b = hourlyBuckets[h]; const sb = scenarioHourly[h]
+                if (!b || b.count === 0) continue
+                hoursWithPasses++
+                const baseMean = b.count > 0 ? b.sumDba / b.count : 0
+                const scnMean = sb && sb.count > 0 ? sb.sumDba / sb.count : 0
+                const drop = baseMean - scnMean
+                if (drop > 0.5) { movedHours++; totalDrop += drop }
+              }
+              if (movedHours === 0) return 'Grey = baseline. No hour\'s average changed materially.'
+              const avgDrop = (totalDrop / movedHours).toFixed(1)
+              return `Grey = baseline. Coloured = scenario. ${movedHours} of ${hoursWithPasses} hours got a quieter mean (avg −${avgDrop} dBA across all passes).`
+            })()
+            : 'Same bars (passes per local hour) but colour = AVERAGE dBA of those passes, so a busy quiet hour looks different from a single-loud-pass hour'}
         >
           <HourlyChart
             buckets={hourlyBuckets}
