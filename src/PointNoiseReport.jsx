@@ -7,12 +7,14 @@ import { isEnginelessType, distFt } from './geo'
 // external consumer that was importing them off PointNoiseReport.jsx.
 import {
   pickSubstituted,
+  pickEliminated,
   shouldWinchSegment,
   segmentDba,
   npv,
   businessModelColumn,
+  regulatoryColumn,
 } from './whatif.js'
-export { pickSubstituted, shouldWinchSegment, segmentDba, npv, businessModelColumn }
+export { pickSubstituted, pickEliminated, shouldWinchSegment, segmentDba, npv, businessModelColumn, regulatoryColumn }
 
 /* SVG-pin DivIcon for the map pin. Drawn at 26×34 with anchor at base. */
 const PIN_ICON = L.divIcon({
@@ -433,7 +435,111 @@ function dbaBandColor(d) {
  *            of mostly-quiet passes vs. a busy hour with a couple of jets)
  *
  * `highlightHour` (optional) dims every other bar so the peak hour stands out.
+ *
+ * §11-CLIENT §13: still used by the AVERAGE-dBA hourly chart. The PEAK
+ * variant was retired in favour of HourlyDbaBandsChart (see below) which
+ * responds to substitutions in a way the peak metric structurally can't.
  */
+const DBA_BANDS = [
+  { lo: 0,  hi: 50,  label: '< 50',  color: '#1e40af' },
+  { lo: 50, hi: 55,  label: '50–54', color: '#38bdf8' },
+  { lo: 55, hi: 65,  label: '55–64', color: '#facc15' },
+  { lo: 65, hi: 75,  label: '65–74', color: '#fb923c' },
+  { lo: 75, hi: 999, label: '≥ 75',  color: '#f87171' },
+]
+function dbaBandIndex(dba) {
+  for (let i = DBA_BANDS.length - 1; i >= 0; i--) {
+    if (dba >= DBA_BANDS[i].lo) return i
+  }
+  return 0
+}
+function bucketizeHourlyBands(rows) {
+  const buckets = Array.from({ length: 24 }, () => ({
+    count: 0,
+    bands: new Array(DBA_BANDS.length).fill(0),
+  }))
+  if (!rows) return buckets
+  for (const r of rows) {
+    if (r.closestTs == null) continue
+    const h = new Date(r.closestTs).getHours()
+    const b = buckets[h]
+    b.count++
+    b.bands[dbaBandIndex(r.dba)]++
+  }
+  return buckets
+}
+function HourlyDbaBandsChart({ buckets, scenarioBuckets, caption }) {
+  const scenarioOn = Array.isArray(scenarioBuckets) && scenarioBuckets.length === 24
+  const max = Math.max(
+    1,
+    ...buckets.map((b) => b.count),
+    ...(scenarioOn ? scenarioBuckets.map((b) => b.count) : []),
+  )
+  const W = 720, H = 220, padBottom = 44, padTop = 44, padX = 24
+  const colW = (W - padX * 2) / 24
+  const usableH = H - padBottom - padTop
+  const renderStack = (b, x, w, opacity, keyPrefix) => {
+    if (!b || b.count === 0) return null
+    let y = H - padBottom
+    return DBA_BANDS.map((band, i) => {
+      const n = b.bands[i] || 0
+      if (n === 0) return null
+      const segH = (n / max) * usableH
+      const rect = (
+        <rect key={`${keyPrefix}-${i}`} x={x} y={y - segH} width={w} height={segH}
+          fill={band.color} opacity={opacity}>
+          <title>{`${keyPrefix} ${band.label} dBA: ${n} pass${n === 1 ? '' : 'es'}`}</title>
+        </rect>
+      )
+      y -= segH
+      return rect
+    })
+  }
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full">
+      {buckets.map((b, h) => {
+        const x = padX + h * colW
+        const sb = scenarioOn ? scenarioBuckets[h] : null
+        const halfW = (colW - 2) / 2
+        const fullW = colW - 2
+        return (
+          <g key={h}>
+            {scenarioOn
+              ? <>
+                  {renderStack(b, x + 1, halfW, 0.5, `baseline ${formatHour12(h)}`)}
+                  {renderStack(sb, x + 1 + halfW, halfW, 1, `scenario ${formatHour12(h)}`)}
+                </>
+              : renderStack(b, x + 1, fullW, 1, `${formatHour12(h)}`)}
+            {h % 3 === 0 && (
+              <text x={x + colW / 2} y={H - 14} textAnchor="middle"
+                fill="rgba(255,255,255,0.7)" fontSize="18" fontFamily="ui-monospace, monospace">
+                {formatHour12(h)}
+              </text>
+            )}
+            {b.count > 0 && (b.count / max) * usableH > 22 && (
+              <text x={x + colW / 2} y={H - padBottom - (b.count / max) * usableH - 5}
+                textAnchor="middle" fill="rgba(255,255,255,0.85)"
+                fontSize="14" fontFamily="ui-monospace, monospace">
+                {b.count}
+              </text>
+            )}
+          </g>
+        )
+      })}
+      <line x1={padX} y1={H - padBottom} x2={W - padX} y2={H - padBottom} stroke="rgba(255,255,255,0.15)" />
+      <text x={padX} y={16} fill="rgba(255,255,255,0.6)" fontSize="14">{caption}</text>
+      <g transform={`translate(${padX}, 28)`}>
+        {DBA_BANDS.map((band, i) => (
+          <g key={i} transform={`translate(${i * 90}, 0)`}>
+            <rect x={0} y={0} width={12} height={10} fill={band.color} />
+            <text x={16} y={9} fill="rgba(255,255,255,0.65)" fontSize="11">{band.label}</text>
+          </g>
+        ))}
+      </g>
+    </svg>
+  )
+}
+
 function HourlyChart({ buckets, highlightHour, colorBy = 'peak', caption, scenarioBuckets }) {
   // Font sizes are in viewBox units; the SVG scales down to fit its container
   // (typically ~480 px wide for the 720-unit viewBox = 0.67× scale). Tick
@@ -822,11 +928,28 @@ function BusinessModelTable({ cols, dbDelta }) {
           </tr>
         </thead>
         <tbody>
+          {/* §11-CLIENT V2 §4: Mechanism row — distinguishes airframe-swap
+              columns ("Airframe substitution") from regulatory ones
+              ("Regulatory rollback" / "FAA Part 61 rulemaking + per-school
+              FTD"). Helps the reader interpret the CapEx + savings rows. */}
+          <tr className="border-t border-white/10">
+            <td className="py-1.5 px-3 text-white/70">Mechanism</td>
+            {cols.map((c) => (
+              <td key={c.code} className="text-right px-3 text-xs text-white/60">
+                {c.mechanism || '—'}
+              </td>
+            ))}
+          </tr>
           <tr className="border-t border-white/10">
             <td className="py-1.5 px-3 text-white/70">CapEx</td>
             {cols.map((c) => (
-              <td key={c.code} className="text-right px-3 tabular-nums">
+              <td key={c.code} className="text-right px-3 tabular-nums" title={c.capexNote || ''}>
                 {fmtUsd(-c.capex)}
+                {c.capexNote && (
+                  <div className="text-[10px] text-white/40 normal-case font-normal">
+                    {c.capexNote}
+                  </div>
+                )}
               </td>
             ))}
           </tr>
@@ -906,50 +1029,111 @@ function BusinessModelTable({ cols, dbDelta }) {
  *  it for the overlay histogram + business-model table), but the
  *  Advanced disclosure's open/closed state is purely local. */
 function WhatIfPanel({ scenario, setScenario, substitutes, businessModelCols, dbDelta }) {
+  // Kept as a single back-compat shell that renders sliders + financials
+  // stacked, for any caller still using the original API. New callers
+  // should use `WhatIfSliders` (the four headline sliders, suitable for
+  // the docked panel) and `WhatIfFinancials` (advanced knobs + business-
+  // model table) separately so the sliders can be locked at the bottom
+  // of the viewport while the financials scroll with the page.
+  return (
+    <div className="space-y-4">
+      <WhatIfSliders scenario={scenario} setScenario={setScenario} substitutes={substitutes} />
+      <WhatIfFinancials scenario={scenario} setScenario={setScenario} substitutes={substitutes} businessModelCols={businessModelCols} dbDelta={dbDelta} />
+    </div>
+  )
+}
+
+/** §11-CLIENT §11: Just the four headline what-if sliders.
+ *  This is what the docked bottom panel renders. Compact 2×2 grid so the
+ *  panel stays short (~140 px tall) even on narrow screens.
+ */
+function WhatIfSliders({ scenario, setScenario, substitutes }) {
+  const update = (patch) => setScenario((s) => ({ ...s, ...patch }))
+  const subVele = findSub(substitutes, 'VELE')
+  const subEfox = findSub(substitutes, 'EFOX')
+  const subSinu = findSub(substitutes, 'SINU')
+  const subWnch = findSub(substitutes, 'WNCH')
+  // §11-CLIENT V2 §3: regulatory demand-reduction substitutes (track_eliminate
+  // scope). Slider is "% of max effect" (intuitive policy-uptake meter);
+  // max_reduction_pct lives in the substitute config so the realistic
+  // industry-response cap is tunable without a code change.
+  const subAtpr = findSub(substitutes, 'ATPR')
+  const subSimx = findSub(substitutes, 'SIMX')
+  const fmtReduction = (sub) => (v) => {
+    const max = Number(sub?.max_reduction_pct) || 0
+    if (v === 0 || max === 0) return `${v}%`
+    const effective = (v * max) / 100
+    return `${v}% → ${effective.toFixed(0)}% reduction`
+  }
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+      <Slider
+        label={`Electric trainer % (${subVele?.name || 'VELE'})`}
+        value={scenario.electric_pct}
+        min={0} max={100} step={5}
+        onChange={(v) => update({ electric_pct: v })}
+        fmt={(v) => `${v}%`}
+      />
+      <Slider
+        label={`Eurofox tow % (${subEfox?.name || 'EFOX'})`}
+        value={scenario.eurofox_pct}
+        min={0} max={100} step={5}
+        onChange={(v) => update({ eurofox_pct: v })}
+        fmt={(v) => `${v}%`}
+      />
+      <Slider
+        label={`Sinus glider % (${subSinu?.name || 'SINU'})`}
+        value={scenario.sinus_pct}
+        min={0} max={100} step={5}
+        onChange={(v) => update({ sinus_pct: v })}
+        fmt={(v) => `${v}%`}
+      />
+      <Slider
+        label={`Winch under N ft AGL (${subWnch?.name || 'WNCH'})`}
+        value={scenario.winch_agl_ft}
+        min={0} max={3000} step={100}
+        onChange={(v) => update({ winch_agl_ft: v })}
+        fmt={(v) => (v === 0 ? 'off' : `${v.toLocaleString()} ft`)}
+      />
+      {subAtpr && (
+        <Slider
+          label={`ATP rollback % (${subAtpr.name || 'ATPR'})`}
+          value={scenario.atpr_pct}
+          min={0} max={100} step={5}
+          onChange={(v) => update({ atpr_pct: v })}
+          fmt={fmtReduction(subAtpr)}
+        />
+      )}
+      {subSimx && (
+        <Slider
+          label={`Simulator expansion % (${subSimx.name || 'SIMX'})`}
+          value={scenario.simx_pct}
+          min={0} max={100} step={5}
+          onChange={(v) => update({ simx_pct: v })}
+          fmt={fmtReduction(subSimx)}
+        />
+      )}
+    </div>
+  )
+}
+
+/** §11-CLIENT §11: financial knobs (advanced disclosure) + business-model
+ *  table. Renders inline below the noise graphs, where reading capex /
+ *  NPV / break-even numbers benefits from scrolling and a stable layout.
+ */
+function WhatIfFinancials({ scenario, setScenario, substitutes, businessModelCols, dbDelta }) {
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const update = (patch) => setScenario((s) => ({ ...s, ...patch }))
   const updateHours = (code, hours) => setScenario((s) => ({
     ...s,
     annual_hours_override: { ...s.annual_hours_override, [code]: hours },
   }))
-  // Sub registry lookups — used to display the per-substitute default for
-  // the "Annual hours per airframe" knobs and the descriptive blurbs.
   const subVele = findSub(substitutes, 'VELE')
   const subEfox = findSub(substitutes, 'EFOX')
   const subSinu = findSub(substitutes, 'SINU')
   const subWnch = findSub(substitutes, 'WNCH')
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        <Slider
-          label={`Electric trainer % (${subVele?.name || 'VELE'})`}
-          value={scenario.electric_pct}
-          min={0} max={100} step={5}
-          onChange={(v) => update({ electric_pct: v })}
-          fmt={(v) => `${v}%`}
-        />
-        <Slider
-          label={`Eurofox tow % (${subEfox?.name || 'EFOX'})`}
-          value={scenario.eurofox_pct}
-          min={0} max={100} step={5}
-          onChange={(v) => update({ eurofox_pct: v })}
-          fmt={(v) => `${v}%`}
-        />
-        <Slider
-          label={`Sinus glider % (${subSinu?.name || 'SINU'})`}
-          value={scenario.sinus_pct}
-          min={0} max={100} step={5}
-          onChange={(v) => update({ sinus_pct: v })}
-          fmt={(v) => `${v}%`}
-        />
-        <Slider
-          label={`Winch under N ft AGL (${subWnch?.name || 'WNCH'})`}
-          value={scenario.winch_agl_ft}
-          min={0} max={3000} step={100}
-          onChange={(v) => update({ winch_agl_ft: v })}
-          fmt={(v) => (v === 0 ? 'off' : `${v.toLocaleString()} ft`)}
-        />
-      </div>
       <Disclosure
         open={advancedOpen}
         onToggle={() => setAdvancedOpen((x) => !x)}
@@ -983,7 +1167,6 @@ function WhatIfPanel({ scenario, setScenario, substitutes, businessModelCols, db
           fuel halves?", 2.0× to ask "what if it doubles?". Discount rate +
           time horizon feed the NPV formula.
         </div>
-        {/* Per-substitute annual-hours overrides — one row each. */}
         <div className="space-y-3 pt-2 border-t border-white/5">
           <div className="text-[10px] uppercase tracking-wide text-white/40">
             Annual hours per airframe (override per substitute)
@@ -1005,9 +1188,6 @@ function WhatIfPanel({ scenario, setScenario, substitutes, businessModelCols, db
           })}
         </div>
       </Disclosure>
-      {/* §11-CLIENT §7: business-model table — only renders when at least
-          one substitute is active. dB delta is supplied by the parent
-          (baseline peak minus scenario peak at the listener). */}
       {businessModelCols && businessModelCols.length > 0 && (
         <div className="space-y-2">
           <div className="text-xs uppercase tracking-wide text-white/60">
@@ -1105,23 +1285,25 @@ function TimeWindowChips({ value, onChange, disabled }) {
 
 /* ───────────────────────── loading skeleton ────────────────────────── */
 
-function LoadingSkeleton({ hours, radiusNm }) {
+function LoadingSkeleton({ hours, radiusNm, stage }) {
+  const isRetry = stage === 'retry'
   return (
     <div className="border border-white/10 rounded-lg p-8 bg-white/[0.02] text-center space-y-4">
       <div className="inline-block">
-        <svg width="36" height="36" viewBox="0 0 36 36" className="animate-spin text-sky-400">
+        <svg width="36" height="36" viewBox="0 0 36 36" className={'animate-spin ' + (isRetry ? 'text-amber-400' : 'text-sky-400')}>
           <circle cx="18" cy="18" r="14" stroke="currentColor" strokeWidth="3" strokeLinecap="round"
             fill="none" strokeDasharray="60" strokeDashoffset="20" opacity="0.8" />
         </svg>
       </div>
       <div className="text-sm text-white/80">
-        Pulling {hours}&nbsp;h of tracks within {radiusNm.toFixed(1)}&nbsp;nm of the pin…
+        {isRetry
+          ? <>First call timed out (cold cache). Retrying automatically…</>
+          : <>Pulling {hours}&nbsp;h of tracks within {radiusNm.toFixed(1)}&nbsp;nm of the pin…</>}
       </div>
       <div className="text-xs text-white/40 max-w-md mx-auto leading-snug">
-        Cold queries against Railway Postgres take 5–30&nbsp;s today
-        (see API_REQUEST.md). Wider windows or radii are slower. If this
-        hangs past 60&nbsp;s, the server query timed out — try a smaller
-        window.
+        {isRetry
+          ? <>The second hit usually lands in 5–7 s once the table cache is warm. See API_REQUEST.md § 1 for the server-side fix.</>
+          : <>Cold queries against Railway Postgres take 5–30&nbsp;s today (see API_REQUEST.md § 1). On a cold-cache 500 the page auto-retries once before surfacing an error.</>}
       </div>
     </div>
   )
@@ -1207,6 +1389,11 @@ export default function PointNoiseReport() {
     eurofox_pct: 0,
     sinus_pct: 0,
     winch_agl_ft: 0,
+    // §11-CLIENT V2: regulatory demand-reduction sliders (track_eliminate
+    // scope). Slider value 0..100 maps linearly to 0..max_reduction_pct
+    // from substitutes.json — ATPR caps at 60%, SIMX at 30%.
+    atpr_pct: 0,
+    simx_pct: 0,
     rate: 0.05,
     horizon_yr: 10,
     fuel_multiplier: 1.0,
@@ -1248,22 +1435,41 @@ export default function PointNoiseReport() {
   const [appliedHours, setAppliedHours] = useState(q.hours)
   const [appliedRadius, setAppliedRadius] = useState(q.radiusNm)
 
+  const [loadingStage, setLoadingStage] = useState(null) // null | 'first' | 'retry'
   const runReport = () => {
     if (abortRef.current) abortRef.current.abort()
     const ctrl = new AbortController()
     abortRef.current = ctrl
-    setLoading(true); setError(null)
+    setLoading(true); setError(null); setLoadingStage('first')
     setListener({ lat, lon, elev_ft: elevFt })
     setAppliedHours(windowHours); setAppliedRadius(radiusNm)
-    fetchSegmentsSameOrigin({
-      lat, lng: lon, hours: windowHours, limit: 500, radiusNm: radiusNm, signal: ctrl.signal,
+    const params = { lat, lng: lon, hours: windowHours, limit: 500, radiusNm: radiusNm, signal: ctrl.signal }
+    const succeed = (data) => { setRaw(data); setLoading(false); setLoadingStage(null) }
+    const fail = (e) => {
+      if (e.name === 'AbortError') return
+      setError(String(e.message || e))
+      setLoading(false); setLoadingStage(null)
+    }
+    // Cold-cache 500s on this endpoint are the rule, not the exception —
+    // see API_REQUEST.md § 1 (`pg-pool Query read timeout` on first hit;
+    // the second call lands in 5–7 s once the table cache is warm). Auto-
+    // retry once on 500/504/timeout-shaped errors before surfacing the
+    // failure to the user. A non-5xx error (404/400/network) skips the
+    // retry — those won't recover.
+    const isRetryableErr = (e) => /\b(500|502|503|504|timeout|failed to fetch)\b/i.test(String(e.message || e))
+    fetchSegmentsSameOrigin(params).then(succeed).catch((e) => {
+      if (e.name === 'AbortError' || ctrl.signal.aborted) return
+      if (!isRetryableErr(e)) return fail(e)
+      setLoadingStage('retry')
+      // Brief delay so the pool's in-flight query has a chance to drain
+      // before we slam it again — also lets the cache start populating.
+      setTimeout(() => {
+        if (ctrl.signal.aborted) return
+        fetchSegmentsSameOrigin({ ...params, signal: ctrl.signal })
+          .then(succeed)
+          .catch((err) => { if (err.name !== 'AbortError') fail(err) })
+      }, 1500)
     })
-      .then((data) => { setRaw(data); setLoading(false) })
-      .catch((e) => {
-        if (e.name === 'AbortError') return
-        setError(String(e.message || e))
-        setLoading(false)
-      })
   }
 
   // auto-fetch on initial mount
@@ -1331,6 +1537,10 @@ export default function PointNoiseReport() {
     if (p.has('eurofox'))   next.eurofox_pct     = num('eurofox', 0)
     if (p.has('sinus'))     next.sinus_pct       = num('sinus', 0)
     if (p.has('winch_agl')) next.winch_agl_ft    = num('winch_agl', 0)
+    // §11-CLIENT V2: regulatory demand-reduction keys (parsed on mount; written
+    // back in the corresponding history.replaceState effect below).
+    if (p.has('atpr'))      next.atpr_pct        = num('atpr', 0)
+    if (p.has('simx'))      next.simx_pct        = num('simx', 0)
     if (p.has('disc'))      next.rate            = num('disc', 5) / 100
     if (p.has('horizon'))   next.horizon_yr      = num('horizon', 10)
     if (p.has('fuel'))      next.fuel_multiplier = num('fuel', 1)
@@ -1347,6 +1557,10 @@ export default function PointNoiseReport() {
       eurofox:   String(scenario.eurofox_pct),
       sinus:     String(scenario.sinus_pct),
       winch_agl: String(scenario.winch_agl_ft),
+      // §11-CLIENT V2 §5: serialize regulatory demand-reduction sliders so
+      // the URL stays a shareable canonical of "the scenario I'm looking at".
+      atpr:      String(scenario.atpr_pct),
+      simx:      String(scenario.simx_pct),
       disc:      (scenario.rate * 100).toFixed(1),
       horizon:   String(scenario.horizon_yr),
       fuel:      scenario.fuel_multiplier.toFixed(2),
@@ -1359,6 +1573,8 @@ export default function PointNoiseReport() {
     scenario.eurofox_pct,
     scenario.sinus_pct,
     scenario.winch_agl_ft,
+    scenario.atpr_pct,
+    scenario.simx_pct,
     scenario.rate,
     scenario.horizon_yr,
     scenario.fuel_multiplier,
@@ -1492,6 +1708,14 @@ export default function PointNoiseReport() {
     return buckets
   }, [filteredRows])
 
+  // §11-CLIENT §13: per-hour × per-dBA-band counts for the stacked-bands
+  // hourly chart (the one that replaced the peak-coloured variant).
+  // Pre-bucketise once per filtered-rows change so the SVG render is cheap.
+  const hourlyBandBuckets = useMemo(
+    () => bucketizeHourlyBands(filteredRows),
+    [filteredRows],
+  )
+
   // §11-CLIENT §6: scenario overlay. Pick the substituted tail Sets from
   // the slider state, then re-aggregate the histogram using the scenario-
   // world per-row dBA. When every slider is at default this is a no-op
@@ -1501,7 +1725,47 @@ export default function PointNoiseReport() {
     || scenario.eurofox_pct > 0
     || scenario.sinus_pct > 0
     || scenario.winch_agl_ft > 0
+    || scenario.atpr_pct > 0
+    || scenario.simx_pct > 0
   )
+  // §11-CLIENT V2 §2b: regulatory demand-reduction picks the tails whose
+  // tracks disappear entirely (the regulatory demand for those flights
+  // dropped — no airframe substitution, the flight simply doesn't happen).
+  // Computed against the full row pool so it stays stable when the user
+  // nudges the dBA-floor / purpose filter; the active filters still apply
+  // downstream via filteredRows. Eliminate wins over any airframe
+  // substitution (a track can be both VELE-picked and ATPR-eliminated
+  // — the latter just means it doesn't fly at all).
+  const eliminatedTails = useMemo(() => {
+    if (!substitutes?.length) return new Set()
+    const set = new Set()
+    pickEliminated(allRows, 'ATPR', scenario.atpr_pct, substitutes).forEach((t) => set.add(t))
+    pickEliminated(allRows, 'SIMX', scenario.simx_pct, substitutes).forEach((t) => set.add(t))
+    return set
+  }, [allRows, scenario.atpr_pct, scenario.simx_pct, substitutes])
+
+  // §11-CLIENT V2: gate for "this window has any substitution-eligible track"
+  // — hoisted out of the two render sites that decide whether to show the
+  // What-If panel / financial section. Airframe-candidates AND/OR a training
+  // track that ATPR/SIMX could eliminate both count.
+  const whatIfApplicable = useMemo(() => {
+    if (!Array.isArray(substitutes) || substitutes.length === 0) {
+      return { anyAirframeCand: false, anyEliminateCand: false }
+    }
+    const anyAirframeCand = allRows.some(
+      (r) => (r.altAirframeCandidates?.length || 0) > 0
+        || (r.altSegmentCandidates?.length || 0) > 0,
+    )
+    const eliminatePurposes = new Set()
+    for (const s of substitutes) {
+      if (s?.scope === 'track_eliminate') {
+        for (const p of s.replaces_purposes || []) eliminatePurposes.add(p)
+      }
+    }
+    const anyEliminateCand = eliminatePurposes.size > 0
+      && allRows.some((r) => r.purpose && eliminatePurposes.has(r.purpose))
+    return { anyAirframeCand, anyEliminateCand }
+  }, [allRows, substitutes])
   const scenarioPicks = useMemo(() => {
     // Use the full row set (not filteredRows) as the substitution pool so
     // the picked tails are stable when the user nudges the dBA-floor or
@@ -1538,10 +1802,19 @@ export default function PointNoiseReport() {
   // Scenario rows — same filters as filteredRows but with per-row dBA
   // replaced by applyScenarioToRow(). When scenarioActive=false this is
   // a thin pass-through (the helper short-circuits unsubstituted rows).
+  //
+  // §11-CLIENT V2 §2b: regulatory demand-reduction tracks are dropped
+  // *before* the per-row scenario projection runs — they don't contribute
+  // any dBA to the scenario histogram at all (the flight simply doesn't
+  // happen). Baseline `filteredRows` is unchanged so the baseline bars
+  // still show what actually flew.
   const scenarioRows = useMemo(() => {
     if (!scenarioActive) return filteredRows
-    return filteredRows.map((r) => applyScenarioToRow(r, scenarioCtx, listener))
-  }, [filteredRows, scenarioCtx, listener, scenarioActive])
+    const survivors = eliminatedTails.size > 0
+      ? filteredRows.filter((r) => !eliminatedTails.has(r.tail))
+      : filteredRows
+    return survivors.map((r) => applyScenarioToRow(r, scenarioCtx, listener))
+  }, [filteredRows, scenarioCtx, listener, scenarioActive, eliminatedTails])
 
   const scenarioHourly = useMemo(() => {
     const buckets = Array.from({ length: 24 }, () => ({ count: 0, peakDba: 0, sumDba: 0 }))
@@ -1557,6 +1830,13 @@ export default function PointNoiseReport() {
     return buckets
   }, [scenarioRows, scenarioActive])
 
+  // §11-CLIENT §13: scenario-world per-hour × per-band counts. Drives the
+  // right-half stack of the stacked-bands chart when scenario is active.
+  const scenarioHourlyBandBuckets = useMemo(
+    () => scenarioActive ? bucketizeHourlyBands(scenarioRows) : null,
+    [scenarioRows, scenarioActive],
+  )
+
   // §11-CLIENT §7: listener-side peak drop — baseline peak minus scenario
   // peak across the filtered window. Used by both the business-model table
   // (NPV $/dB column) and the WhatIfPanel header.
@@ -1568,8 +1848,25 @@ export default function PointNoiseReport() {
     return Math.max(0, basePeak - scnPeak)
   }, [scenarioActive, filteredRows, scenarioRows])
 
+  // §11-CLIENT V2 §4: distinct schools among the eliminated tracks — drives
+  // the SIMX `N_schools_affected` (one FTD per school). When none of the
+  // eliminated tracks carry a `school` attribute (typical when the fleet
+  // roster doesn't cover them), default to 1 so the column still renders
+  // with a coherent capex number.
+  const schoolsAffected = useMemo(() => {
+    if (eliminatedTails.size === 0) return 0
+    const schools = new Set()
+    for (const r of allRows) {
+      if (!eliminatedTails.has(r.tail)) continue
+      if (r.school) schools.add(r.school)
+    }
+    return schools.size > 0 ? schools.size : 1
+  }, [allRows, eliminatedTails])
+
   // §11-CLIENT §7: business-model table. One column per active substitute
-  // (slider > 0).
+  // (slider > 0). V2 adds ATPR + SIMX (regulatory demand-reduction) via a
+  // separate builder — their NPV shape differs from airframe substitutes
+  // (no per-airframe capex; ATPR is purely an advocacy line item).
   const businessModelCols = useMemo(() => {
     if (!scenarioActive || !substitutes?.length) return []
     const cols = []
@@ -1588,8 +1885,26 @@ export default function PointNoiseReport() {
     slot('EFOX', scenario.eurofox_pct)
     slot('SINU', scenario.sinus_pct)
     slot('WNCH', scenario.winch_agl_ft, true)
+    // §11-CLIENT V2 §4: regulatory demand-reduction columns. Show only when
+    // the slider is active AND it actually eliminated at least one track in
+    // the current window. nSchoolsAffected sizes the FTD capex for SIMX;
+    // ATPR ignores it (advocacy capex is one-time).
+    const regSlot = (code, pct) => {
+      if (!pct || pct <= 0) return
+      const sub = findSub(substitutes, code)
+      if (!sub) return
+      if (eliminatedTails.size === 0) return
+      const col = regulatoryColumn({
+        sub, scenario,
+        nSchoolsAffected: Math.max(1, schoolsAffected),
+        dbDelta,
+      })
+      if (col) cols.push(col)
+    }
+    regSlot('ATPR', scenario.atpr_pct)
+    regSlot('SIMX', scenario.simx_pct)
     return cols
-  }, [scenarioActive, substitutes, scenarioPicks, winchTracks, scenario, dbDelta])
+  }, [scenarioActive, substitutes, scenarioPicks, winchTracks, scenario, dbDelta, eliminatedTails, schoolsAffected])
 
   const peakHour = useMemo(() => {
     let h = -1, best = -Infinity
@@ -1709,9 +2024,22 @@ export default function PointNoiseReport() {
     })
   }
 
+  // §11-CLIENT §11: docked slider panel can be collapsed to a thin strip
+  // so it doesn't hide the bottom of the page when the user is reading
+  // the methodology / footer. Default open when scenario is active so the
+  // user can see what they're tweaking; default open generally too —
+  // collapsing is opt-in.
+  const [dockOpen, setDockOpen] = useState(true)
+
   return (
     <div className="min-h-screen bg-neutral-950 text-white">
-      <div className="max-w-6xl mx-auto px-4 py-5 space-y-4">
+      {/* Bottom padding leaves room for the docked slider panel so the
+          final section isn't covered. ~190 px = open panel height; ~36 px
+          when collapsed. */}
+      <div
+        className="max-w-6xl mx-auto px-4 py-5 space-y-4"
+        style={{ paddingBottom: dockOpen ? 200 : 56 }}
+      >
         <header>
           <h1 className="text-2xl font-semibold">Point noise report</h1>
           <p className="text-sm text-white/50 mt-1">
@@ -1855,7 +2183,7 @@ export default function PointNoiseReport() {
         {/* Status: error first, then loading skeleton replacing all results. */}
         {error && <ErrorBox message={error} onRetry={runReport} />}
 
-        {loading && !error && <LoadingSkeleton hours={windowHours} radiusNm={radiusNm} />}
+        {loading && !error && <LoadingSkeleton hours={windowHours} radiusNm={radiusNm} stage={loadingStage} />}
 
         {!loading && !error && (
         <>
@@ -1892,52 +2220,6 @@ export default function PointNoiseReport() {
           />
         </div>
 
-        {/* §11-CLIENT §3 + §9: What-If panel.
-            Render rules:
-              - substitutes === null → still loading: render nothing
-                (the rest of the page is fine without it).
-              - substitutes.length === 0 (404 / missing config) OR no
-                track in the current window carries alt_airframe_candidates
-                (older deployment) → render a small inline note so the
-                user knows the panel is intentionally absent, not broken.
-              - otherwise → full What-If panel + business-model table. */}
-        {(() => {
-          if (substitutes == null) return null  // still loading
-          const anyCandidate = allRows.some(
-            (r) => (r.altAirframeCandidates?.length || 0) > 0
-              || (r.altSegmentCandidates?.length || 0) > 0,
-          )
-          if (!substitutes.length || !anyCandidate) {
-            // Only surface the note once we know the listener query
-            // succeeded — empty allRows just means "no flights in window"
-            // and the user has bigger problems than the What-If panel.
-            if (allRows.length === 0) return null
-            return (
-              <Section title="What-If: quieter fleets">
-                <div className="text-xs text-white/40 leading-snug">
-                  Scenario substitution data isn't in this segments response
-                  yet — available after the next API deploy. The rest of the
-                  noise report is unaffected.
-                </div>
-              </Section>
-            )
-          }
-          return (
-            <Section
-              title="What-If: quieter fleets"
-              hint="Drag a slider to swap a fraction of the current fleet for a quieter alternative. All math is client-side — sliders update the overlay histogram + business-model table instantly."
-            >
-              <WhatIfPanel
-                scenario={scenario}
-                setScenario={setScenario}
-                substitutes={substitutes}
-                businessModelCols={businessModelCols}
-                dbDelta={dbDelta}
-              />
-            </Section>
-          )
-        })()}
-
         {/* Purpose rollup — the headline */}
         <Section
           title="Why was this noise here? — by purpose"
@@ -1951,20 +2233,39 @@ export default function PointNoiseReport() {
           />
         </Section>
 
-        {/* Hourly (peak-coloured) + dBA distribution side by side */}
+        {/* Hourly (stacked dBA bands) + dBA distribution side by side.
+            §11-CLIENT §13: replaced the peak-coloured chart with a
+            stacked-bands variant — every substitution that pushes a
+            pass into a quieter band is visible as band-segment growth,
+            so the chart is responsive to substitutions even when
+            per-hour peak is unchanged. */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <Section
-            title={scenarioActive ? 'When does the noise happen? — peak dBA (scenario overlay)' : 'When does the noise happen? — peak dBA'}
+            title={scenarioActive ? 'When does the noise happen? — by dBA band (scenario)' : 'When does the noise happen? — by dBA band'}
             hint={scenarioActive
-              ? 'Grey = baseline. Coloured = what-if scenario from the sliders above.'
-              : 'Bar = passes that hour · colour = LOUDEST single pass in that hour'}
+              ? (() => {
+                // Count how many flights moved INTO a quieter band under
+                // the scenario. That's the metric this chart was designed
+                // around — every substitution that drops a pass from
+                // (e.g.) 70-74 to 60-64 is one "quieted" flight.
+                let quieted = 0
+                for (let h = 0; h < 24; h++) {
+                  const b = hourlyBandBuckets[h]; const sb = scenarioHourlyBandBuckets?.[h]
+                  if (!b || !sb) continue
+                  // Walk loud→quiet; sum the positive shifts away from loud bands.
+                  for (let i = DBA_BANDS.length - 1; i > 0; i--) {
+                    const drop = (b.bands[i] || 0) - (sb.bands[i] || 0)
+                    if (drop > 0) quieted += drop
+                  }
+                }
+                return `Side-by-side: left bar = baseline, right bar = scenario. ${quieted} pass${quieted === 1 ? '' : 'es'} moved into a quieter band.`
+              })()
+              : 'Stacked bands by peak dBA at the listener. Each hour\'s total stays the same — substitutions visibly grow the quiet bands and shrink the loud ones.'}
           >
-            <HourlyChart
-              buckets={hourlyBuckets}
-              scenarioBuckets={scenarioActive ? scenarioHourly : null}
-              highlightHour={peakHour}
-              colorBy="peak"
-              caption="flights / hour (local) — bar color = peak dBA in that hour"
+            <HourlyDbaBandsChart
+              buckets={hourlyBandBuckets}
+              scenarioBuckets={scenarioActive ? scenarioHourlyBandBuckets : null}
+              caption="passes / hour by peak dBA at the listener"
             />
           </Section>
           <Section
@@ -1981,14 +2282,74 @@ export default function PointNoiseReport() {
           </Section>
         </div>
 
+        {/* §11-CLIENT §11: What-If FINANCIALS (NPV inputs + business-model
+            table) renders inline here, right under the overlay charts.
+            The four headline sliders that drive the overlay live in a
+            FIXED-BOTTOM docked panel (rendered at the end of this
+            component) so they remain in view while the user scrolls the
+            graphs. The two parts are deliberately decoupled — slider
+            scrubs feel instant; financial reading wants a stable layout. */}
+        {(() => {
+          if (substitutes == null) return null
+          const { anyAirframeCand, anyEliminateCand } = whatIfApplicable
+          if (!substitutes.length || (!anyAirframeCand && !anyEliminateCand)) {
+            if (allRows.length === 0) return null
+            return (
+              <Section title="What-If: quieter fleets">
+                <div className="text-xs text-white/40 leading-snug">
+                  Scenario substitution data isn't in this segments response
+                  yet — available after the next API deploy. The rest of the
+                  noise report is unaffected.
+                </div>
+              </Section>
+            )
+          }
+          return (
+            <Section
+              title="What-If: financial impact"
+              hint="Drag the sliders in the docked panel at the bottom of the page. NPV / $-per-dB updates live below."
+            >
+              <WhatIfFinancials
+                scenario={scenario}
+                setScenario={setScenario}
+                substitutes={substitutes}
+                businessModelCols={businessModelCols}
+                dbDelta={dbDelta}
+              />
+            </Section>
+          )
+        })()}
+
         {/* Hourly mean — same shape, but the colour answers a different
             question: "how loud was the typical pass during that hour?" A
             busy hour of training C172s reads quiet; one biz-jet arrival
             in an otherwise empty hour spikes the peak chart but not this
             one. */}
         <Section
-          title="When does the noise happen? — average dBA"
-          hint="Same bars (passes per local hour) but colour = AVERAGE dBA of those passes, so a busy quiet hour looks different from a single-loud-pass hour"
+          title={scenarioActive ? 'When does the noise happen? — average dBA (scenario overlay)' : 'When does the noise happen? — average dBA'}
+          hint={scenarioActive
+            ? (() => {
+              // §11-CLIENT §12: average pulls down whenever any pass in
+              // an hour gets quieter, so this chart is much more
+              // responsive to training-purpose substitutions than the
+              // peak chart above. Surface the avg drop so the user sees
+              // the substitution working here even when the peak chart
+              // looks frozen.
+              let movedHours = 0, totalDrop = 0, hoursWithPasses = 0
+              for (let h = 0; h < 24; h++) {
+                const b = hourlyBuckets[h]; const sb = scenarioHourly[h]
+                if (!b || b.count === 0) continue
+                hoursWithPasses++
+                const baseMean = b.count > 0 ? b.sumDba / b.count : 0
+                const scnMean = sb && sb.count > 0 ? sb.sumDba / sb.count : 0
+                const drop = baseMean - scnMean
+                if (drop > 0.5) { movedHours++; totalDrop += drop }
+              }
+              if (movedHours === 0) return 'Grey = baseline. No hour\'s average changed materially.'
+              const avgDrop = (totalDrop / movedHours).toFixed(1)
+              return `Grey = baseline. Coloured = scenario. ${movedHours} of ${hoursWithPasses} hours got a quieter mean (avg −${avgDrop} dBA across all passes).`
+            })()
+            : 'Same bars (passes per local hour) but colour = AVERAGE dBA of those passes, so a busy quiet hour looks different from a single-loud-pass hour'}
         >
           <HourlyChart
             buckets={hourlyBuckets}
@@ -2285,6 +2646,57 @@ export default function PointNoiseReport() {
         </>
         )}
       </div>
+
+      {/* §11-CLIENT §11: docked What-If sliders.
+          Fixed at the bottom of the viewport so the user can drag any
+          slider while watching the hourly + dBA-histogram charts respond
+          live. Rendered only when substitutes are loaded AND the current
+          window has at least one substitutable track — otherwise the
+          panel has nothing to swap. */}
+      {(() => {
+        if (substitutes == null || substitutes.length === 0) return null
+        const { anyAirframeCand, anyEliminateCand } = whatIfApplicable
+        if (!anyAirframeCand && !anyEliminateCand) return null
+        const activeCount =
+          (scenario.electric_pct > 0 ? 1 : 0)
+          + (scenario.eurofox_pct > 0 ? 1 : 0)
+          + (scenario.sinus_pct > 0 ? 1 : 0)
+          + (scenario.winch_agl_ft > 0 ? 1 : 0)
+          + (scenario.atpr_pct > 0 ? 1 : 0)
+          + (scenario.simx_pct > 0 ? 1 : 0)
+        return (
+          <div
+            className="fixed bottom-0 inset-x-0 z-[1500] border-t border-white/15 bg-neutral-950/95 backdrop-blur shadow-[0_-8px_24px_rgba(0,0,0,0.6)]"
+          >
+            <div className="max-w-6xl mx-auto px-4 py-2">
+              <button
+                type="button"
+                onClick={() => setDockOpen((o) => !o)}
+                className="w-full flex items-center justify-between text-left text-xs uppercase tracking-wide text-white/60 hover:text-white"
+              >
+                <span className="flex items-center gap-2">
+                  <span className={dockOpen ? '' : 'opacity-60'}>What-If sliders</span>
+                  {activeCount > 0 && (
+                    <span className="text-[10px] bg-sky-500/30 text-sky-200 rounded px-1.5 py-0.5 normal-case">
+                      {activeCount} active · Δ peak {dbDelta > 0 ? `−${Math.round(dbDelta)}` : '0'} dBA
+                    </span>
+                  )}
+                </span>
+                <span className="text-white/40">{dockOpen ? '▾' : '▴'}</span>
+              </button>
+              {dockOpen && (
+                <div className="pt-2 pb-1">
+                  <WhatIfSliders
+                    scenario={scenario}
+                    setScenario={setScenario}
+                    substitutes={substitutes}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        )
+      })()}
     </div>
   )
 }
