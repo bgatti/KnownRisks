@@ -177,19 +177,16 @@ try {
 // Scenario-substitution registry — quieter-fleet alternatives keyed by code
 // (EFOX/SINU/VELE/WNCH). Each entry declares which incumbent types/purposes
 // it can replace and whether it applies to the whole track (scope=track) or
-// just a sub-segment (scope=segment, e.g. WNCH below 2000 ft AGL). Loaded
-// once at module scope so the /api/excursions/segments handler can use it
-// without re-reading on every request. See public/substitutes.json + Ask #11.
+// just a sub-segment (scope=segment, e.g. WNCH below 2000 ft AGL). See Ask
+// #11 in API_REQUEST.md. Helpers live in ./scenarioSubstitutes.js so the
+// test suite can exercise them without spinning up vite.
 let SUBSTITUTES = []
+let SUBSTITUTES_BY_CODE = new Map()
 try {
   const sj = JSON.parse(fs.readFileSync('public/substitutes.json', 'utf8'))
   SUBSTITUTES = Array.isArray(sj?.substitutes) ? sj.substitutes : []
+  for (const s of SUBSTITUTES) SUBSTITUTES_BY_CODE.set(s.code, s)
 } catch { /* optional registry */ }
-
-// Substitute-matching + dBA-projection helpers live in
-// ./scenarioSubstitutes.js so the test suite can exercise them directly
-// without spinning up vite. See pickTrackCandidates / pickSegmentCandidates
-// / dbaAtListener imports at the top of this file.
 function aircraftIconUrl(type, tail) {
   const T = (type || '').toUpperCase()
   const N = (tail || '').toUpperCase()
@@ -1151,11 +1148,9 @@ function excursionsApiPlugin() {
           const center = (latParam != null && lonParam != null && latParam !== '' && lonParam !== '')
             ? { lat: Number(latParam), lon: Number(lonParam) }
             : null
-          // Listener elevation for substitute-dBA computation. Defaults to the
-          // nearest Front-Range airport's field elevation (KBDU 5288, KBJC 5673,
-          // KEIK 5025, KLMO 5054, KAPA 5885, KFNL 5016, KGXY 4697). Accept an
-          // explicit `elev_ft` query param when the caller knows the listener's
-          // actual ground elevation (a hilltop sensor, a different region, etc.).
+          // Listener elevation for substitute-dBA computation. Accepts an
+          // explicit `elev_ft` for hilltop sensors / out-of-region listeners;
+          // otherwise picks the nearest ENRICH_AP airport's field elevation.
           // Only meaningful when center is set — substitute dBA is gated on lat/lon.
           let listenerElev = null
           if (center) {
@@ -1163,14 +1158,13 @@ function excursionsApiPlugin() {
             if (elevParam != null && elevParam !== '' && Number.isFinite(Number(elevParam))) {
               listenerElev = Number(elevParam)
             } else {
-              const ELEVS = { KBDU: 5288, KBJC: 5673, KEIK: 5025, KLMO: 5054, KAPA: 5885, KFNL: 5016, KGXY: 4697 }
-              let best = null, bestD = Infinity
+              let nearest = null, bestD = Infinity
               for (const ap of ENRICH_AP) {
-                if (!(ap.code in ELEVS)) continue
+                if (ap.elev == null) continue
                 const d = distNmAp(center.lat, center.lon, ap.lat, ap.lon)
-                if (d < bestD) { bestD = d; best = ap.code }
+                if (d < bestD) { bestD = d; nearest = ap }
               }
-              listenerElev = best ? ELEVS[best] : 5288 // default to KBDU field elevation
+              listenerElev = nearest ? nearest.elev : 5288 // KBDU fallback
             }
           }
           if (!zonesCache) {
@@ -1461,70 +1455,43 @@ function excursionsApiPlugin() {
               // /api/excursions/boot calls the same helper so the kiosk sees
               // identical phase values from either source.
               const { phase, descents, hasDescents } = classifyTrackPhase(walk)
-              // Resolve purpose for substitute matching — uses the same module
-              // helper as the kiosk so the same track classifies the same way
-              // from either endpoint. The track's stored purpose (if any) +
-              // type + tail feed into the resolver. The resulting purpose
-              // also gets emitted on the response so the client can mirror
-              // server-side scenario logic without a second lookup.
               const trackPurpose = resolvePurpose(t.purpose, t.type, t.call || t.reg)
               const matchT = { type: t.type || '', purpose: trackPurpose }
               const trackCands = pickTrackCandidates(matchT, SUBSTITUTES)
               const segCands = pickSegmentCandidates(matchT, SUBSTITUTES)
-              // Per-segment scenario dBA — only when the caller supplied lat/lon
-              // (otherwise we have no listener to project the substitute onto).
-              // For each substitute that's a candidate for the track, walk the
-              // segment's points, find the closest-approach point to the
-              // listener, and compute the substitute's peak dBA there. WNCH and
-              // other segment-scope substitutes are only emitted as a number
-              // when at least one point in the segment falls below the AGL
-              // cutoff; otherwise the key is present but null (out of window).
-              // When a substitute is NOT a candidate for the track, its key is
-              // OMITTED ENTIRELY from the segment map — the absence is the
-              // signal that the substitute doesn't apply at all.
+              // Per-segment scenario dBA — populated only when the caller
+              // supplied a listener (lat/lon). Substitute codes that aren't
+              // candidates for the track are OMITTED from the map; segment-
+              // scope substitutes (WNCH) carry null when out of AGL window.
               if (center && listenerElev != null && (trackCands.length || segCands.length)) {
-                const subByCode = new Map()
-                for (const sub of SUBSTITUTES) subByCode.set(sub.code, sub)
+                const round1 = (db) => Math.round(db * 10) / 10
                 for (const s of filtered) {
-                  // Find closest-approach point to the listener for this segment.
-                  let bestPt = null, bestDist = Infinity
+                  // Single pass: closest-approach point + min AGL.
+                  let bestPt = null, bestDist = Infinity, minAgl = Infinity
                   for (const p of s.points) {
                     if (p[0] == null || p[1] == null) continue
                     const d = distFt(p[0], p[1], center.lat, center.lon)
                     if (d < bestDist) { bestDist = d; bestPt = p }
+                    if (p[2] != null) {
+                      const a = p[2] - listenerElev
+                      if (a < minAgl) minAgl = a
+                    }
                   }
                   if (!bestPt) continue
                   const altMsl = bestPt[2]
-                  // Minimum AGL across all points in the segment — used to
-                  // decide if a segment-scope substitute (WNCH) applies at
-                  // all. If min AGL is above its cutoff, the substitute is
-                  // out of window for this segment → null.
-                  let minAgl = Infinity
-                  for (const p of s.points) {
-                    if (p[2] == null) continue
-                    const a = p[2] - listenerElev
-                    if (a < minAgl) minAgl = a
-                  }
                   const sub = {}
                   for (const code of trackCands) {
-                    const meta = subByCode.get(code)
-                    if (!meta) continue
-                    sub[code] = Math.round(
-                      dbaAtListener(meta.base_dba ?? 0, altMsl, listenerElev, bestDist) * 10
-                    ) / 10
+                    const meta = SUBSTITUTES_BY_CODE.get(code)
+                    if (meta) sub[code] = round1(dbaAtListener(meta.base_dba ?? 0, altMsl, listenerElev, bestDist))
                   }
                   for (const c of segCands) {
-                    const meta = subByCode.get(c.code)
+                    const meta = SUBSTITUTES_BY_CODE.get(c.code)
                     if (!meta) continue
                     const cutoff = c.applies_to_agl_below_ft
                     const inWindow = cutoff == null || (Number.isFinite(minAgl) && minAgl < cutoff)
-                    if (!inWindow) {
-                      sub[c.code] = null
-                    } else {
-                      sub[c.code] = Math.round(
-                        dbaAtListener(meta.base_dba ?? 0, altMsl, listenerElev, bestDist) * 10
-                      ) / 10
-                    }
+                    sub[c.code] = inWindow
+                      ? round1(dbaAtListener(meta.base_dba ?? 0, altMsl, listenerElev, bestDist))
+                      : null
                   }
                   s.alt_dba_by_substitute = sub
                 }
@@ -1543,13 +1510,7 @@ function excursionsApiPlugin() {
                 // altitude correction (subtracted from raw alt before
                 // classification). 0 when no calibration was available.
                 alt_offset_ft: trackOffset,
-                // Scenario substitutes — Ask #11. The client uses these to
-                // power the What-If panel (electric trainer %, eurofox tow %,
-                // sinus glider %, winch under N ft AGL).
-                //   alt_airframe_candidates → whole-track substitutes (VELE,
-                //     EFOX, SINU) that match this track's type or purpose.
-                //   alt_segment_candidates  → sub-segment substitutes (WNCH)
-                //     with the AGL cutoff they apply below.
+                // Scenario substitutes (Ask #11) — see /api/discover.
                 alt_airframe_candidates: trackCands,
                 alt_segment_candidates: segCands,
                 segments: filtered,
