@@ -931,6 +931,18 @@ function WhatIfSliders({ scenario, setScenario, substitutes }) {
   const subEfox = findSub(substitutes, 'EFOX')
   const subSinu = findSub(substitutes, 'SINU')
   const subWnch = findSub(substitutes, 'WNCH')
+  // §11-CLIENT V2 §3: regulatory demand-reduction substitutes (track_eliminate
+  // scope). Slider is "% of max effect" (intuitive policy-uptake meter);
+  // max_reduction_pct lives in the substitute config so the realistic
+  // industry-response cap is tunable without a code change.
+  const subAtpr = findSub(substitutes, 'ATPR')
+  const subSimx = findSub(substitutes, 'SIMX')
+  const fmtReduction = (sub) => (v) => {
+    const max = Number(sub?.max_reduction_pct) || 0
+    if (v === 0 || max === 0) return `${v}%`
+    const effective = (v * max) / 100
+    return `${v}% → ${effective.toFixed(0)}% reduction`
+  }
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
       <Slider
@@ -961,6 +973,24 @@ function WhatIfSliders({ scenario, setScenario, substitutes }) {
         onChange={(v) => update({ winch_agl_ft: v })}
         fmt={(v) => (v === 0 ? 'off' : `${v.toLocaleString()} ft`)}
       />
+      {subAtpr && (
+        <Slider
+          label={`ATP rollback % (${subAtpr.name || 'ATPR'})`}
+          value={scenario.atpr_pct}
+          min={0} max={100} step={5}
+          onChange={(v) => update({ atpr_pct: v })}
+          fmt={fmtReduction(subAtpr)}
+        />
+      )}
+      {subSimx && (
+        <Slider
+          label={`Simulator expansion % (${subSimx.name || 'SIMX'})`}
+          value={scenario.simx_pct}
+          min={0} max={100} step={5}
+          onChange={(v) => update({ simx_pct: v })}
+          fmt={fmtReduction(subSimx)}
+        />
+      )}
     </div>
   )
 }
@@ -2062,11 +2092,23 @@ export default function PointNoiseReport() {
             scrubs feel instant; financial reading wants a stable layout. */}
         {(() => {
           if (substitutes == null) return null
-          const anyCandidate = allRows.some(
+          // §11-CLIENT V2: match the docked-panel gate — render the financial
+          // section when either airframe substitutes OR regulatory demand
+          // reduction (ATPR/SIMX, scope=track_eliminate) has at least one
+          // applicable track in the current window.
+          const anyAirframeCand = allRows.some(
             (r) => (r.altAirframeCandidates?.length || 0) > 0
               || (r.altSegmentCandidates?.length || 0) > 0,
           )
-          if (!substitutes.length || !anyCandidate) {
+          const eliminatePurposes = new Set()
+          for (const s of substitutes) {
+            if (s?.scope === 'track_eliminate') {
+              for (const p of s.replaces_purposes || []) eliminatePurposes.add(p)
+            }
+          }
+          const anyEliminateCand = eliminatePurposes.size > 0
+            && allRows.some((r) => r.purpose && eliminatePurposes.has(r.purpose))
+          if (!substitutes.length || (!anyAirframeCand && !anyEliminateCand)) {
             if (allRows.length === 0) return null
             return (
               <Section title="What-If: quieter fleets">
@@ -2429,16 +2471,31 @@ export default function PointNoiseReport() {
           panel has nothing to swap. */}
       {(() => {
         if (substitutes == null || substitutes.length === 0) return null
-        const anyCandidate = allRows.some(
+        // §11-CLIENT V2: the regulatory demand-reduction sliders (ATPR/SIMX)
+        // act on `purpose=training` directly — no per-track candidate field
+        // required. So the panel is meaningful as long as the window has any
+        // airframe-candidate track OR any track whose purpose matches a
+        // track_eliminate substitute.
+        const anyAirframeCand = allRows.some(
           (r) => (r.altAirframeCandidates?.length || 0) > 0
             || (r.altSegmentCandidates?.length || 0) > 0,
         )
-        if (!anyCandidate) return null
+        const eliminatePurposes = new Set()
+        for (const s of substitutes) {
+          if (s?.scope === 'track_eliminate') {
+            for (const p of s.replaces_purposes || []) eliminatePurposes.add(p)
+          }
+        }
+        const anyEliminateCand = eliminatePurposes.size > 0
+          && allRows.some((r) => r.purpose && eliminatePurposes.has(r.purpose))
+        if (!anyAirframeCand && !anyEliminateCand) return null
         const activeCount =
           (scenario.electric_pct > 0 ? 1 : 0)
           + (scenario.eurofox_pct > 0 ? 1 : 0)
           + (scenario.sinus_pct > 0 ? 1 : 0)
           + (scenario.winch_agl_ft > 0 ? 1 : 0)
+          + (scenario.atpr_pct > 0 ? 1 : 0)
+          + (scenario.simx_pct > 0 ? 1 : 0)
         return (
           <div
             className="fixed bottom-0 inset-x-0 z-[1500] border-t border-white/15 bg-neutral-950/95 backdrop-blur shadow-[0_-8px_24px_rgba(0,0,0,0.6)]"
