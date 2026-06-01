@@ -127,16 +127,43 @@ export async function loadTracksFromDb({ fromDate = null, toDate = null, hardCap
 }
 const trackWindowCache = new Map()
 
-export const loadLiveFromDb = cached('live', 5_000, async () => {
-  const p = getPool()
-  const res = await p.query(
-    'SELECT day, started_at, updated_at, tracks FROM live_tracks ORDER BY id DESC LIMIT 1'
-  )
-  if (res.rows.length === 0) return { tracks: [], _byTail: new Map(), updated_at: null }
-  const row = res.rows[0]
-  const tracks = row.tracks || []
-  return { tracks, _byTail: indexByTail(tracks), updated_at: row.updated_at }
-})
+// resolveLiveDateRange — pure, testable: given a lookback in hours and
+// the current epoch ms, produce the (fromDate, toDate) UTC range to
+// query. Always pads +24 h on the early side so a track that took off
+// at 23:55 UTC yesterday stays in scope even for short-lookback queries.
+//
+// Exported so it can be unit-tested without mocking the DB pool — see
+// db.test.js → loadLiveFromDb — UTC-boundary correctness.
+export function resolveLiveDateRange(hoursBack, nowMs = Date.now()) {
+  const fromMs = nowMs - (hoursBack * 3600 * 1000) - 24 * 3600 * 1000
+  return {
+    fromDate: new Date(fromMs).toISOString().slice(0, 10),
+    toDate: new Date(nowMs).toISOString().slice(0, 10),
+  }
+}
+
+// loadLiveFromDb — UTC-boundary-correct live track loader.
+//
+// History: an earlier implementation queried `ORDER BY id DESC LIMIT 1`
+// to grab "today's row." That's silently wrong any time the requested
+// lookback crosses UTC midnight: at 03:00 UTC the "latest" row contains
+// only the last 3 hours of data, dropping the previous 21 h that live
+// in yesterday's row. Three downstream fixes lapsed because each plugin
+// had its own loadLive closure repeating the same single-day pattern.
+//
+// Fix at the source: resolveLiveDateRange computes a UTC range from
+// `hoursBack`, padding +24 h on the early side (a track that took off
+// at 23:55 UTC yesterday is in YESTERDAY's bucket). The bug condition
+// (single-day query at midnight) is structurally impossible: even
+// hoursBack=0 still yields a 24-hour range that crosses the boundary.
+//
+// `hoursBack` defaults to 4 — enough for any single-day overlap. New
+// callers that need a longer window should pass it explicitly so the
+// range is sized to fit.
+export async function loadLiveFromDb(hoursBack = 4) {
+  const { fromDate, toDate } = resolveLiveDateRange(hoursBack)
+  return loadLiveFromDbByDateRange(fromDate, toDate)
+}
 
 // Load live_tracks across a date range (inclusive). Each day has exactly
 // one current row in live_tracks (older versions are pruned by the capture

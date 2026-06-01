@@ -217,7 +217,7 @@ window. Sourced from the live store (`live_tracks`), most-recent first.
   "airport": "KBDU", "minutes": 30, "pop_scale": 1000,
   "scoring": {
     "impact_index": "population-noise per ft / POP_SCALE (same kernel as leaderboard & impact-explain)",
-    "impact_score": "impact_index × purpose weight (training ×2, baked in here — do NOT re-apply)",
+    "impact_score": "alias of impact_index (no purpose multiplier — purpose-aware ranking is a caller concern)",
     "impact_grade": "A<0.3 B<0.6 C<1.2 D<2.0 F (on impact_score)"
   },
   "count": 1,
@@ -230,16 +230,24 @@ window. Sourced from the live store (`live_tracks`), most-recent first.
     "on_ground_min": 8.8, "airborne_min": 71.8,
     "impact_index": 0.237, "impact_score": 0.475, "impact_grade": "B",
     "pop_impact": 1144555273,
-    "bands": [{ "klass": null, "points": [[40.04, -105.22, 6500], …] }]
+    "bands": [{
+      "klass": null,
+      "impact": 25620, "impact_share": 0.486,
+      "points": [[40.04, -105.22, 6500, 1240], [40.05, -105.21, 6200, 6400], …]
+    }]
   }]
 }
 ```
 
-**Scoring contract** — `impact_index` is the pure population value (identical to
-the leaderboard); **`impact_score` already has the training ×2 baked in**, so
-the consumer must not apply it again. `impact_grade` is the letter for
-`impact_score`. **`bands[]`** are the capture-worker's classified runs
-(`klass`: `red`/`orange`/`yellow`/`purple`/`null`; points `[lat,lon,alt]`).
+**Scoring contract** — `impact_index` is the population-noise measurement
+(identical kernel to the leaderboard / impact-explain). `impact_score` is
+currently an **alias of `impact_index`** — there is **no purpose multiplier**
+applied server-side. Purpose-aware weighting (e.g. emphasizing training in a
+ranking or slide rotation) is a caller concern. The `purpose` field is still
+returned on each landing so callers can apply their own policy. `impact_grade`
+is the letter mapped from `impact_score` (= `impact_index`).
+**`bands[]`** carry the classified runs (`klass`: `red`/`orange`/`yellow`/`null`)
+with per-point and per-band impact values — see "Bands" below.
 
 **Gating fields** — `airborne_min` is the *last sortie's* airborne time (a
 day-track merges all of an aircraft's flights, so this walks back to that
@@ -247,6 +255,23 @@ landing's takeoff). `origin_dist_nm` is the great-circle from the first observed
 fix to the field — note the capture is corridor-bounded (~36 nm), so this is the
 *observed inbound leg*, not necessarily the true flight origin distance.
 `null` `airborne_min` means a taxi-only track (no airborne segment captured).
+
+**Bands — per-point and per-band impact for gradient renderers.**
+Each `bands[].points[]` is a **4-tuple** `[lat, lon, alt_ft_msl, impact]`
+where `impact` is the per-point population-noise intensity (same kernel family
+as `impact_index`). The fourth slot is a strict superset of the legacy 3-tuple,
+so clients that read `p[0..2]` keep working.
+
+Each band also carries:
+- `impact` — sum of per-point impacts in this band.
+- `impact_share` — that band's share of the track total, `0.000..1.000`.
+
+Use `impact_share` to color whole bands relatively when you don't autoscale
+per-point; use `p[3]` to autoscale across visible points (e.g. percentile
+stops) for a smooth gradient. The 4-bucket `klass` is a **population/zone
+classifier** — within a single `klass`, per-point `impact` can vary ~100×+
+because population density and AGL both vary along the path. Categorical
+`klass` and continuous `impact` complement each other.
 
 ### GET /api/noise/missions
 

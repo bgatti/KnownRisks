@@ -1,0 +1,67 @@
+{
+  "substitutes": [
+    {
+      "code": "EFOX",
+      "name": "Aeropro Eurofox",
+      "base_dba": 72,
+      "hp": 100,
+      "powertrain": "Rotax 912 (gasoline)",
+      "replaces_types": ["PA25", "PA18"],
+      "replaces_purposes": ["tow_plane"],
+      "scope": "track",
+      "cap_ex_usd": 155000,
+      "op_savings_per_hr_usd": 40,
+      "useful_life_years": 15,
+      "residual_value_pct": 0.40,
+      "annual_hours_typical": 400
+    },
+    {
+      "code": "SINU",
+      "name": "Pipistrel Sinus",
+      "base_dba": 70,
+      "base_dba_soaring": 0,
+      "hp": 80,
+      "powertrain": "Rotax 912 (gasoline)",
+      "replaces_types": ["GLID", "VENT", "NIMB", "DISC", "DG10", "DG15", "DG80", "DG1T", "AS21", "AS25", "AS31", "JS1J", "LS4", "PIK", "SZD", "ASTR", "ASW"],
+      "replaces_purposes": ["glider"],
+      "scope": "track",
+      "note": "Self-launching. When substituted, the paired tow plane disappears too — engine on only for first ~2 min of flight.",
+      "cap_ex_usd": 145000,
+      "op_savings_per_hr_usd": 30,
+      "useful_life_years": 20,
+      "residual_value_pct": 0.50,
+      "annual_hours_typical": 250
+    },
+    {
+      "code": "VELE",
+      "name": "Pipistrel Velis Electro",
+      "base_dba": 60,
+      "hp": 102,
+      "powertrain": "Electric (76 kW)",
+      "replaces_types": ["C172", "C152", "P28A", "C72R", "P28B", "DA20", "DV20", "DA40", "PA28"],
+      "replaces_purposes": ["training"],
+      "scope": "track",
+      "cap_ex_usd": 210000,
+      "op_savings_per_hr_usd": 30,
+      "useful_life_years": 12,
+      "residual_value_pct": 0.30,
+      "annual_hours_typical": 600
+    },
+    {
+      "code": "WNCH",
+      "name": "Winch launch",
+      "base_dba": 0,
+      "powertrain": "Ground-based winch (electric or diesel — noise is local to airfield, not propagated)",
+      "replaces_types": ["PA25", "PA18"],
+      "replaces_purposes": ["tow_plane"],
+      "scope": "segment",
+      "applies_to_agl_below_ft": 2000,
+      "note": "Substitutes the tow-segment portion below the cutoff AGL — applies only to that sub-segment, not the whole track.",
+      "cap_ex_usd": 100000,
+      "op_savings_per_hr_usd": 0,
+      "op_savings_per_launch_usd": 35,
+      "useful_life_years": 25,
+      "residual_value_pct": 0.30
+    }
+  ]
+}

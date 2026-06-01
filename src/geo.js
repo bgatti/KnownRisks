@@ -52,6 +52,25 @@ export function distFt(lat1, lon1, lat2, lon2) {
   return Math.hypot(dLat, dLon)
 }
 
+// Engineless aircraft (gliders, balloons, gyrocopters) are exempt from the
+// VNAP — they have no engine noise, so flying them low over a noise zone is
+// not a noise event. ICAO type codes for the common Front-Range gliders:
+//   GLID  generic glider                 SGS    Schweizer SGS series
+//   AS21  Schleicher ASK-21              AS25/AS26/AS31 other Schleichers
+//   DG10/DG15/DG1T/DG80  DG Flugzeugbau  VENT   Schempp-Hirth Ventus
+//   NIMB  Schempp-Hirth Nimbus           DISC   Schempp-Hirth Discus
+//   ASTR  Schempp-Hirth Astir            JS\d   Jonker Sailplanes
+//   LS\d  Rolladen-Schneider             PIK    PIK series
+//   ASW   Schleicher ASW                 SZD    SZD (PZL)
+//   BALL  hot-air balloon                XNOS/COY2  catch-alls for misc engineless
+// Anything matching → engineless. Returns false on missing/empty/null input
+// so the default treatment (powered) is the safer assumption.
+const ENGINELESS_TYPE_RE = /^(GLID|VENT|NIMB|DISC|SGS|ASTR|ASW|JS\d|LS\d|PIK|SZD|BALL|XNOS|COY2|AS2\d|AS3\d|DG\d)/
+export function isEnginelessType(typeCode) {
+  if (!typeCode) return false
+  return ENGINELESS_TYPE_RE.test(String(typeCode).toUpperCase())
+}
+
 // Walk a track and return length (ft) broken down by classification band.
 //   total   — total path length
 //   yellow  — length where either endpoint is within 250 ft of a boundary
@@ -61,10 +80,15 @@ export function distFt(lat1, lon1, lat2, lon2) {
 //   inRed   — orange + red (strict violations)
 // Segments are attributed to the MOST-SEVERE endpoint class so the bands are
 // mutually exclusive and sum to inZone.
-export function trackLengthFt(points, zones) {
+// `opts.engineless`: when true (glider/balloon), no segments are classified —
+// the aircraft is VNAP-exempt and only `total` is reported.
+export function trackLengthFt(points, zones, opts = {}) {
   let total = 0, yellow = 0, orange = 0, red = 0
   if (points.length < 2) return { total, yellow, orange, red, inZone: 0, inRed: 0 }
-  const tags = points.map((p) => classifyPoint(p[0], p[1], p[2], zones))
+  const engineless = !!opts.engineless
+  const tags = engineless
+    ? new Array(points.length).fill(null)
+    : points.map((p) => classifyPoint(p[0], p[1], p[2], zones))
   const rank = { yellow: 1, orange: 2, red: 3 }
   for (let i = 1; i < points.length; i++) {
     const a = points[i - 1]
@@ -115,7 +139,10 @@ const SEVERITY = { yellow: 1, orange: 2, red: 3 }
 // altitude agree. Return the LESS-SEVERE of the two tags (min severity). A
 // high aircraft in a zone stays clean; a low aircraft outside a zone stays
 // clean; only a low aircraft inside a zone is flagged.
-export function classifyPoint(lat, lon, alt, zones) {
+// `opts.engineless`: when true the aircraft is VNAP-exempt (glider, balloon)
+// and we always return null.
+export function classifyPoint(lat, lon, alt, zones, opts) {
+  if (opts && opts.engineless) return null
   const z = classify(signedDistanceToZonesFt(lat, lon, zones))
   const a = classifyAlt(alt)
   if (!z || !a) return null
