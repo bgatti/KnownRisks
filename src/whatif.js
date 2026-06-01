@@ -53,6 +53,11 @@ export function shouldWinchSegment(seg, threshold_ft, listenerElevFt) {
 }
 
 /* ─── segmentDba ──────────────────────────────────────────────────── */
+// Airframe substitutes in priority order. Hoisted out of segmentDba so a
+// hot-path call (one per segment × one per track) doesn't allocate this
+// array each invocation.
+const AIRFRAME_SUB_CODES = ['VELE', 'EFOX', 'SINU']
+
 /**
  * §11-CLIENT §5: per-segment dBA in the scenario world.
  *
@@ -71,7 +76,7 @@ export function segmentDba(track, seg, scenario, listenerElevFt, baseDbaForSeg) 
   }
   const map = seg?.alt_dba_by_substitute
   if (map && scenario?.substituted) {
-    for (const code of ['VELE', 'EFOX', 'SINU']) {
+    for (const code of AIRFRAME_SUB_CODES) {
       if (scenario.substituted[code]?.has(tail)) {
         const v = map[code]
         if (v != null) return v

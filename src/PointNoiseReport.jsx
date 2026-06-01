@@ -901,10 +901,12 @@ function BusinessModelTable({ cols, dbDelta }) {
   )
 }
 
-/** §11-CLIENT §3: the four what-if sliders + the Advanced disclosure. State
- *  lives in the parent (PointNoiseReport) so the rest of the page can read
- *  it for the overlay histogram + the business-model table. */
-function WhatIfPanel({ scenario, setScenario, substitutes, advancedOpen, setAdvancedOpen, businessModelCols, dbDelta }) {
+/** §11-CLIENT §3: the four what-if sliders + the Advanced disclosure.
+ *  Scenario state itself lives in the parent (the rest of the page reads
+ *  it for the overlay histogram + business-model table), but the
+ *  Advanced disclosure's open/closed state is purely local. */
+function WhatIfPanel({ scenario, setScenario, substitutes, businessModelCols, dbDelta }) {
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   const update = (patch) => setScenario((s) => ({ ...s, ...patch }))
   const updateHours = (code, hours) => setScenario((s) => ({
     ...s,
@@ -1210,7 +1212,6 @@ export default function PointNoiseReport() {
     fuel_multiplier: 1.0,
     annual_hours_override: {},
   })
-  const [advancedOpen, setAdvancedOpen] = useState(false)
   const [excludeGliders, setExcludeGliders] = useState(true)
   const [purposeSelected, setPurposeSelected] = useState(new Set())
 
@@ -1556,14 +1557,21 @@ export default function PointNoiseReport() {
     return buckets
   }, [scenarioRows, scenarioActive])
 
-  // §11-CLIENT §7: business-model table. Only render columns for active
-  // substitutes (slider > 0). dB delta is the listener-side peak drop —
-  // baseline peak minus scenario peak across the filtered window.
+  // §11-CLIENT §7: listener-side peak drop — baseline peak minus scenario
+  // peak across the filtered window. Used by both the business-model table
+  // (NPV $/dB column) and the WhatIfPanel header.
+  const dbDelta = useMemo(() => {
+    if (!scenarioActive) return 0
+    let basePeak = 0, scnPeak = 0
+    for (const r of filteredRows) if (r.dba > basePeak) basePeak = r.dba
+    for (const r of scenarioRows) if (r.dba > scnPeak) scnPeak = r.dba
+    return Math.max(0, basePeak - scnPeak)
+  }, [scenarioActive, filteredRows, scenarioRows])
+
+  // §11-CLIENT §7: business-model table. One column per active substitute
+  // (slider > 0).
   const businessModelCols = useMemo(() => {
     if (!scenarioActive || !substitutes?.length) return []
-    const baselinePeak = filteredRows.reduce((m, r) => Math.max(m, r.dba || 0), 0)
-    const scenarioPeak = scenarioRows.reduce((m, r) => Math.max(m, r.dba || 0), 0)
-    const dbDelta = baselinePeak - scenarioPeak
     const cols = []
     const slot = (code, pct, isWinch = false) => {
       if (!pct || pct <= 0) return
@@ -1573,12 +1581,7 @@ export default function PointNoiseReport() {
         ? (winchTracks.size > 0 ? 1 : 0)  // single shared winch system
         : scenarioPicks[code]?.size || 0
       if (n <= 0) return
-      const col = businessModelColumn({
-        sub,
-        scenario,
-        nAirframes: n,
-        dbDelta,
-      })
+      const col = businessModelColumn({ sub, scenario, nAirframes: n, dbDelta })
       if (col) cols.push(col)
     }
     slot('VELE', scenario.electric_pct)
@@ -1586,7 +1589,7 @@ export default function PointNoiseReport() {
     slot('SINU', scenario.sinus_pct)
     slot('WNCH', scenario.winch_agl_ft, true)
     return cols
-  }, [scenarioActive, substitutes, filteredRows, scenarioRows, scenarioPicks, winchTracks, scenario])
+  }, [scenarioActive, substitutes, scenarioPicks, winchTracks, scenario, dbDelta])
 
   const peakHour = useMemo(() => {
     let h = -1, best = -Infinity
@@ -1928,15 +1931,8 @@ export default function PointNoiseReport() {
                 scenario={scenario}
                 setScenario={setScenario}
                 substitutes={substitutes}
-                advancedOpen={advancedOpen}
-                setAdvancedOpen={setAdvancedOpen}
                 businessModelCols={businessModelCols}
-                dbDelta={(() => {
-                  if (!scenarioActive) return 0
-                  const baselinePeak = filteredRows.reduce((m, r) => Math.max(m, r.dba || 0), 0)
-                  const scenarioPeak = scenarioRows.reduce((m, r) => Math.max(m, r.dba || 0), 0)
-                  return Math.max(0, baselinePeak - scenarioPeak)
-                })()}
+                dbDelta={dbDelta}
               />
             </Section>
           )
