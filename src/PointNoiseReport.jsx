@@ -1743,6 +1743,29 @@ export default function PointNoiseReport() {
     pickEliminated(allRows, 'SIMX', scenario.simx_pct, substitutes).forEach((t) => set.add(t))
     return set
   }, [allRows, scenario.atpr_pct, scenario.simx_pct, substitutes])
+
+  // §11-CLIENT V2: gate for "this window has any substitution-eligible track"
+  // — hoisted out of the two render sites that decide whether to show the
+  // What-If panel / financial section. Airframe-candidates AND/OR a training
+  // track that ATPR/SIMX could eliminate both count.
+  const whatIfApplicable = useMemo(() => {
+    if (!Array.isArray(substitutes) || substitutes.length === 0) {
+      return { anyAirframeCand: false, anyEliminateCand: false }
+    }
+    const anyAirframeCand = allRows.some(
+      (r) => (r.altAirframeCandidates?.length || 0) > 0
+        || (r.altSegmentCandidates?.length || 0) > 0,
+    )
+    const eliminatePurposes = new Set()
+    for (const s of substitutes) {
+      if (s?.scope === 'track_eliminate') {
+        for (const p of s.replaces_purposes || []) eliminatePurposes.add(p)
+      }
+    }
+    const anyEliminateCand = eliminatePurposes.size > 0
+      && allRows.some((r) => r.purpose && eliminatePurposes.has(r.purpose))
+    return { anyAirframeCand, anyEliminateCand }
+  }, [allRows, substitutes])
   const scenarioPicks = useMemo(() => {
     // Use the full row set (not filteredRows) as the substitution pool so
     // the picked tails are stable when the user nudges the dBA-floor or
@@ -2268,22 +2291,7 @@ export default function PointNoiseReport() {
             scrubs feel instant; financial reading wants a stable layout. */}
         {(() => {
           if (substitutes == null) return null
-          // §11-CLIENT V2: match the docked-panel gate — render the financial
-          // section when either airframe substitutes OR regulatory demand
-          // reduction (ATPR/SIMX, scope=track_eliminate) has at least one
-          // applicable track in the current window.
-          const anyAirframeCand = allRows.some(
-            (r) => (r.altAirframeCandidates?.length || 0) > 0
-              || (r.altSegmentCandidates?.length || 0) > 0,
-          )
-          const eliminatePurposes = new Set()
-          for (const s of substitutes) {
-            if (s?.scope === 'track_eliminate') {
-              for (const p of s.replaces_purposes || []) eliminatePurposes.add(p)
-            }
-          }
-          const anyEliminateCand = eliminatePurposes.size > 0
-            && allRows.some((r) => r.purpose && eliminatePurposes.has(r.purpose))
+          const { anyAirframeCand, anyEliminateCand } = whatIfApplicable
           if (!substitutes.length || (!anyAirframeCand && !anyEliminateCand)) {
             if (allRows.length === 0) return null
             return (
@@ -2647,23 +2655,7 @@ export default function PointNoiseReport() {
           panel has nothing to swap. */}
       {(() => {
         if (substitutes == null || substitutes.length === 0) return null
-        // §11-CLIENT V2: the regulatory demand-reduction sliders (ATPR/SIMX)
-        // act on `purpose=training` directly — no per-track candidate field
-        // required. So the panel is meaningful as long as the window has any
-        // airframe-candidate track OR any track whose purpose matches a
-        // track_eliminate substitute.
-        const anyAirframeCand = allRows.some(
-          (r) => (r.altAirframeCandidates?.length || 0) > 0
-            || (r.altSegmentCandidates?.length || 0) > 0,
-        )
-        const eliminatePurposes = new Set()
-        for (const s of substitutes) {
-          if (s?.scope === 'track_eliminate') {
-            for (const p of s.replaces_purposes || []) eliminatePurposes.add(p)
-          }
-        }
-        const anyEliminateCand = eliminatePurposes.size > 0
-          && allRows.some((r) => r.purpose && eliminatePurposes.has(r.purpose))
+        const { anyAirframeCand, anyEliminateCand } = whatIfApplicable
         if (!anyAirframeCand && !anyEliminateCand) return null
         const activeCount =
           (scenario.electric_pct > 0 ? 1 : 0)
