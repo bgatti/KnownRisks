@@ -14,6 +14,7 @@ import { NoiseStudio as NoiseReportPage } from './NoiseReport.jsx'
 import NoiseHeatmap from './NoiseHeatmap.jsx'
 import KioskMap from './KioskMap.jsx'
 import ImpactExplain from './ImpactExplain.jsx'
+import PointNoiseReport from './PointNoiseReport.jsx'
 import React from 'react'
 
 class ErrorBoundary extends React.Component {
@@ -496,6 +497,9 @@ export default function App() {
   }
   if (route === '/impact-explain') {
     return <ErrorBoundary><ImpactExplain /></ErrorBoundary>
+  }
+  if (route === '/point-noise') {
+    return <ErrorBoundary><PointNoiseReport /></ErrorBoundary>
   }
   if (route === '/yoy') return <YearOverYear />
   if (route === '/bases') return <BasesDiagnostic />

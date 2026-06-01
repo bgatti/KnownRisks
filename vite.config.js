@@ -3509,7 +3509,21 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   }
 
   // ── worst_segment — 30 s sliding window over pattern-excluded fixes ──
-  out.worst_segment = computeWorstSegment(nonPatternPts, POPGRID?.popAt, airport, engineless, calib.offset_ft)
+  // Falls back to the full track (flagged `is_pattern: true`) when the
+  // flight had no non-pattern fixes. Without the fallback, a sortie
+  // that stayed entirely in an airport pattern envelope (e.g. a KBDU
+  // student doing T&Gs all day) reports `pop_impact > 0` (pattern
+  // contributes at PATTERN_WEIGHT=0.3) but no `worst_segment` polyline,
+  // so the kiosk has nothing to highlight on the map (operator-filed
+  // 2026-06-01 — "two flights at KBDU right now, neither showing
+  // worst segment"). The kiosk can opt to style is_pattern segments
+  // differently (subtler color, dashed, etc.).
+  let _ws = computeWorstSegment(nonPatternPts, POPGRID?.popAt, airport, engineless, calib.offset_ft)
+  if (!_ws && flightPts.length >= 3) {
+    _ws = computeWorstSegment(flightPts, POPGRID?.popAt, airport, engineless, calib.offset_ft, { permissive: true })
+    if (_ws) _ws.is_pattern = true
+  }
+  out.worst_segment = _ws
 
   // ── incursion_segments — per-zone in-polygon runs (Ask #6) ───────────
   out.incursion_segments = computeIncursionSegments(flightPts, airport, engineless, ap, calib.offset_ft)
@@ -3710,7 +3724,8 @@ function aglAdjustedDba(p, fieldElevFt, klass) {
   return d
 }
 
-function computeWorstSegment(flightPts, popAt, airport, engineless, altOffsetFt = 0) {
+function computeWorstSegment(flightPts, popAt, airport, engineless, altOffsetFt = 0, opts = {}) {
+  const { permissive = false } = opts
   if (!flightPts || flightPts.length < 3 || !popAt) return null
   const pts = flightPts.filter(p => p[3] != null)
   if (pts.length < 3) return null
@@ -3735,16 +3750,31 @@ function computeWorstSegment(flightPts, popAt, airport, engineless, altOffsetFt 
       const popv = popAt(p[0], p[1]) || 0
       if (popv > peakPop) peakPop = popv
     }
-    if (peakPop <= 0) continue
+    // Skip windows over zero-population terrain unless we're in
+    // permissive mode (pattern-only-flight fallback). T&G work at a
+    // small field can leave EVERY 30 s window entirely over the
+    // runway's own zero-pop grid cells, which would normally produce
+    // a null worst_segment. In permissive mode rank by peakDba instead
+    // so the kiosk gets a representative segment to highlight.
+    if (peakPop <= 0 && !permissive) continue
     const { total, lenFt } = impactSegments(winPts, popAt, distFt)
     const impact_index = lenFt > 0 ? (total / lenFt) / POP_SCALE : 0
-    const rawScore = Math.round(impact_index * scale)
-    // Null-when-clamping per kiosk's calibration request: while the
-    // window-scoped IMPACT_SCALE is provisional, a rawScore > 100 means
-    // we'd clamp; emit null instead. Internal rawScore is kept on the
-    // best record so window selection stays correct (the worst window
-    // still wins, it just doesn't surface a misleading 100).
-    const impact_score = rawScore > 100 ? null : Math.max(0, rawScore)
+    const rawScore = peakPop > 0
+      ? Math.round(impact_index * scale)
+      : Math.round(peakDba)
+    // Null-when-clamping per kiosk's calibration request: a rawScore > 100
+    // would clamp; emit null instead so the kiosk doesn't show a
+    // misleading 100. Internal rawScore stays on the best record so
+    // window selection still ranks correctly.
+    //
+    // EXCEPTION — permissive (pattern-only fallback): the kiosk drops
+    // worst_segments with null impact_score, which would defeat the
+    // purpose of the fallback. Clamp at 100 here and accept the
+    // imprecision; the operator-relevant signal is "this flight had a
+    // noteworthy 30 s window," not the exact rank.
+    const impact_score = rawScore > 100
+      ? (permissive ? Math.min(100, Math.round(peakDba)) : null)
+      : Math.max(0, rawScore)
     if (!best || rawScore > best._rawScore) {
       // Ask #9 info-box stats: AGL min/mean/peak, length_nm, people_exposed.
       // people_exposed is the people-seconds aggregate the kiosk wants
