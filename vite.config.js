@@ -3627,6 +3627,100 @@ function aglAdjustedDba(p, fieldElevFt, klass) {
   return d
 }
 
+// bridgeTrackGaps — fill in synthetic intermediate fixes across coverage
+// gaps when the implied groundspeed is consistent with reasonable
+// aircraft motion. Used to keep `worst_segment.points` renderable when
+// the kiosk's edge-length filter would otherwise drop the polyline
+// (a sparse 30 s window can have a single pair of fixes 30+ s apart;
+// the renderer treats that as a coverage gap and skips it, so the
+// worst-segment overlay becomes orphaned even though the segment is
+// physically real).
+//
+// Synthetic points get a 5th tuple slot = 1 so downstream renderers
+// can style them distinctly (dashed line, faded color, etc.). Real
+// points stay as 4-tuples (backwards compatible — old consumers ignore
+// the extra element).
+//
+// Acceptance test for a gap (per operator spec):
+//   1. Compute implied groundspeed = gap_dist / gap_dt
+//   2. If neighbor edges before/after the gap have a usable speed
+//      estimate, accept the bridge only when implied is within
+//      ±tolerance of the neighbor speed (default ±75%). Catches the
+//      "the plane really was going this fast, just lost coverage"
+//      case while rejecting "the plane disappeared and reappeared
+//      somewhere implausible."
+//   3. Falls back to a plausible-range check (30-400 kts covering
+//      GA + light jets) when no neighbor speed is available.
+//
+// Gaps longer than `maxBridgeMs` (default 5 min) are NEVER bridged
+// regardless of implied speed — at that scale the aircraft's actual
+// path is genuinely unknown.
+function bridgeTrackGaps(pts, opts = {}) {
+  const {
+    gapMs = 30_000,
+    maxBridgeMs = 5 * 60_000,
+    plausibleKtsMin = 30,
+    plausibleKtsMax = 400,
+    tolerance = 0.75,
+    targetEdgeMs = 15_000,
+  } = opts
+  if (!Array.isArray(pts) || pts.length < 2) return pts
+  const out = [pts[0]]
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i]
+    const dtMs = (b[3] || 0) - (a[3] || 0)
+    if (dtMs <= gapMs || dtMs > maxBridgeMs) { out.push(b); continue }
+
+    // Neighbor-speed estimate — prefer the edge before the gap; fall
+    // back to the edge after.
+    let neighborKts = null
+    if (i >= 2) {
+      const prev = pts[i - 2]
+      const ndtS = ((a[3] || 0) - (prev[3] || 0)) / 1000
+      if (ndtS > 0 && ndtS < 30) {
+        const ndnm = distFt(prev[0], prev[1], a[0], a[1]) / 6076.12
+        neighborKts = ndnm / (ndtS / 3600)
+      }
+    }
+    if (neighborKts == null && i + 1 < pts.length) {
+      const next = pts[i + 1]
+      const ndtS = ((next[3] || 0) - (b[3] || 0)) / 1000
+      if (ndtS > 0 && ndtS < 30) {
+        const ndnm = distFt(b[0], b[1], next[0], next[1]) / 6076.12
+        neighborKts = ndnm / (ndtS / 3600)
+      }
+    }
+
+    const gapDistNm = distFt(a[0], a[1], b[0], b[1]) / 6076.12
+    const impliedKts = gapDistNm / (dtMs / 3_600_000)
+
+    let accept = false
+    if (neighborKts != null && neighborKts >= plausibleKtsMin && neighborKts <= plausibleKtsMax) {
+      accept = impliedKts >= neighborKts * (1 - tolerance)
+             && impliedKts <= neighborKts * (1 + tolerance)
+    } else {
+      accept = impliedKts >= plausibleKtsMin && impliedKts <= plausibleKtsMax
+    }
+    if (!accept) { out.push(b); continue }
+
+    // Insert enough synthetic points to keep each resulting edge below
+    // targetEdgeMs. Linear interpolation on lat/lon/alt/ts.
+    const nSegments = Math.max(2, Math.ceil(dtMs / targetEdgeMs))
+    for (let k = 1; k < nSegments; k++) {
+      const t = k / nSegments
+      out.push([
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] != null && b[2] != null ? a[2] + (b[2] - a[2]) * t : (a[2] ?? b[2] ?? null),
+        Math.round((a[3] || 0) + dtMs * t),
+        1, // synth marker
+      ])
+    }
+    out.push(b)
+  }
+  return out
+}
+
 function computeWorstSegment(flightPts, popAt, airport, engineless, altOffsetFt = 0) {
   if (!flightPts || flightPts.length < 3 || !popAt) return null
   const pts = flightPts.filter(p => p[3] != null)
@@ -3708,6 +3802,17 @@ function computeWorstSegment(flightPts, popAt, airport, engineless, altOffsetFt 
     }
   }
   if (best) delete best._rawScore
+  if (best && Array.isArray(best.points)) {
+    // Bridge any in-window coverage gaps so the kiosk's edge-length
+    // filter doesn't orphan the polyline. Synthetic points carry a
+    // 5th tuple slot = 1 so the renderer can style them distinctly
+    // (e.g. dashed line). See bridgeTrackGaps for the acceptance
+    // rules.
+    const bridged = bridgeTrackGaps(best.points)
+    const synthCount = bridged.reduce((n, p) => n + (p[4] === 1 ? 1 : 0), 0)
+    best.points = bridged
+    best.points_synth_count = synthCount
+  }
   return best
 }
 
