@@ -3520,7 +3520,7 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   // differently (subtler color, dashed, etc.).
   let _ws = computeWorstSegment(nonPatternPts, POPGRID?.popAt, airport, engineless, calib.offset_ft)
   if (!_ws && flightPts.length >= 3) {
-    _ws = computeWorstSegment(flightPts, POPGRID?.popAt, airport, engineless, calib.offset_ft)
+    _ws = computeWorstSegment(flightPts, POPGRID?.popAt, airport, engineless, calib.offset_ft, { permissive: true })
     if (_ws) _ws.is_pattern = true
   }
   out.worst_segment = _ws
@@ -3724,7 +3724,8 @@ function aglAdjustedDba(p, fieldElevFt, klass) {
   return d
 }
 
-function computeWorstSegment(flightPts, popAt, airport, engineless, altOffsetFt = 0) {
+function computeWorstSegment(flightPts, popAt, airport, engineless, altOffsetFt = 0, opts = {}) {
+  const { permissive = false } = opts
   if (!flightPts || flightPts.length < 3 || !popAt) return null
   const pts = flightPts.filter(p => p[3] != null)
   if (pts.length < 3) return null
@@ -3749,10 +3750,18 @@ function computeWorstSegment(flightPts, popAt, airport, engineless, altOffsetFt 
       const popv = popAt(p[0], p[1]) || 0
       if (popv > peakPop) peakPop = popv
     }
-    if (peakPop <= 0) continue
+    // Skip windows over zero-population terrain unless we're in
+    // permissive mode (pattern-only-flight fallback). T&G work at a
+    // small field can leave EVERY 30 s window entirely over the
+    // runway's own zero-pop grid cells, which would normally produce
+    // a null worst_segment. In permissive mode rank by peakDba instead
+    // so the kiosk gets a representative segment to highlight.
+    if (peakPop <= 0 && !permissive) continue
     const { total, lenFt } = impactSegments(winPts, popAt, distFt)
     const impact_index = lenFt > 0 ? (total / lenFt) / POP_SCALE : 0
-    const rawScore = Math.round(impact_index * scale)
+    const rawScore = peakPop > 0
+      ? Math.round(impact_index * scale)
+      : Math.round(peakDba)
     // Null-when-clamping per kiosk's calibration request: while the
     // window-scoped IMPACT_SCALE is provisional, a rawScore > 100 means
     // we'd clamp; emit null instead. Internal rawScore is kept on the
