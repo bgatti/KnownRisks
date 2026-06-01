@@ -1840,6 +1840,7 @@ function excursionsApiPlugin() {
             const tracksSql = `
               SELECT call, type, desc_text AS desc, own_op AS "ownOp", src,
                      date, base_airport AS base, worst_class AS worst, school,
+                     purpose AS stored_purpose,
                      seg_total, seg_red, seg_orange, seg_yellow, seg_purple,
                      len_total_ft, len_red_ft, len_orange_ft, len_yellow_ft, len_purple_ft,
                      bands
@@ -2011,14 +2012,30 @@ function excursionsApiPlugin() {
             }
             const GROUND_AGL = 200 // ft above field elevation still counts as "on ground"
             const NEAR_NM = 2.5    // a track end this close to a field = a landing there
+            // schoolMap for purposeML shape inference — lazy-loaded global
+            // populated by current-flights / segments. When unset, the
+            // resolver degrades to isSchoolFleet=false (the only effect is
+            // `pattern_solo` not being upgraded to `training`).
+            const bootSchoolMap = global.__SCHOOL_TAIL_AIRPORT || null
             for (const t of liveTracks) {
               const info = tailInfo.get(t.call)
               t.base = info?.base || null
-              t.purpose = resolvePurpose(info?.purpose, t.type, t.call)
+              // Boot point stream comes from bands (each band has its own
+              // points[]). Flatten now so the shape classifier can see the
+              // full track without re-walking. resolvePurposeWithShape
+              // emits purpose_source on the wire so the kiosk can tell
+              // inferred (`shape`) from curated (`special_use` / `type`
+              // / `tracked`). See purposeML/ADOPTING_PURPOSE_ML_API.md.
+              const pts = (t.bands || []).flatMap((b) => b.points || [])
+              const bootPurposeAns = resolvePurposeWithShape(
+                info?.purpose, t.type, t.call, pts, bootSchoolMap,
+              )
+              t.purpose = bootPurposeAns.purpose
+              t.purpose_source = bootPurposeAns.source
+              if (bootPurposeAns.confidence != null) t.purpose_confidence = bootPurposeAns.confidence
               t.school = info?.school || t.school || null
               t.desc = info?.descr || expandType(t.type) // expanded aircraft type
               t.origin = null; t.dest = null; t.landed = false; t.on_ground_min = null
-              const pts = (t.bands || []).flatMap((b) => b.points || [])
               if (pts.length >= 2) {
                 const p0 = pts[0], pN = pts[pts.length - 1]
                 const o = nearestAp(p0[0], p0[1]); if (o.dist <= 3) t.origin = o.code
@@ -2232,8 +2249,19 @@ function excursionsApiPlugin() {
                 // so glow lights only the segments actually within earshot
                 // of when the complainant pressed record.
                 fsMod.attachComplaintsToBands(bands, trackComplaints, { pad: 60 * 1000 })
+                // Shape-boosted purpose for historical tracks. `pts`
+                // already flattened above for phase classification; reuse.
+                const histSchoolMap = global.__SCHOOL_TAIL_AIRPORT || null
+                const histPurposeAns = resolvePurposeWithShape(
+                  r.stored_purpose, r.type, r.call, pts, histSchoolMap,
+                )
+                const histExtras = {
+                  purpose: histPurposeAns.purpose,
+                  purpose_source: histPurposeAns.source,
+                }
+                if (histPurposeAns.confidence != null) histExtras.purpose_confidence = histPurposeAns.confidence
                 return {
-                  ...r, ...(exemptedCounters || {}), bands,
+                  ...r, ...(exemptedCounters || {}), ...histExtras, bands,
                   phase: ph.phase, descents: ph.descents, hasDescents: ph.hasDescents,
                   vnap_exempt: engineless || undefined,
                   complaints: trackComplaints,
@@ -7272,14 +7300,25 @@ function adsbApiPlugin() {
               complaintsRaw, tail, takeoffMs, last[3] || nowMs,
             )
 
-            flights.push({
+            // Shape-boosted purpose via purposeML — same priority chain
+            // as /api/excursions/segments. schoolMap is already in scope
+            // (global.__SCHOOL_TAIL_AIRPORT, loaded above). pts is the
+            // current-session points already trimmed for this aircraft.
+            // purpose_source distinguishes inferred (`shape`) from curated
+            // (`special_use` / `type` / `tracked`).
+            // See purposeML/ADOPTING_PURPOSE_ML_API.md.
+            const cfPurposeAns = resolvePurposeWithShape(
+              inf.purpose, t.type, tail, pts, schoolMap,
+            )
+            const cfRow = {
               icao: t.hex,
               tail,
               type: t.type || null,
               desc: inf.descr || expandType(t.type),
               base: inf.base || (schoolBase ? airport : null) || (fleetBase ? airport : null),
               based_reason: basedReason,
-              purpose: resolvePurpose(inf.purpose, t.type, tail),
+              purpose: cfPurposeAns.purpose,
+              purpose_source: cfPurposeAns.source,
               school: inf.school || schoolEntry?.school || null,
               lat: last[0], lon: last[1],
               alt_ft: last[2], alt_agl: Math.round(altAgl),
@@ -7293,7 +7332,9 @@ function adsbApiPlugin() {
               current_maneuvers: currentManeuvers,
               intent: intentTop,
               complaints: flightComplaints,
-            })
+            }
+            if (cfPurposeAns.confidence != null) cfRow.purpose_confidence = cfPurposeAns.confidence
+            flights.push(cfRow)
           }
           flights.sort((a, b) => (a.dist_nm - b.dist_nm))
           // Top-level complaint feed — recent complaints (last 60 min, matching
