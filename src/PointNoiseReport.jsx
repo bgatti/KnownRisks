@@ -12,8 +12,9 @@ import {
   segmentDba,
   npv,
   businessModelColumn,
+  regulatoryColumn,
 } from './whatif.js'
-export { pickSubstituted, pickEliminated, shouldWinchSegment, segmentDba, npv, businessModelColumn }
+export { pickSubstituted, pickEliminated, shouldWinchSegment, segmentDba, npv, businessModelColumn, regulatoryColumn }
 
 /* SVG-pin DivIcon for the map pin. Drawn at 26×34 with anchor at base. */
 const PIN_ICON = L.divIcon({
@@ -434,7 +435,111 @@ function dbaBandColor(d) {
  *            of mostly-quiet passes vs. a busy hour with a couple of jets)
  *
  * `highlightHour` (optional) dims every other bar so the peak hour stands out.
+ *
+ * §11-CLIENT §13: still used by the AVERAGE-dBA hourly chart. The PEAK
+ * variant was retired in favour of HourlyDbaBandsChart (see below) which
+ * responds to substitutions in a way the peak metric structurally can't.
  */
+const DBA_BANDS = [
+  { lo: 0,  hi: 50,  label: '< 50',  color: '#1e40af' },
+  { lo: 50, hi: 55,  label: '50–54', color: '#38bdf8' },
+  { lo: 55, hi: 65,  label: '55–64', color: '#facc15' },
+  { lo: 65, hi: 75,  label: '65–74', color: '#fb923c' },
+  { lo: 75, hi: 999, label: '≥ 75',  color: '#f87171' },
+]
+function dbaBandIndex(dba) {
+  for (let i = DBA_BANDS.length - 1; i >= 0; i--) {
+    if (dba >= DBA_BANDS[i].lo) return i
+  }
+  return 0
+}
+function bucketizeHourlyBands(rows) {
+  const buckets = Array.from({ length: 24 }, () => ({
+    count: 0,
+    bands: new Array(DBA_BANDS.length).fill(0),
+  }))
+  if (!rows) return buckets
+  for (const r of rows) {
+    if (r.closestTs == null) continue
+    const h = new Date(r.closestTs).getHours()
+    const b = buckets[h]
+    b.count++
+    b.bands[dbaBandIndex(r.dba)]++
+  }
+  return buckets
+}
+function HourlyDbaBandsChart({ buckets, scenarioBuckets, caption }) {
+  const scenarioOn = Array.isArray(scenarioBuckets) && scenarioBuckets.length === 24
+  const max = Math.max(
+    1,
+    ...buckets.map((b) => b.count),
+    ...(scenarioOn ? scenarioBuckets.map((b) => b.count) : []),
+  )
+  const W = 720, H = 220, padBottom = 44, padTop = 44, padX = 24
+  const colW = (W - padX * 2) / 24
+  const usableH = H - padBottom - padTop
+  const renderStack = (b, x, w, opacity, keyPrefix) => {
+    if (!b || b.count === 0) return null
+    let y = H - padBottom
+    return DBA_BANDS.map((band, i) => {
+      const n = b.bands[i] || 0
+      if (n === 0) return null
+      const segH = (n / max) * usableH
+      const rect = (
+        <rect key={`${keyPrefix}-${i}`} x={x} y={y - segH} width={w} height={segH}
+          fill={band.color} opacity={opacity}>
+          <title>{`${keyPrefix} ${band.label} dBA: ${n} pass${n === 1 ? '' : 'es'}`}</title>
+        </rect>
+      )
+      y -= segH
+      return rect
+    })
+  }
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full">
+      {buckets.map((b, h) => {
+        const x = padX + h * colW
+        const sb = scenarioOn ? scenarioBuckets[h] : null
+        const halfW = (colW - 2) / 2
+        const fullW = colW - 2
+        return (
+          <g key={h}>
+            {scenarioOn
+              ? <>
+                  {renderStack(b, x + 1, halfW, 0.5, `baseline ${formatHour12(h)}`)}
+                  {renderStack(sb, x + 1 + halfW, halfW, 1, `scenario ${formatHour12(h)}`)}
+                </>
+              : renderStack(b, x + 1, fullW, 1, `${formatHour12(h)}`)}
+            {h % 3 === 0 && (
+              <text x={x + colW / 2} y={H - 14} textAnchor="middle"
+                fill="rgba(255,255,255,0.7)" fontSize="18" fontFamily="ui-monospace, monospace">
+                {formatHour12(h)}
+              </text>
+            )}
+            {b.count > 0 && (b.count / max) * usableH > 22 && (
+              <text x={x + colW / 2} y={H - padBottom - (b.count / max) * usableH - 5}
+                textAnchor="middle" fill="rgba(255,255,255,0.85)"
+                fontSize="14" fontFamily="ui-monospace, monospace">
+                {b.count}
+              </text>
+            )}
+          </g>
+        )
+      })}
+      <line x1={padX} y1={H - padBottom} x2={W - padX} y2={H - padBottom} stroke="rgba(255,255,255,0.15)" />
+      <text x={padX} y={16} fill="rgba(255,255,255,0.6)" fontSize="14">{caption}</text>
+      <g transform={`translate(${padX}, 28)`}>
+        {DBA_BANDS.map((band, i) => (
+          <g key={i} transform={`translate(${i * 90}, 0)`}>
+            <rect x={0} y={0} width={12} height={10} fill={band.color} />
+            <text x={16} y={9} fill="rgba(255,255,255,0.65)" fontSize="11">{band.label}</text>
+          </g>
+        ))}
+      </g>
+    </svg>
+  )
+}
+
 function HourlyChart({ buckets, highlightHour, colorBy = 'peak', caption, scenarioBuckets }) {
   // Font sizes are in viewBox units; the SVG scales down to fit its container
   // (typically ~480 px wide for the 720-unit viewBox = 0.67× scale). Tick
@@ -823,11 +928,28 @@ function BusinessModelTable({ cols, dbDelta }) {
           </tr>
         </thead>
         <tbody>
+          {/* §11-CLIENT V2 §4: Mechanism row — distinguishes airframe-swap
+              columns ("Airframe substitution") from regulatory ones
+              ("Regulatory rollback" / "FAA Part 61 rulemaking + per-school
+              FTD"). Helps the reader interpret the CapEx + savings rows. */}
+          <tr className="border-t border-white/10">
+            <td className="py-1.5 px-3 text-white/70">Mechanism</td>
+            {cols.map((c) => (
+              <td key={c.code} className="text-right px-3 text-xs text-white/60">
+                {c.mechanism || '—'}
+              </td>
+            ))}
+          </tr>
           <tr className="border-t border-white/10">
             <td className="py-1.5 px-3 text-white/70">CapEx</td>
             {cols.map((c) => (
-              <td key={c.code} className="text-right px-3 tabular-nums">
+              <td key={c.code} className="text-right px-3 tabular-nums" title={c.capexNote || ''}>
                 {fmtUsd(-c.capex)}
+                {c.capexNote && (
+                  <div className="text-[10px] text-white/40 normal-case font-normal">
+                    {c.capexNote}
+                  </div>
+                )}
               </td>
             ))}
           </tr>
@@ -1682,8 +1804,25 @@ export default function PointNoiseReport() {
     return Math.max(0, basePeak - scnPeak)
   }, [scenarioActive, filteredRows, scenarioRows])
 
+  // §11-CLIENT V2 §4: distinct schools among the eliminated tracks — drives
+  // the SIMX `N_schools_affected` (one FTD per school). When none of the
+  // eliminated tracks carry a `school` attribute (typical when the fleet
+  // roster doesn't cover them), default to 1 so the column still renders
+  // with a coherent capex number.
+  const schoolsAffected = useMemo(() => {
+    if (eliminatedTails.size === 0) return 0
+    const schools = new Set()
+    for (const r of allRows) {
+      if (!eliminatedTails.has(r.tail)) continue
+      if (r.school) schools.add(r.school)
+    }
+    return schools.size > 0 ? schools.size : 1
+  }, [allRows, eliminatedTails])
+
   // §11-CLIENT §7: business-model table. One column per active substitute
-  // (slider > 0).
+  // (slider > 0). V2 adds ATPR + SIMX (regulatory demand-reduction) via a
+  // separate builder — their NPV shape differs from airframe substitutes
+  // (no per-airframe capex; ATPR is purely an advocacy line item).
   const businessModelCols = useMemo(() => {
     if (!scenarioActive || !substitutes?.length) return []
     const cols = []
@@ -1702,8 +1841,26 @@ export default function PointNoiseReport() {
     slot('EFOX', scenario.eurofox_pct)
     slot('SINU', scenario.sinus_pct)
     slot('WNCH', scenario.winch_agl_ft, true)
+    // §11-CLIENT V2 §4: regulatory demand-reduction columns. Show only when
+    // the slider is active AND it actually eliminated at least one track in
+    // the current window. nSchoolsAffected sizes the FTD capex for SIMX;
+    // ATPR ignores it (advocacy capex is one-time).
+    const regSlot = (code, pct) => {
+      if (!pct || pct <= 0) return
+      const sub = findSub(substitutes, code)
+      if (!sub) return
+      if (eliminatedTails.size === 0) return
+      const col = regulatoryColumn({
+        sub, scenario,
+        nSchoolsAffected: Math.max(1, schoolsAffected),
+        dbDelta,
+      })
+      if (col) cols.push(col)
+    }
+    regSlot('ATPR', scenario.atpr_pct)
+    regSlot('SIMX', scenario.simx_pct)
     return cols
-  }, [scenarioActive, substitutes, scenarioPicks, winchTracks, scenario, dbDelta])
+  }, [scenarioActive, substitutes, scenarioPicks, winchTracks, scenario, dbDelta, eliminatedTails, schoolsAffected])
 
   const peakHour = useMemo(() => {
     let h = -1, best = -Infinity
@@ -2032,41 +2189,39 @@ export default function PointNoiseReport() {
           />
         </Section>
 
-        {/* Hourly (peak-coloured) + dBA distribution side by side */}
+        {/* Hourly (stacked dBA bands) + dBA distribution side by side.
+            §11-CLIENT §13: replaced the peak-coloured chart with a
+            stacked-bands variant — every substitution that pushes a
+            pass into a quieter band is visible as band-segment growth,
+            so the chart is responsive to substitutions even when
+            per-hour peak is unchanged. */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <Section
-            title={scenarioActive ? 'When does the noise happen? — peak dBA (scenario overlay)' : 'When does the noise happen? — peak dBA'}
+            title={scenarioActive ? 'When does the noise happen? — by dBA band (scenario)' : 'When does the noise happen? — by dBA band'}
             hint={scenarioActive
               ? (() => {
-                // §11-CLIENT §12: show whether the PEAK chart actually
-                // responded to the scenario sliders, and explain it when
-                // it didn't. Peak in each hour is driven by the loudest
-                // pass — if that pass is a non-substituted aircraft
-                // (typical when only training is being swapped), the
-                // colour stays put. Compute the per-hour peak delta to
-                // surface the response (or honest lack thereof).
-                let movedHours = 0, totalPeakDrop = 0, hoursWithPasses = 0
+                // Count how many flights moved INTO a quieter band under
+                // the scenario. That's the metric this chart was designed
+                // around — every substitution that drops a pass from
+                // (e.g.) 70-74 to 60-64 is one "quieted" flight.
+                let quieted = 0
                 for (let h = 0; h < 24; h++) {
-                  const b = hourlyBuckets[h]; const sb = scenarioHourly[h]
-                  if (!b || b.count === 0) continue
-                  hoursWithPasses++
-                  const drop = b.peakDba - (sb?.peakDba || 0)
-                  if (drop > 0.5) { movedHours++; totalPeakDrop += drop }
+                  const b = hourlyBandBuckets[h]; const sb = scenarioHourlyBandBuckets?.[h]
+                  if (!b || !sb) continue
+                  // Walk loud→quiet; sum the positive shifts away from loud bands.
+                  for (let i = DBA_BANDS.length - 1; i > 0; i--) {
+                    const drop = (b.bands[i] || 0) - (sb.bands[i] || 0)
+                    if (drop > 0) quieted += drop
+                  }
                 }
-                if (movedHours === 0) {
-                  return 'Grey = baseline. No hour\'s peak changed — the loudest pass each hour is a non-substituted aircraft. Look at the avg-dBA chart below for the typical-pass impact.'
-                }
-                const avgDrop = (totalPeakDrop / movedHours).toFixed(1)
-                return `Grey = baseline. Coloured = scenario. ${movedHours} of ${hoursWithPasses} hours got a quieter peak (avg −${avgDrop} dBA).`
+                return `Side-by-side: left bar = baseline, right bar = scenario. ${quieted} pass${quieted === 1 ? '' : 'es'} moved into a quieter band.`
               })()
-              : 'Bar = passes that hour · colour = LOUDEST single pass in that hour'}
+              : 'Stacked bands by peak dBA at the listener. Each hour\'s total stays the same — substitutions visibly grow the quiet bands and shrink the loud ones.'}
           >
-            <HourlyChart
-              buckets={hourlyBuckets}
-              scenarioBuckets={scenarioActive ? scenarioHourly : null}
-              highlightHour={peakHour}
-              colorBy="peak"
-              caption="flights / hour (local) — bar color = peak dBA in that hour"
+            <HourlyDbaBandsChart
+              buckets={hourlyBandBuckets}
+              scenarioBuckets={scenarioActive ? scenarioHourlyBandBuckets : null}
+              caption="passes / hour by peak dBA at the listener"
             />
           </Section>
           <Section
