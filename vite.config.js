@@ -12,7 +12,23 @@ import {
 } from './scenarioSubstitutes.js'
 import { NOISE_ZONES } from './src/noiseZones.js'
 import { classifyOneTrack, phaseMLApiPlugin } from './phaseML/index.js'
-import { classifyOneTrack as purposeMLClassify, purposeMLApiPlugin } from './purposeML/index.js'
+// purposeML is an optional sibling library. When present, the shape
+// branch of resolvePurposeWithShape fires; when absent, the branch is
+// skipped and the resolver falls through to the type-based fallback
+// (the rest of the priority chain still works). Loaded lazily via
+// createRequire so a missing library only logs a warning instead of
+// breaking module load. See purposeML/ADOPTING_PURPOSE_ML_API.md.
+let purposeMLClassify = null
+let purposeMLApiPlugin = () => ({ name: 'purpose-ml-noop' })
+try {
+  const { createRequire } = await import('module')
+  const requireOpt = createRequire(import.meta.url)
+  const mod = requireOpt('./purposeML/index.js')
+  if (mod && typeof mod.classifyOneTrack === 'function') purposeMLClassify = mod.classifyOneTrack
+  if (mod && typeof mod.purposeMLApiPlugin === 'function') purposeMLApiPlugin = mod.purposeMLApiPlugin
+} catch (err) {
+  console.warn('[purposeML] library unavailable — shape inference disabled:', err && err.message)
+}
 import { synthesizeInProgressCycle } from './flightCycles.js'
 import {
   computeFlightAltOffset,
@@ -213,10 +229,12 @@ function resolvePurposeWithShape(stored, type, tail, points, schoolMap) {
   const tailKey = tail ? String(tail).toUpperCase() : ''
   const isSchoolFleet = !!(schoolMap && tailKey && schoolMap.has(tailKey))
   // 4. Path-shape inference — only when there are enough fixes to be
-  //    meaningful. The classifier itself enforces 30+ points / 5+ min
-  //    active; this gate is cheap and avoids the call entirely for
-  //    fresh airborne flights with sparse history.
-  if (Array.isArray(points) && points.length >= 30) {
+  //    meaningful AND the optional purposeML library actually loaded.
+  //    The classifier itself enforces 30+ points / 5+ min active; this
+  //    gate is cheap and avoids the call entirely for fresh airborne
+  //    flights with sparse history.
+  if (typeof purposeMLClassify === 'function'
+      && Array.isArray(points) && points.length >= 30) {
     try {
       const objPoints = pointsToPurposeMLShape(points)
       const v = purposeMLClassify(objPoints, {
