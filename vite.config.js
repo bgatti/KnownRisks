@@ -8,6 +8,13 @@ import { distFt, classifyPoint, isEnginelessType } from './src/geo.js'
 import { NOISE_ZONES } from './src/noiseZones.js'
 import { classifyOneTrack, phaseMLApiPlugin } from './phaseML/index.js'
 import { synthesizeInProgressCycle } from './flightCycles.js'
+import {
+  computeFlightAltOffset,
+  regionalOffsetSeries,
+  smoothedOffsetFor,
+  applyOffsetToPoints,
+  VERIFIED_ALT_CAL_RADIUS_NM,
+} from './src/altCorrection.js'
 
 // Load .env.local into process.env BEFORE importing db.js (which reads
 // DATABASE_URL at module load). Lets local dev point at Railway's Postgres
@@ -1277,6 +1284,72 @@ function excursionsApiPlugin() {
           // tracks are 3-element with no timestamps — for those we trust
           // the date-level filter applied above.
           const filterPointsByTime = !!(fromParam || toParam)
+
+          // ── Per-track alt-correction pre-pass ────────────────────────
+          // Each track gets its own self-calibrated offset (lowest-25% or
+          // runway-anchor cohort vs the base-airport elevation), the
+          // regional smoother averages across nearby landings at the same
+          // airport, and the smoothed offset is subtracted from every
+          // point before classification. Without this, segment points
+          // carry raw barometric altitude → AGL math goes negative on
+          // any flight whose transponder over-reads by a few hundred
+          // feet. See `noise/web/ADJUSTED_ALT.md`.
+          const pickAirportForTrack = (t) => {
+            if (t.base_airport) {
+              const ap = ENRICH_AP.find(a => a.code === t.base_airport)
+              if (ap) return ap
+            }
+            // Fall back to the nearest airport whose first or last fix
+            // lies within VERIFIED_ALT_CAL_RADIUS_NM. This catches live
+            // tracks that don't carry the base_airport column.
+            if (!t.points?.length) return null
+            const first = t.points[0]
+            const last = t.points[t.points.length - 1]
+            let best = null, bestD = VERIFIED_ALT_CAL_RADIUS_NM
+            for (const ap of ENRICH_AP) {
+              const dF = first[0] != null && first[1] != null
+                ? distNmAp(first[0], first[1], ap.lat, ap.lon) : Infinity
+              const dL = last[0] != null && last[1] != null
+                ? distNmAp(last[0], last[1], ap.lat, ap.lon) : Infinity
+              const d = Math.min(dF, dL)
+              if (d < bestD) { bestD = d; best = ap }
+            }
+            return best
+          }
+          const midMsOfTrack = (t) => {
+            if (!t.points?.length) return null
+            const first = t.points[0]?.[3]
+            const last = t.points[t.points.length - 1]?.[3]
+            if (typeof first !== 'number' || typeof last !== 'number') return null
+            return (first + last) / 2
+          }
+          const selfCalibrated = []
+          const apByTrack = new WeakMap()
+          for (const t of matches) {
+            if (!t.points?.length) continue
+            const ap = pickAirportForTrack(t)
+            if (!ap) continue
+            apByTrack.set(t, ap)
+            const mid = midMsOfTrack(t)
+            if (mid == null) continue
+            const { offset_ft, calibration_fixes } = computeFlightAltOffset(t.points, ap)
+            if (!calibration_fixes) continue
+            selfCalibrated.push({
+              airport: ap.code, midMs: mid,
+              offsetFt: offset_ft, calibrationFixes: calibration_fixes,
+            })
+          }
+          const altSeries = regionalOffsetSeries(selfCalibrated)
+          const offsetByTrack = new WeakMap()
+          for (const t of matches) {
+            const ap = apByTrack.get(t)
+            if (!ap) continue
+            const mid = midMsOfTrack(t)
+            if (mid == null) continue
+            const sm = smoothedOffsetFor(ap.code, mid, altSeries)
+            if (sm) offsetByTrack.set(t, sm.offset_ft)
+          }
+
           for (const t of matches) {
             const m = (t.src || '').match(/(\d{4}-\d{2}-\d{2})/)
             const date = m ? m[1] : (t.src === 'live' ? toDate : null)
@@ -1284,10 +1357,16 @@ function excursionsApiPlugin() {
             // Build the point list to walk. When a precise window was
             // requested and the track has per-point timestamps, drop points
             // outside it; otherwise use all points.
-            const walk = (filterPointsByTime && t.points.length && typeof t.points[0][3] === 'number')
+            const walkRaw = (filterPointsByTime && t.points.length && typeof t.points[0][3] === 'number')
               ? t.points.filter((p) => p[3] >= fromMs && p[3] <= toMs)
               : t.points
-            if (walk.length === 0) continue
+            if (walkRaw.length === 0) continue
+            // Apply the regional-smoothed offset to every point before
+            // classification — zone tests use p[2] (alt MSL), and every
+            // point that ends up in segments[*].points[] must already
+            // carry the corrected altitude.
+            const trackOffset = offsetByTrack.get(t) || 0
+            const walk = applyOffsetToPoints(walkRaw, trackOffset)
             // Engineless aircraft (gliders, balloons) are VNAP-exempt — emit
             // their segments as a single clean band so they never appear in
             // the excursion feed even when low over a noise zone.
@@ -1347,6 +1426,10 @@ function excursionsApiPlugin() {
                 // Null on live-only tracks (the live_tracks JSONB doesn't carry it);
                 // we backfill from historical candidates of the same tail below.
                 base_airport: t.base_airport || null,
+                // alt_offset_ft: regional-smoothed per-track ADS-B
+                // altitude correction (subtracted from raw alt before
+                // classification). 0 when no calibration was available.
+                alt_offset_ft: trackOffset,
                 segments: filtered,
               })
             }
@@ -3133,178 +3216,10 @@ function patternEnvelopeFor(airport) {
 // constant per-airport.
 const PATTERN_WEIGHT = 0.3
 
-// Region-wide alt-offset smoother. Each "landing-anchor" measurement from
-// any flight (its own lowest-25% cohort vs field elev) feeds an in-memory
-// per-airport time series. For any given flight we look at the 2 landings
-// before and 2 after its midtime and average — outliers further than
-// max(50, stddev) from the cohort mean get dropped before the final mean.
-// Smoothing across multiple flights catches baro drift during long flights,
-// rescues flights that never approached the runway, and reduces single-
-// transponder noise from any one calibration.
-const REGIONAL_OFFSET_WINDOW_MS = 12 * 3600 * 1000 // keep last 12 h of events
-const REGIONAL_OFFSET_NEAR_N = 2 // 2 landings before + 2 after
-
-function regionalOffsetSeriesFromFlights(flights) {
-  // Build per-airport time series from the per-flight self-calibration
-  // measurements. Each flight contributes one event { landingMs, offsetFt }
-  // when its own cohort yields a non-zero offset. landingMs is the flight's
-  // midtime (best proxy for when that transponder/baro state held).
-  const byAirport = new Map()
-  const now = Date.now()
-  for (const f of flights) {
-    if (!f._selfOffset || !f._selfOffsetCohort) continue
-    const mid = f._midMs
-    if (now - mid > REGIONAL_OFFSET_WINDOW_MS) continue
-    const a = f._airport
-    if (!a) continue
-    if (!byAirport.has(a)) byAirport.set(a, [])
-    byAirport.get(a).push({ landingMs: mid, offsetFt: f._selfOffset })
-  }
-  for (const series of byAirport.values()) series.sort((a, b) => a.landingMs - b.landingMs)
-  return byAirport
-}
-
-function smoothedOffsetFor(airport, midMs, series) {
-  const events = series.get(airport)
-  if (!events || events.length === 0) return null
-  const before = events.filter(e => e.landingMs < midMs).slice(-REGIONAL_OFFSET_NEAR_N)
-  const after = events.filter(e => e.landingMs >= midMs).slice(0, REGIONAL_OFFSET_NEAR_N)
-  const sample = [...before, ...after].map(e => e.offsetFt)
-  if (sample.length === 0) return null
-  const mean = sample.reduce((s, v) => s + v, 0) / sample.length
-  const variance = sample.reduce((s, v) => s + (v - mean) * (v - mean), 0) / sample.length
-  const stddev = Math.sqrt(variance)
-  const band = Math.max(50, stddev)
-  const filtered = sample.filter(v => Math.abs(v - mean) <= band)
-  const finalMean = (filtered.length > 0 ? filtered : sample).reduce((s, v) => s + v, 0) / (filtered.length || sample.length)
-  return { offset_ft: Math.round(finalMean), n_landings: sample.length }
-}
-
-// `verified_alt` — back out ADS-B reporting drift on a per-flight basis.
-// Mode-S barometric altitude is calibrated to standard-pressure (29.92)
-// while the published runway elevation is true MSL. Local pressure and
-// transponder accuracy combine to give each flight a systematic offset
-// that can be hundreds of feet — enough to make a pattern leg read as
-// en-route, or vice-versa.
-//
-// Calibration: any fix that's geographically over the airport AND at a
-// reported altitude close to the field is taken as ground-truth. The
-// per-flight offset is the average delta between those reported alts
-// and the field elevation. Apply by subtracting offset_ft from any raw
-// reported altitude:
-//   verified_alt_ft = reported_alt_ft - offset_ft
-//   verified_agl_ft = verified_alt_ft - field_elev_ft
-//
-// Tuning knobs:
-//   CAL_RADIUS_NM        — how close to airport center we look for anchors
-//   CAL_COHORT_FRACTION  — what fraction of the lowest fixes to average
-//                          (the lowest fixes are closest to the runway
-//                          surface — touchdown / taxi / start-of-roll)
-//   CAL_MIN_FIXES        — minimum candidate fixes before we attempt
-//   CAL_MAX_AGL_FT       — sanity bound on cohort mean (if it's higher,
-//                          the plane never actually descended to the
-//                          runway and we can't calibrate)
-const VERIFIED_ALT_CAL_RADIUS_NM = 2.0
-const VERIFIED_ALT_CAL_COHORT_FRACTION = 0.25
-const VERIFIED_ALT_CAL_MIN_FIXES = 3
-const VERIFIED_ALT_CAL_MAX_AGL_FT = 500
-
-// Signal weights for runway-anchor scoring. Stationary indicators
-// (gs < 20 kts, multiple consecutive fixes at the same alt) are
-// highest-confidence; vs ≈ 0 (level flight) is meaningful but weaker
-// since level flight at any altitude scores too. Anchors with stronger
-// scores win the cohort selection; same-score ties break to lower alt.
-const RUNWAY_GS_KTS_MAX = 20
-const RUNWAY_VS_FPM_MAX = 100
-const RUNWAY_ALT_CLUSTER_FT = 10
-const RUNWAY_ALT_CLUSTER_NEIGHBORS = 2
-const RUNWAY_SCORE_W_GS = 3
-const RUNWAY_SCORE_W_VS = 2
-const RUNWAY_SCORE_W_CLUSTER = 2
-
-// Find high-confidence runway-anchor fixes from a flight track. Combines
-// stationary signals (low ground speed, low vertical speed, alt-clustered
-// neighbors) into a per-fix score. Returns anchors sorted by score
-// descending (and alt ascending as a tiebreaker). Per operator: vs=0,
-// gs<20 kts, and several consecutive datums at the same alt are strong
-// hints the aircraft is on the runway. Sometimes we won't see these —
-// in which case the caller falls back to the lowest-25% method.
-function findRunwayAnchors(flightPts, ap) {
-  const out = []
-  for (let i = 0; i < flightPts.length; i++) {
-    const p = flightPts[i]
-    if (p[0] == null || p[1] == null || p[2] == null) continue
-    if (distNmAp(p[0], p[1], ap.lat, ap.lon) > VERIFIED_ALT_CAL_RADIUS_NM) continue
-    let vs = null, gs = null
-    if (i > 0) {
-      const prev = flightPts[i - 1]
-      const dtSec = ((p[3] || 0) - (prev[3] || 0)) / 1000
-      if (dtSec > 0 && dtSec < 60 && prev[2] != null) {
-        vs = ((p[2] - prev[2]) / dtSec) * 60 // ft/min
-        const dFt = distFt(prev[0], prev[1], p[0], p[1])
-        gs = (dFt / dtSec) / 1.68781 // ft/s → knots
-      }
-    }
-    let score = 0
-    if (gs != null && gs < RUNWAY_GS_KTS_MAX) score += RUNWAY_SCORE_W_GS
-    if (vs != null && Math.abs(vs) < RUNWAY_VS_FPM_MAX) score += RUNWAY_SCORE_W_VS
-    let altNeighbors = 0
-    for (let j = Math.max(0, i - 2); j <= Math.min(flightPts.length - 1, i + 2); j++) {
-      if (j === i) continue
-      const q = flightPts[j]
-      if (q && q[2] != null && Math.abs(q[2] - p[2]) <= RUNWAY_ALT_CLUSTER_FT) altNeighbors++
-    }
-    if (altNeighbors >= RUNWAY_ALT_CLUSTER_NEIGHBORS) score += RUNWAY_SCORE_W_CLUSTER
-    if (score > 0) out.push({ alt: p[2], score })
-  }
-  out.sort((a, b) => (b.score - a.score) || (a.alt - b.alt))
-  return out
-}
-
-function computeFlightAltOffset(flightPts, airport) {
-  const ap = ENRICH_AP.find(a => a.code === airport)
-  if (!ap || !flightPts || !flightPts.length) {
-    return { offset_ft: 0, calibration_fixes: 0 }
-  }
-  // Primary: high-confidence runway anchors from low gs/vs/alt-clustered
-  // fixes. Use anchors with score ≥ topScore/2 (keeps the best cohort).
-  const anchors = findRunwayAnchors(flightPts, ap)
-  if (anchors.length >= VERIFIED_ALT_CAL_MIN_FIXES) {
-    const topScore = anchors[0].score
-    const cohort = anchors.filter(a => a.score >= Math.max(1, topScore / 2))
-    if (cohort.length >= VERIFIED_ALT_CAL_MIN_FIXES) {
-      const avg = cohort.reduce((s, a) => s + a.alt, 0) / cohort.length
-      if ((avg - ap.elev) <= VERIFIED_ALT_CAL_MAX_AGL_FT) {
-        return {
-          offset_ft: Math.round(avg - ap.elev),
-          calibration_fixes: cohort.length,
-        }
-      }
-    }
-  }
-  // Fallback: lowest-25% of in-range fixes (the prior algorithm). Catches
-  // flights where we lack the speed/vs signals but did dip near the field.
-  const candidates = []
-  for (const p of flightPts) {
-    if (p[0] == null || p[1] == null || p[2] == null) continue
-    if (distNmAp(p[0], p[1], ap.lat, ap.lon) > VERIFIED_ALT_CAL_RADIUS_NM) continue
-    candidates.push(p[2])
-  }
-  if (candidates.length < VERIFIED_ALT_CAL_MIN_FIXES) {
-    return { offset_ft: 0, calibration_fixes: 0 }
-  }
-  const sorted = candidates.slice().sort((a, b) => a - b)
-  const kFloor = Math.max(VERIFIED_ALT_CAL_MIN_FIXES, Math.ceil(sorted.length * VERIFIED_ALT_CAL_COHORT_FRACTION))
-  const cohort = sorted.slice(0, kFloor)
-  const avg = cohort.reduce((s, v) => s + v, 0) / cohort.length
-  if ((avg - ap.elev) > VERIFIED_ALT_CAL_MAX_AGL_FT) {
-    return { offset_ft: 0, calibration_fixes: cohort.length }
-  }
-  return {
-    offset_ft: Math.round(avg - ap.elev),
-    calibration_fixes: cohort.length,
-  }
-}
+// `verified_alt` — per-flight ADS-B barometric altitude correction.
+// The math (`findRunwayAnchors`, `computeFlightAltOffset`, the regional
+// time smoother) lives in `./src/altCorrection.js` so /api/excursions/segments
+// can reuse it. See `noise/web/ADJUSTED_ALT.md` for the prose explainer.
 
 function isInPattern(p, ap, radiusNm, altAglFt) {
   if (!ap || p[0] == null || p[1] == null) return false
@@ -3400,7 +3315,7 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   // verified_alt offset for this flight — back out per-flight ADS-B
   // barometric drift by comparing low-over-field fixes to known field
   // elevation. Subtracted from any raw alt before computing AGL.
-  const calib = computeFlightAltOffset(flightPts, airport)
+  const calib = computeFlightAltOffset(flightPts, ap)
   out.alt_offset_ft = calib.offset_ft
   out.alt_offset_calibration_fixes = calib.calibration_fixes
   // Population-impact + worst-segment use a pattern-excluded subset — the
@@ -4901,25 +4816,29 @@ function flightsApiPlugin() {
           // transponder noise. The delta gets folded back into alt_agl_*
           // on worst_segment and incursion_segments so noise items
           // report the smoothed-corrected AGL.
-          const seriesByAirport = new Map()
+          // `regionalOffsetSeries` drops calibrationFixes==0; we also drop
+          // offsetFt==0 here to preserve the pre-refactor semantics (a
+          // flight whose cohort produced a 0-ft offset wasn't seeded into
+          // the series).
+          const midMsOf = (f) => {
+            const takeoffMs = Date.parse(f.takeoff_ts || '')
+            const landMs = f.landed_at ? Date.parse(f.landed_at) : takeoffMs
+            return Number.isFinite(takeoffMs) && Number.isFinite(landMs)
+              ? (takeoffMs + landMs) / 2 : nowMs
+          }
+          const selfCalibrated = []
           for (const f of flights) {
             const off = f.indicators?.alt_offset_ft
             const cohort = f.indicators?.alt_offset_calibration_fixes || 0
             if (!cohort || off === 0) continue
-            const takeoffMs = Date.parse(f.takeoff_ts || '')
-            const landMs = f.landed_at ? Date.parse(f.landed_at) : takeoffMs
-            const midMs = Number.isFinite(takeoffMs) && Number.isFinite(landMs)
-              ? (takeoffMs + landMs) / 2 : nowMs
-            if (!seriesByAirport.has(airport)) seriesByAirport.set(airport, [])
-            seriesByAirport.get(airport).push({ landingMs: midMs, offsetFt: off })
+            selfCalibrated.push({
+              airport, midMs: midMsOf(f),
+              offsetFt: off, calibrationFixes: cohort,
+            })
           }
-          for (const arr of seriesByAirport.values()) arr.sort((a, b) => a.landingMs - b.landingMs)
+          const seriesByAirport = regionalOffsetSeries(selfCalibrated)
           for (const f of flights) {
-            const takeoffMs = Date.parse(f.takeoff_ts || '')
-            const landMs = f.landed_at ? Date.parse(f.landed_at) : takeoffMs
-            const midMs = Number.isFinite(takeoffMs) && Number.isFinite(landMs)
-              ? (takeoffMs + landMs) / 2 : nowMs
-            const smoothed = smoothedOffsetFor(airport, midMs, seriesByAirport)
+            const smoothed = smoothedOffsetFor(airport, midMsOf(f), seriesByAirport)
             if (!smoothed) continue
             const oldOff = f.indicators.alt_offset_ft || 0
             const delta = smoothed.offset_ft - oldOff
@@ -8091,14 +8010,14 @@ const API_MANIFEST = {
             { name: 'limit', type: 'int', default: 200, desc: 'Cap on number of tracks returned (sorted by recency).' },
           ],
           response: {
-            tracks: '[{tail, type, src, date, live, phase, descents, base_airport, segments:[{klass, zone, points, startedAt, endedAt}]}]',
+            tracks: '[{tail, type, src, date, live, phase, descents, base_airport, alt_offset_ft, segments:[{klass, zone, points, startedAt, endedAt}]}]',
             center: '{lat, lon, radius_mi, radius_ft} | null',
             window: '{hours, from, to, limit}',
             matched: 'int — total tracks before limit',
           },
           example: '/api/excursions/segments?lat=40.04&lon=-105.22&radius_mi=5&hours=2',
           example2: '/api/excursions/segments?lat=40.04&lon=-105.22&radius_nm=2&from=2026-05-07T20:15:00Z&to=2026-05-07T20:30:00Z',
-          notes: 'Each segment.klass is null|yellow|orange|red — null = clean, others = noise violation severity. Points are [lat, lon, alt_ft, ts_ms]. Live tracks (src=live) carry per-point timestamps for sub-second filtering; historical tracks are date-only.',
+          notes: 'Each segment.klass is null|yellow|orange|red — null = clean, others = noise violation severity. Points are [lat, lon, alt_ft, ts_ms] with alt already corrected by alt_offset_ft (regional-smoothed per-track ADS-B baro-drift offset; 0 when no calibration available — see ADJUSTED_ALT.md). Live tracks (src=live) carry per-point timestamps for sub-second filtering; historical tracks are date-only.',
         },
         {
           method: 'GET',
