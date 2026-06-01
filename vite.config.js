@@ -711,6 +711,33 @@ function excursionsApiPlugin() {
   // mtime-based cache for the big tracks file. Re-read only when the file
   // on disk changes; avoids re-parsing 200 MB on every API hit.
   const fileCache = { tracks: null, schools: null, live: null }
+
+  // ── Caches for /api/excursions/boot ───────────────────────────────
+  //
+  // The handler runs three slow SQL queries (historical-tracks, per-tail
+  // active aggregation, per-tail enrichment join) plus a live_tracks
+  // multi-day pull. The region-wide case (no `airport=` filter) returned
+  // 500s averaging 59 s / max 98 s in production with 3-of-3 failure
+  // rate. SQL has no narrowing predicate beyond date + (worst_class
+  // NOT NULL), so the planner scans the whole 24 h window and sorts by
+  // a CASE expression over thousands of rows with multi-KB `bands`
+  // JSONB. With 8 s kiosk polling and 60 s response time, the pg pool
+  // (max=8) saturates; new requests wait until statement_timeout (25 s)
+  // fires and the handler returns 500.
+  //
+  // The "boot" semantic — clients call once at startup — tolerates a
+  // generous TTL. 45 s is long enough that repeated probes within a
+  // kiosk session are free; short enough that the next session sees
+  // fresh data.
+  //
+  // Request coalescing: concurrent callers for the same key wait on
+  // the leader's Promise rather than each running their own query
+  // against an already-saturated pool. This eliminates the
+  // pool-exhaustion 500 cascade in the multi-workstation case.
+  const BOOT_RESPONSE_TTL_MS = 45_000
+  const bootResponseCache = new Map() // key -> { body, fetchedAt }
+  const bootInFlight = new Map() // key -> Promise<{ body }>
+
   const TRACKS_DIR = 'C:\\tmp\\noise_data'
   const TRACK_YEARS = ['2023', '2024', '2025', '2026']
   const FILE_PATHS = {
@@ -1381,16 +1408,14 @@ function excursionsApiPlugin() {
       server.middlewares.use('/api/excursions/boot', async (req, res, next) => {
         console.log('[excursions-boot] hit:', req.method, req.url)
         if (req.method !== 'GET') return next()
+        // Coalesce-leader bookkeeping in outer scope so the catch can
+        // safely settle (or no-op for waiters / early returns).
+        let leaderResolve = null
+        let leaderReject = null
+        let leaderCacheKey = null
         try {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const hours = Number(u.searchParams.get('hours')) || 1
-          const limit = Math.min(500, Number(u.searchParams.get('limit')) || 100)
-          const includeSet = new Set(
-            (u.searchParams.get('include') || '')
-              .split(',')
-              .map((s) => s.trim())
-              .filter(Boolean),
-          )
           // `airport` filter — when set, the response narrows to tracks
           // attributed to (or flying through) the named field. Without it
           // the endpoint is region-wide (every Front Range airport mixed),
@@ -1400,12 +1425,75 @@ function excursionsApiPlugin() {
           // are filtered post-enrichment on `t.base === airport ||
           // t.origin === airport || t.dest === airport` (covers transit).
           const airport = (u.searchParams.get('airport') || '').trim().toUpperCase() || null
+          // Region-wide (no `airport=`) is the heaviest path: the SQL has
+          // no narrowing predicate beyond date, and the response includes
+          // every Front Range airport's tracks. The kiosk reported 3-of-3
+          // 500 / 59 s avg / 98 s max on hours=24&limit=150 unfiltered.
+          // Cap unfiltered limit at 75 to keep the worst-case payload and
+          // sort cost bounded — clients that want full detail must pass
+          // `airport=`. The `limit` query param still wins up to its hard
+          // ceiling (500 with airport, 75 without).
+          const rawLimit = Number(u.searchParams.get('limit')) || 100
+          const limit = airport ? Math.min(500, rawLimit) : Math.min(75, rawLimit)
+          const includeSet = new Set(
+            (u.searchParams.get('include') || '')
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean),
+          )
           if (airport && !ENRICH_AP.find(a => a.code === airport)) {
             res.statusCode = 400
             res.setHeader('Content-Type', 'application/json')
             res.setHeader('Access-Control-Allow-Origin', '*')
             return res.end(JSON.stringify({ error: `unknown airport ${airport}` }))
           }
+
+          // ── Response cache ──
+          // /boot is the kiosk's bootstrap call — probed once at startup
+          // and again on session reconnects. Cache the JSON body keyed on
+          // (airport, hours, limit, include) for BOOT_RESPONSE_TTL_MS
+          // (45 s). A warm cache eliminates the multi-second SQL +
+          // per-tail enrichment path entirely. The cached value is the
+          // already-serialized JSON string so we avoid re-stringifying.
+          const includeKey = [...includeSet].sort().join(',')
+          const cacheKey = `${airport || ''}|${hours}|${limit}|${includeKey}`
+          const cachedBoot = bootResponseCache.get(cacheKey)
+          if (cachedBoot && Date.now() - cachedBoot.fetchedAt < BOOT_RESPONSE_TTL_MS) {
+            res.setHeader('Content-Type', 'application/json')
+            res.setHeader('Access-Control-Allow-Origin', '*')
+            res.setHeader('X-Cache', 'HIT')
+            return res.end(cachedBoot.body)
+          }
+
+          // ── In-flight request coalescing ──
+          // Without this, when the kiosk fleet polls the endpoint while a
+          // MISS is computing, each request grabs a pool slot and runs
+          // the full SQL independently. With pool max=8 and ~60 s queries,
+          // the pool saturates and downstream requests time out with
+          // statement_timeout → 500. Coalescing lets every waiter on the
+          // same key share one computation.
+          const inflight = bootInFlight.get(cacheKey)
+          if (inflight) {
+            // Waiter path. If the leader rejects, the outer catch emits
+            // a clean 500 for this caller too.
+            const { body } = await inflight
+            res.setHeader('Content-Type', 'application/json')
+            res.setHeader('Access-Control-Allow-Origin', '*')
+            res.setHeader('X-Cache', 'COALESCED')
+            return res.end(body)
+          }
+          // Leader path: create the in-flight promise so coalesced callers
+          // arriving below can await it. Track the key + resolvers in
+          // outer scope so the success / error tails know to settle.
+          leaderCacheKey = cacheKey
+          const inflightPromise = new Promise((resolve, reject) => {
+            leaderResolve = resolve
+            leaderReject = reject
+          })
+          // Silence unhandled-rejection noise if no waiter ever attaches.
+          inflightPromise.catch(() => {})
+          bootInFlight.set(cacheKey, inflightPromise)
+
           const SEV = { yellow: 1, orange: 2, red: 3, purple: 4 }
           const nowMs = Date.now()
           const fromDate = new Date(nowMs - hours * 3600 * 1000).toISOString().slice(0, 10)
@@ -1768,9 +1856,7 @@ function excursionsApiPlugin() {
             }
           }
 
-          res.setHeader('Content-Type', 'application/json')
-          res.setHeader('Access-Control-Allow-Origin', '*')
-          res.end(JSON.stringify({
+          const responseBody = JSON.stringify({
             generated_at: new Date(nowMs).toISOString(),
             window: {
               hours, from: fromDate, to: toDate, limit,
@@ -1851,15 +1937,36 @@ function excursionsApiPlugin() {
               geocoded_count: complaintsForWindow.filter(c => c.lat != null && c.lon != null).length,
               items: complaintsForWindow,
             },
-          }))
+          })
+          // Cache the serialized body and release coalesced waiters before
+          // writing the response. Failures are NOT cached — the next caller
+          // retries.
+          bootResponseCache.set(cacheKey, { body: responseBody, fetchedAt: Date.now() })
+          if (leaderResolve) {
+            bootInFlight.delete(leaderCacheKey)
+            leaderResolve({ body: responseBody })
+          }
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Access-Control-Allow-Origin', '*')
+          res.setHeader('X-Cache', 'MISS')
+          res.end(responseBody)
         } catch (err) {
           console.error('[excursions-boot] error', err)
+          // Release any waiting coalesced callers with the same error so
+          // they emit their own 500 (or retry on the next poll). Only the
+          // leader has resolvers; waiters and early returns leave these
+          // null, in which case there's nothing to settle.
+          if (leaderReject) {
+            try {
+              bootInFlight.delete(leaderCacheKey)
+              leaderReject(err)
+            } catch {}
+          }
           res.statusCode = 500
           res.setHeader('Content-Type', 'application/json')
           // CORS must be set on the error path too — otherwise a DB-timeout
           // 500 (e.g. Query read timeout under load) reaches the browser as
-          // a CORS error, masking the real cause. The success path sets this
-          // header at line ~1736; this catch was missing it.
+          // a CORS error, masking the real cause.
           res.setHeader('Access-Control-Allow-Origin', '*')
           res.end(JSON.stringify({ error: String(err) }))
         }
