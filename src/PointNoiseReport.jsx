@@ -1557,6 +1557,10 @@ export default function PointNoiseReport() {
       eurofox:   String(scenario.eurofox_pct),
       sinus:     String(scenario.sinus_pct),
       winch_agl: String(scenario.winch_agl_ft),
+      // §11-CLIENT V2 §5: serialize regulatory demand-reduction sliders so
+      // the URL stays a shareable canonical of "the scenario I'm looking at".
+      atpr:      String(scenario.atpr_pct),
+      simx:      String(scenario.simx_pct),
       disc:      (scenario.rate * 100).toFixed(1),
       horizon:   String(scenario.horizon_yr),
       fuel:      scenario.fuel_multiplier.toFixed(2),
@@ -1569,6 +1573,8 @@ export default function PointNoiseReport() {
     scenario.eurofox_pct,
     scenario.sinus_pct,
     scenario.winch_agl_ft,
+    scenario.atpr_pct,
+    scenario.simx_pct,
     scenario.rate,
     scenario.horizon_yr,
     scenario.fuel_multiplier,
