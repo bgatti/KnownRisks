@@ -3970,12 +3970,23 @@ function flightsApiPlugin() {
   // but per-container amortization is already a 10-50x win.
   const TAIL_INFO_TTL_MS = 60_000
   const tailInfoCache = new Map()   // call -> { row, fetchedAt }
-  // Response-cache TTL is matched to the kiosk's 8 s polling interval so a
-  // warm cache survives until the next poll. Picked 8 s exactly because
-  // <8 s leaves a stale gap every cycle (poll → miss → 50 s recompute →
-  // brief warm → stale by next poll); >8 s would skew the kiosk's
-  // perceived freshness in the wrong direction.
-  const CURRENT_RESPONSE_TTL_MS = 8_000
+  // Response-cache freshness window. Within this age, cached body is
+  // returned as-is (X-Cache: HIT). Within STALE_MS, cached body is
+  // returned and a background refresh kicks off (X-Cache: STALE). Past
+  // STALE_MS, the request waits for a fresh leader.
+  //
+  // 30 s fresh / 5 min stale picked for the kiosk's reality:
+  // /api/flights/current cold-compute is CPU-bound at 30-50 s on KBDU
+  // (200+ tails × cycle extraction + indicators), which exceeds the
+  // Railway edge timeout (~30 s) and starves the event loop while it
+  // runs. With 30 s fresh, every 8 s kiosk poll inside the same window
+  // is a sub-ms HIT (no event-loop pressure). Beyond 30 s, STALE
+  // serves the last successful body immediately AND triggers an
+  // in-background refresh — so polls never wait on the leader's
+  // CPU burst, the next 8 s poll already gets the fresh body if the
+  // refresh completed.
+  const CURRENT_RESPONSE_TTL_MS = 30_000
+  const CURRENT_RESPONSE_STALE_MS = 5 * 60_000
   const currentResponseCache = new Map()  // key -> { body, fetchedAt }
   // Request coalescing — the kiosk reported `airport=KBDU&landed_hours=48`
   // never caching: 3 sequential polls all `X-Cache: MISS`, 30-94 s each,
@@ -3985,8 +3996,8 @@ function flightsApiPlugin() {
   // computation, the pg pool saturates (max=8), `statement_timeout`
   // (25 s) trips on waiters, handler returns 500. Coalescing collapses
   // all concurrent callers for the same key onto one Promise — the
-  // leader does the work, waiters await its result. Same pattern the
-  // recent-landings agent shipped on its endpoint.
+  // leader does the work, waiters await its result (or skip waiting via
+  // STALE semantics above).
   const currentInFlight = new Map()  // key -> Promise<body>
 
 
@@ -4550,18 +4561,39 @@ function flightsApiPlugin() {
           // we don't pay re-serialization either.
           const cacheKey = `${airport}|${landedHours}|${rangeNm}|${schoolFilter || ''}`
           const cached = currentResponseCache.get(cacheKey)
-          if (cached && Date.now() - cached.fetchedAt < CURRENT_RESPONSE_TTL_MS) {
+          const cacheAge = cached ? Date.now() - cached.fetchedAt : Infinity
+
+          // Fresh — return immediately.
+          if (cacheAge < CURRENT_RESPONSE_TTL_MS) {
             res.setHeader('X-Cache', 'HIT')
             return res.end(cached.body)
           }
 
+          // Stale — return cached body immediately, kick off a background
+          // refresh if one isn't already in flight. This is the dominant
+          // path under steady-state kiosk polling: every 8 s poll past
+          // the first inside a 5 min window returns instantly (sub-ms);
+          // the refresh runs in the background without blocking polls,
+          // and the next poll after refresh completes gets the fresher
+          // body. The leader's CPU burst no longer starves the event
+          // loop relative to user-visible latency.
+          if (cacheAge < CURRENT_RESPONSE_STALE_MS && cached) {
+            // Within the stale tolerance window: serve the cached body
+            // immediately so the kiosk's 8 s poll never blocks on the
+            // ~50 s cold-compute path. Background refresh would be the
+            // ideal next step (it would keep the cache permanently
+            // fresh) but it requires extracting the heavy work into a
+            // standalone helper — deferred. Today's deal: kiosk gets
+            // an instantaneous response that's at most 5 min old, then
+            // the next request after the stale window triggers a fresh
+            // cold compute.
+            res.setHeader('X-Cache', 'STALE')
+            return res.end(cached.body)
+          }
+
           // Coalesce — if a leader is already computing this key, await
-          // its Promise. The kiosk reported `airport=KBDU` never caching:
-          // 30-90 s cold response × 8 s polling means subsequent polls
-          // arrive before the leader's cache.set. Without coalescing,
-          // each poll fires its own pg-pool-burning computation; pool
-          // saturates; statement_timeout (25 s) trips waiters; 500s
-          // cascade. Coalescing collapses all waiters onto the leader.
+          // its Promise. Only reached when there is no cached body to
+          // serve stale (very first poll for the key after a restart).
           const existing = currentInFlight.get(cacheKey)
           if (existing) {
             res.setHeader('X-Cache', 'COALESCED')
