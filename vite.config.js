@@ -3562,7 +3562,23 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   }
   const tMs = grpCycles[0].tMs
   const lMs = grpCycles[grpCycles.length - 1].lMs ?? Date.now()
-  const flightPts = allPts.filter(p => p[3] != null && p[3] >= tMs && p[3] <= lMs)
+  let flightPts = allPts.filter(p => p[3] != null && p[3] >= tMs && p[3] <= lMs)
+  if (flightPts.length < 2) return out
+
+  // Belt-and-suspenders: if extractTowCycles produced a cycle bundle
+  // spanning an overnight parking gap (the bug the bundler cap is
+  // designed to prevent, but a regression already cost us this twice),
+  // trim flightPts to the last contiguous block separated by a gap
+  // > FLIGHT_PT_MAX_GAP_MS so worst_segment / VNAP / impact don't see
+  // yesterday's sortie data. See commit da8e2d2 for the original.
+  const FLIGHT_PT_MAX_GAP_MS = 60 * 60_000
+  let lastBigGapIdx = -1
+  for (let i = 1; i < flightPts.length; i++) {
+    if ((flightPts[i][3] || 0) - (flightPts[i - 1][3] || 0) > FLIGHT_PT_MAX_GAP_MS) {
+      lastBigGapIdx = i
+    }
+  }
+  if (lastBigGapIdx > 0) flightPts = flightPts.slice(lastBigGapIdx)
   if (flightPts.length < 2) return out
   const engineless = isEnginelessType(type)
   const ap = ENRICH_AP.find(a => a.code === airport)
