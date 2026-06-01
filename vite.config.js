@@ -3939,6 +3939,16 @@ function computeFlightId(airport, tail, takeoffMs) {
 const COVERAGE_GAP_SAMPLE_MS = 5000     // expected ADS-B fix interval
 const COVERAGE_GAP_THRESHOLD = 0.30     // < 30% expected coverage = dropout
 const COVERAGE_GAP_DRIFT_FT = 2000      // > 2,000 ft drift = still airborne
+// Maximum gap the coverage guard will EVER bridge. Beyond this, the
+// aircraft was definitively on the ground — the guard's "the plane was
+// still airborne, ADS-B just dropped out" rationale no longer applies.
+// Without this cap, a 24 h overnight parking with a ramp tow of just
+// > 2,000 ft (very common — hangar repositioning) caused two sorties
+// to be merged into one 24+ hour "flight," which then surfaced an
+// older sortie's worst_segment in the current feed (operator-filed
+// orphan-bug 2026-06-01). FLIGHT_GAP_MIN trainer-gap distribution
+// puts the clean "next sortie" floor at 60 min; cap matches.
+const COVERAGE_GAP_MAX_MS = 60 * 60_000
 
 function groupCyclesIntoFlights(cycles, gapMinMs, allPts = null) {
   if (!cycles || !cycles.length) return []
@@ -3952,7 +3962,7 @@ function groupCyclesIntoFlights(cycles, gapMinMs, allPts = null) {
     const gap = cur.tMs - prev.lMs
     let merge = gap < gapMinMs
 
-    if (!merge && allPts) {
+    if (!merge && allPts && gap <= COVERAGE_GAP_MAX_MS) {
       // Coverage-gap guard. Count fixes inside the gap window and the
       // physical drift between the last pre-gap and first post-gap fixes.
       const gapStart = prev.lMs
