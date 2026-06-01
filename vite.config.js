@@ -3846,6 +3846,66 @@ function flightsApiPlugin() {
   const CURRENT_RESPONSE_TTL_MS = 8_000
   const currentResponseCache = new Map()  // key -> { body, fetchedAt }
 
+  // Cache for /api/schools. The handler used to read + parse
+  // public/flight_schools_fleets.json (30 KB), `await import` two node
+  // modules, and slug-compute the whole catalog on EVERY request — the
+  // kiosk measured 27.83 s avg / 80.77 s p100 (OneDrive-backed I/O +
+  // per-call dynamic imports compound badly on Windows dev).
+  //
+  // flight_schools_fleets.json is static config (a human edits it, not
+  // the runtime). Load it once, build a fully-resolved
+  // { airport -> [{slug,name,tail_count}, ...] } index, cache in
+  // closure scope. An mtime check lets dev edits hot-reload without
+  // restarting the server. Path resolution (relative
+  // 'public/flight_schools_fleets.json') is unchanged from the
+  // previous handler so prod and dev see the same file.
+  const SCHOOLS_INDEX_PATH = 'public/flight_schools_fleets.json'
+  let schoolsIndexCache = null      // { byAirport: Map, mtimeMs }
+  let schoolsIndexLastServed = null // identity ref for X-Cache header
+  function buildSchoolsIndex(raw) {
+    const fleets = JSON.parse(raw)
+    const airportOf = (s) => ((s.airport || '').split(/[\s/]/, 1)[0] || '').trim().toUpperCase()
+    const byAirport = new Map()
+    for (const s of (fleets.schools || [])) {
+      const ap = airportOf(s)
+      if (!ap) continue
+      const slug = slugifySchool(s.name)
+      if (!slug) continue
+      const entry = {
+        slug,
+        name: s.name,
+        tail_count: Array.isArray(s.aircraft) ? s.aircraft.length : 0,
+      }
+      let bucket = byAirport.get(ap)
+      if (!bucket) { bucket = []; byAirport.set(ap, bucket) }
+      bucket.push(entry)
+    }
+    // Sort each bucket once at index-build time so request handlers
+    // can return the cached array verbatim.
+    for (const bucket of byAirport.values()) {
+      bucket.sort((a, b) => (b.tail_count - a.tail_count) || a.name.localeCompare(b.name))
+    }
+    return { byAirport, mtimeMs: 0 }
+  }
+  function loadSchoolsIndex() {
+    let mtimeMs = 0
+    try { mtimeMs = fs.statSync(SCHOOLS_INDEX_PATH).mtimeMs } catch { mtimeMs = -1 }
+    if (schoolsIndexCache && schoolsIndexCache.mtimeMs === mtimeMs) return schoolsIndexCache
+    if (mtimeMs < 0) {
+      schoolsIndexCache = { byAirport: new Map(), mtimeMs: -1 }
+      return schoolsIndexCache
+    }
+    try {
+      const raw = fs.readFileSync(SCHOOLS_INDEX_PATH, 'utf8')
+      schoolsIndexCache = buildSchoolsIndex(raw)
+      schoolsIndexCache.mtimeMs = mtimeMs
+    } catch (e) {
+      console.error('[api/schools] fleet config read failed:', e.message)
+      schoolsIndexCache = { byAirport: new Map(), mtimeMs }
+    }
+    return schoolsIndexCache
+  }
+
 
   return {
     name: 'flights-api',
@@ -4250,29 +4310,22 @@ function flightsApiPlugin() {
           // that row, and the school then appears at KFNL with one
           // tail. Aggregated across the whole tracks history, RMS ended
           // up listed at all 7 configured airports.
-          const { default: fs } = await import('fs/promises')
-          const { default: path } = await import('path')
-          let fleets = { schools: [] }
-          try {
-            const raw = await fs.readFile(path.resolve('public/flight_schools_fleets.json'), 'utf8')
-            fleets = JSON.parse(raw)
-          } catch (e) {
-            console.error('[api/schools] fleet config read failed:', e.message)
-          }
-          // Normalize the school's airport field — entries can be
-          // "KBDU", "KBJC area", or "KFTG/KCFO"; take the first
-          // ICAO-shaped token before any whitespace or slash.
-          const airportOf = (s) => ((s.airport || '').split(/[\s/]/, 1)[0] || '').trim().toUpperCase()
-          const schools = (fleets.schools || [])
-            .filter((s) => airportOf(s) === airport)
-            .map((s) => ({
-              slug: slugifySchool(s.name),
-              name: s.name,
-              tail_count: Array.isArray(s.aircraft) ? s.aircraft.length : 0,
-            }))
-            .filter((s) => s.slug)
-            .sort((a, b) => (b.tail_count - a.tail_count) || a.name.localeCompare(b.name))
-          res.end(JSON.stringify({ airport, count: schools.length, schools }))
+          //
+          // Perf: the previous body `await import`-ed fs/promises and
+          // path, then re-read + re-parsed the 30 KB JSON and slug-
+          // computed the WHOLE catalog on EVERY request. The kiosk
+          // measured 27.83 s avg / 80.77 s p100 — dynamic imports +
+          // OneDrive-backed I/O compound badly on Windows dev. The
+          // static config now lives in a closure-scope index built
+          // once (and invalidated by mtime so dev edits hot-reload).
+          // Per-request work is a Map.get plus the final
+          // JSON.stringify. Warm hits are < 1 ms; cold path is a
+          // single sync stat + readFile + parse. Wire shape unchanged.
+          const idx = loadSchoolsIndex()
+          const bucket = idx.byAirport.get(airport) || []
+          res.setHeader('X-Cache', idx === schoolsIndexLastServed ? 'HIT' : 'MISS')
+          schoolsIndexLastServed = idx
+          res.end(JSON.stringify({ airport, count: bucket.length, schools: bucket }))
         } catch (err) {
           console.error('[api/schools] error', err)
           res.statusCode = 500
