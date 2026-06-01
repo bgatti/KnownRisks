@@ -5174,6 +5174,52 @@ function dbTracksPlugin() {
 // lightweight server-side queries against pre-computed columns.
 function noiseApiPlugin() {
   if (!db.useDb) return null // only on Railway
+
+  // ── Caches for /api/noise/recent-landings ───────────────────────────────
+  //
+  // The kiosk team measured 84 s avg / 101 s p100 on this endpoint with one
+  // 500 in 3 samples (probable cause: pg pool exhaustion under concurrent
+  // polling, then statement_timeout firing → catch returns 500). The slow
+  // paths mirror /api/flights/current and /api/adsb/current-flights:
+  //
+  //   1. The per-tail GROUP BY scan over `tracks` (`call = ANY($1)`) — same
+  //      SQL all three endpoints run. `tracks.call` is unindexed, so each
+  //      request triggers a seq scan over millions of rows. The JS-level
+  //      mitigation here hides it for warm hits; see
+  //      migrations/20260531_tracks_call_idx.sql for the matching index
+  //      that drops cold-start latency from minutes to under a second.
+  //   2. extractTowCycles + impactSegments + bandsFromPoints walk every
+  //      track point per request. Even after the tail-info join is cached,
+  //      a 12 h window still has hundreds of tracks to process.
+  //   3. Multi-workstation kiosk polling. With the 8 s poll interval and
+  //      a 60 s cold response, every workstation runs the full pipeline
+  //      independently → pool saturation → cascading 500s.
+  //
+  // Two-layer cache + request coalescing (same shape as the boot-endpoint
+  // and current-flights fixes already landed):
+  //
+  //   RECENT_LANDINGS_RESPONSE_TTL_MS: full response JSON keyed on
+  //   (airport, minutes), 10 s TTL. A new landing typically takes ≥ 60 s
+  //   to register (descent → confirmed on-ground requires ≥ 30 s of fixes
+  //   below ground ceiling), so a 10 s stale window is invisible to
+  //   operators. Picked slightly over the kiosk's 8 s poll cadence so the
+  //   second poll in a pair is a HIT.
+  //
+  //   RECENT_LANDINGS_TAIL_INFO_TTL_MS: per-tail (base, school, purpose,
+  //   desc) row, 60 s TTL. School/base/purpose change at most once per day.
+  //   Each request queries Postgres only for tails missing from the cache;
+  //   steady-state polling drives the per-tail SQL to ~0 rows.
+  //
+  // recentLandingsInFlight coalesces concurrent MISS computations on the
+  // same key so the multi-workstation case shares one pipeline run; this
+  // is the most likely fix for the 1-of-3 sample returning 500 / 58 bytes
+  // (concurrent miss → pool exhaustion → statement_timeout → 500).
+  const RECENT_LANDINGS_RESPONSE_TTL_MS = 10_000
+  const recentLandingsResponseCache = new Map() // key -> { body, fetchedAt }
+  const recentLandingsInFlight = new Map()      // key -> Promise<{ body }>
+  const RECENT_LANDINGS_TAIL_INFO_TTL_MS = 60_000
+  const recentLandingsTailInfoCache = new Map() // call -> { row, fetchedAt }
+
   return {
     name: 'noise-api',
     configureServer(server) {
@@ -5510,6 +5556,10 @@ function noiseApiPlugin() {
       // cadence) is a caller concern; this API returns the physical measurement.
       server.middlewares.use('/api/noise/recent-landings', async (req, res, next) => {
         if (req.method !== 'GET') return next()
+        // Settle-helper for the in-flight coalescing layer; set in the
+        // MISS path and called from both the happy path and the catch so
+        // failures don't poison coalesced waiters.
+        let settleInflight = null
         try {
           const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
           const airport = (u.searchParams.get('airport') || 'KBDU').trim().toUpperCase()
@@ -5521,6 +5571,45 @@ function noiseApiPlugin() {
           if (!ap) { res.statusCode = 400; return res.end(JSON.stringify({ error: `unknown airport ${airport}` })) }
           if (!POPGRID) { res.statusCode = 503; return res.end(JSON.stringify({ error: 'population grid unavailable' })) }
 
+          // ── Response cache check ──
+          // Composite key over the params that affect output. With
+          // RECENT_LANDINGS_RESPONSE_TTL_MS=10s and 8 s kiosk polling, the
+          // second poll in any pair is a HIT and replies in sub-ms time.
+          // Cached body is the final JSON string (no re-serialization).
+          const cacheKey = `${airport}|${minutes}`
+          const cached = recentLandingsResponseCache.get(cacheKey)
+          if (cached && Date.now() - cached.fetchedAt < RECENT_LANDINGS_RESPONSE_TTL_MS) {
+            res.setHeader('X-Cache', 'HIT')
+            return res.end(cached.body)
+          }
+
+          // ── In-flight request coalescing ──
+          // Without this, when multiple workstations poll while a MISS is
+          // computing, each request grabs a pg pool slot and runs the full
+          // pipeline independently. Under sustained load (the kiosk team's
+          // measured 84 s avg), the pool saturates and downstream requests
+          // time out → catch returns 500. Coalescing lets every waiter on
+          // the same key share one computation; this is the most likely
+          // explanation for the 1-of-3 sample returning 500 / 58 bytes.
+          const inflight = recentLandingsInFlight.get(cacheKey)
+          if (inflight) {
+            const { body } = await inflight
+            res.setHeader('X-Cache', 'COALESCED')
+            return res.end(body)
+          }
+          let resolveInflight, rejectInflight
+          const inflightPromise = new Promise((resolve, reject) => {
+            resolveInflight = resolve
+            rejectInflight = reject
+          })
+          recentLandingsInFlight.set(cacheKey, inflightPromise)
+          // Always clear the in-flight entry once we resolve/reject so a
+          // failed run doesn't poison subsequent callers.
+          settleInflight = (ok, value) => {
+            recentLandingsInFlight.delete(cacheKey)
+            if (ok) resolveInflight(value); else rejectInflight(value)
+          }
+
           const today = new Date().toISOString().slice(0, 10)
           const range = await db.loadLiveFromDbByDateRange(today, today)
           const tracks = range.tracks || []
@@ -5531,18 +5620,50 @@ function noiseApiPlugin() {
           const fsMod = await import('./flightScore.js')
           const complaintsRaw = await loadComplaintsCached()
 
-          // call → base/purpose/school/desc from the historical classification
-          const tails = [...new Set(tracks.map((t) => (t.call || '').trim()).filter(Boolean))]
+          // call → base/purpose/school/desc from the historical classification.
+          //
+          // Memoized at 60 s per tail (recentLandingsTailInfoCache, plugin
+          // scope). On each request we query Postgres only for tails missing
+          // from the cache; steady-state kiosk polling drives this query to
+          // ~0 rows. Cold start pays the full GROUP BY scan once. Until the
+          // matching migration's tracks(call) index lands in production, that
+          // scan IS the dominant slow path — this cache makes it a one-time
+          // cost per process.
+          const allTails = [...new Set(tracks.map((t) => (t.call || '').trim()).filter(Boolean))]
           const info = new Map()
-          if (tails.length) {
-            const r = await db.queryDb(
-              `SELECT call,
-                 (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base,
-                 (array_agg(purpose      ORDER BY date DESC) FILTER (WHERE purpose      IS NOT NULL))[1] AS purpose,
-                 (array_agg(school       ORDER BY date DESC) FILTER (WHERE school       IS NOT NULL))[1] AS school,
-                 (array_agg(desc_text    ORDER BY date DESC) FILTER (WHERE desc_text    IS NOT NULL))[1] AS descr
-               FROM tracks WHERE call = ANY($1) GROUP BY call`, [tails])
-            for (const row of r.rows) info.set(row.call, row)
+          const tailsToFetch = []
+          const tailNowMs = Date.now()
+          for (const tail of allTails) {
+            const c = recentLandingsTailInfoCache.get(tail)
+            if (c && tailNowMs - c.fetchedAt < RECENT_LANDINGS_TAIL_INFO_TTL_MS) {
+              if (c.row) info.set(tail, c.row)
+            } else {
+              tailsToFetch.push(tail)
+            }
+          }
+          if (tailsToFetch.length) {
+            try {
+              const r = await db.queryDb(
+                `SELECT call,
+                   (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base,
+                   (array_agg(purpose      ORDER BY date DESC) FILTER (WHERE purpose      IS NOT NULL))[1] AS purpose,
+                   (array_agg(school       ORDER BY date DESC) FILTER (WHERE school       IS NOT NULL))[1] AS school,
+                   (array_agg(desc_text    ORDER BY date DESC) FILTER (WHERE desc_text    IS NOT NULL))[1] AS descr
+                 FROM tracks WHERE call = ANY($1) GROUP BY call`, [tailsToFetch])
+              const rowByCall = new Map()
+              for (const row of r.rows) rowByCall.set(row.call, row)
+              // Cache ALL fetched tails (including tails with no matching
+              // row) so the next request doesn't re-query unknowns.
+              for (const tail of tailsToFetch) {
+                const row = rowByCall.get(tail) || null
+                recentLandingsTailInfoCache.set(tail, { row, fetchedAt: tailNowMs })
+                if (row) info.set(tail, row)
+              }
+            } catch {
+              // On DB failure don't poison the cache. Unfetched tails stay
+              // missing so the next request retries; existing cached
+              // entries remain valid.
+            }
           }
 
           const nowMs = Date.now()
@@ -5751,7 +5872,7 @@ function noiseApiPlugin() {
           // lat/lon-populated entries for map pins (mirrors the boot
           // endpoint's shape so a single client renderer handles both).
           const complaintsForWindow = fsMod.recentComplaintsForKiosk(complaintsRaw, minutes)
-          res.end(JSON.stringify({
+          const responseBody = JSON.stringify({
             generated_at: new Date(nowMs).toISOString(),
             airport, minutes, pop_scale: POP_SCALE,
             scoring: {
@@ -5773,9 +5894,19 @@ function noiseApiPlugin() {
               geocoded_count: complaintsForWindow.filter(c => c.lat != null && c.lon != null).length,
               items: complaintsForWindow,
             },
-          }))
+          })
+          // Persist into the response cache and unblock any coalesced
+          // waiters BEFORE writing to res, so a slow socket flush doesn't
+          // hold subsequent callers on the same key.
+          recentLandingsResponseCache.set(cacheKey, { body: responseBody, fetchedAt: Date.now() })
+          if (settleInflight) settleInflight(true, { body: responseBody })
+          res.setHeader('X-Cache', 'MISS')
+          res.end(responseBody)
         } catch (e) {
           console.error('[noise-api] /recent-landings error', e)
+          // Release any coalesced callers with the error so they don't
+          // hang. Failures are NOT cached — the next request retries.
+          try { if (settleInflight) settleInflight(false, e) } catch {}
           res.statusCode = 500
           res.setHeader('Content-Type', 'application/json')
           res.end(JSON.stringify({ error: String(e) }))
