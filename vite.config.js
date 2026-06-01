@@ -3678,37 +3678,52 @@ function bridgeTrackGaps(pts, opts = {}) {
     const dtMs = (b[3] || 0) - (a[3] || 0)
     if (dtMs <= gapMs || dtMs > maxBridgeMs) { out.push(b); continue }
 
-    // Neighbor-speed estimate — prefer the edge before the gap; fall
-    // back to the edge after.
-    let neighborKts = null
+    // Groundspeed at A = the speed of the edge immediately before A.
+    // Groundspeed at B = the speed of the edge immediately after B.
+    // Average the two for the reference speed; if only one side is
+    // measurable, use that. If neither is measurable, DO NOT bridge —
+    // we won't invent a speed.
+    //
+    // Neighbor edges longer than 30 s are themselves potentially in a
+    // dropout window, so their derived speed is unreliable; reject and
+    // fall through to the other side or to no-bridge.
+    let prevKts = null, nextKts = null
     if (i >= 2) {
       const prev = pts[i - 2]
       const ndtS = ((a[3] || 0) - (prev[3] || 0)) / 1000
       if (ndtS > 0 && ndtS < 30) {
         const ndnm = distFt(prev[0], prev[1], a[0], a[1]) / 6076.12
-        neighborKts = ndnm / (ndtS / 3600)
+        prevKts = ndnm / (ndtS / 3600)
       }
     }
-    if (neighborKts == null && i + 1 < pts.length) {
+    if (i + 1 < pts.length) {
       const next = pts[i + 1]
       const ndtS = ((next[3] || 0) - (b[3] || 0)) / 1000
       if (ndtS > 0 && ndtS < 30) {
         const ndnm = distFt(b[0], b[1], next[0], next[1]) / 6076.12
-        neighborKts = ndnm / (ndtS / 3600)
+        nextKts = ndnm / (ndtS / 3600)
       }
+    }
+    let nodeKts = null
+    if (prevKts != null && nextKts != null) nodeKts = (prevKts + nextKts) / 2
+    else if (prevKts != null) nodeKts = prevKts
+    else if (nextKts != null) nodeKts = nextKts
+    if (nodeKts == null) { out.push(b); continue }
+    // Sanity bound — a runaway derived speed (single buggy fix) shouldn't
+    // license a bridge. Outside the plausible aircraft envelope, abort.
+    if (nodeKts < plausibleKtsMin || nodeKts > plausibleKtsMax) {
+      out.push(b); continue
     }
 
     const gapDistNm = distFt(a[0], a[1], b[0], b[1]) / 6076.12
     const impliedKts = gapDistNm / (dtMs / 3_600_000)
-
-    let accept = false
-    if (neighborKts != null && neighborKts >= plausibleKtsMin && neighborKts <= plausibleKtsMax) {
-      accept = impliedKts >= neighborKts * (1 - tolerance)
-             && impliedKts <= neighborKts * (1 + tolerance)
-    } else {
-      accept = impliedKts >= plausibleKtsMin && impliedKts <= plausibleKtsMax
+    // The bridge's straight-line implied speed must match the observed
+    // node-speed average within ±tolerance. ±75% is generous enough to
+    // accept lazy turns + minor course changes through the gap while
+    // rejecting "the aircraft teleported" cases.
+    if (impliedKts < nodeKts * (1 - tolerance) || impliedKts > nodeKts * (1 + tolerance)) {
+      out.push(b); continue
     }
-    if (!accept) { out.push(b); continue }
 
     // Insert enough synthetic points to keep each resulting edge below
     // targetEdgeMs. Linear interpolation on lat/lon/alt/ts.
@@ -3835,17 +3850,15 @@ function computeWorstSegment(flightPts, popAt, airport, engineless, altOffsetFt 
     }
   }
   if (best) delete best._rawScore
-  if (best && Array.isArray(best.points)) {
-    // Bridge any in-window coverage gaps so the kiosk's edge-length
-    // filter doesn't orphan the polyline. Synthetic points carry a
-    // 5th tuple slot = 1 so the renderer can style them distinctly
-    // (e.g. dashed line). See bridgeTrackGaps for the acceptance
-    // rules.
-    const bridged = bridgeTrackGaps(best.points)
-    const synthCount = bridged.reduce((n, p) => n + (p[4] === 1 ? 1 : 0), 0)
-    best.points = bridged
-    best.points_synth_count = synthCount
-  }
+  // INVARIANT: worst_segment.points MUST be a literal subset of the
+  // flight-path points the kiosk renders. Do NOT bridge synth points
+  // in here — bridging happens on the flight-path data in
+  // /api/excursions/boot (bridgeBandsInPlace). The kiosk identifies
+  // the worst_segment fixes inside the bridged band points by matching
+  // (lat, lon, ts) tuples and highlights them on the rendered polyline.
+  // If we bridged here too, the worst_segment would contain synth fixes
+  // that may not be byte-identical to the band-side synth fixes, which
+  // would break the highlight.
   return best
 }
 
