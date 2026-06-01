@@ -12,8 +12,12 @@ import {
   segmentDba,
   npv,
   businessModelColumn,
+  purposeSourceBadgeProps,
 } from './whatif.js'
-export { pickSubstituted, pickEliminated, shouldWinchSegment, segmentDba, npv, businessModelColumn }
+export {
+  pickSubstituted, pickEliminated, shouldWinchSegment, segmentDba,
+  npv, businessModelColumn, purposeSourceBadgeProps,
+}
 
 /* SVG-pin DivIcon for the map pin. Drawn at 26×34 with anchor at base. */
 const PIN_ICON = L.divIcon({
@@ -171,61 +175,6 @@ const PURPOSE_COLOR = {
   pattern_solo:    '#fbbf24', // amber-400 — close to training, distinct hue
   ga_local:        '#60a5fa', // blue-400 — pairs with legacy ga_single
   ga_xc:           '#3b82f6', // blue-500 — darker XC variant
-}
-
-/**
- * §11-CLIENT V3 §2: shape the per-row provenance badge.
- *
- * Pure helper — returns the badge's visible text, color, and tooltip
- * for a given (purpose_source, purpose_confidence) pair, or null when
- * the source is missing (older API, no badge to render). Lives at
- * module scope so the test suite can import it without pulling React
- * + leaflet through PointNoiseReport.jsx.
- *
- * Source → badge spec (matches API_REQUEST.md §11 V3 §2):
- *   special_use   →  "★ curated"     gold      "Authoritative registry entry"
- *   type          →  "T"             slate     "Inferred from ICAO type code"
- *   tracked       →  "DB"            slate     "Stored in the tracks database"
- *   shape         →  "~ shape (N%)"  cyan      "Inferred from flight-path shape via purposeML"
- *   shape-hedged  →  "~ hedge (N%)"  cyan-fade "Hedged purposeML verdict — treat as advisory"
- */
-export function purposeSourceBadgeProps(source, confidence) {
-  if (!source) return null
-  const pct = Number.isFinite(confidence) ? Math.round(confidence * 100) : null
-  switch (source) {
-    case 'special_use':
-      return {
-        text: '★ curated',
-        color: '#f59e0b', // amber-500 — gold tone
-        title: 'Authoritative registry entry',
-      }
-    case 'type':
-      return {
-        text: 'T',
-        color: '#94a3b8', // slate-400
-        title: 'Inferred from ICAO type code',
-      }
-    case 'tracked':
-      return {
-        text: 'DB',
-        color: '#94a3b8', // slate-400
-        title: 'Stored in the tracks database',
-      }
-    case 'shape':
-      return {
-        text: pct != null ? `~ shape (${pct}%)` : '~ shape',
-        color: '#22d3ee', // cyan-400
-        title: 'Inferred from flight-path shape via purposeML',
-      }
-    case 'shape-hedged':
-      return {
-        text: pct != null ? `~ hedge (${pct}%)` : '~ hedge',
-        color: '#67e8f9', // cyan-300 — faded
-        title: 'Hedged purposeML verdict — treat as advisory',
-      }
-    default:
-      return null
-  }
 }
 
 /** Mirrors purposeOf in vite.config.js. */

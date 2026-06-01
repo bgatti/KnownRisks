@@ -19,6 +19,7 @@ import {
   segmentDba,
   npv,
   businessModelColumn,
+  purposeSourceBadgeProps,
 } from './whatif.js'
 
 /* ─── pickSubstituted ─────────────────────────────────────────────── */
@@ -265,5 +266,58 @@ describe('businessModelColumn', () => {
     expect(positive.npv).toBeGreaterThan(0)
     expect(positive.breakEvenHours).toBeNull()  // already paying
     expect(positive.dollarsPerDb).toBeNull()
+  })
+})
+
+/* ─── purposeSourceBadgeProps ─────────────────────────────────────── */
+
+// §11-CLIENT V3 §5: one assertion per purpose_source value plus the
+// confidence-percent rounding for the 'shape' variants. The badge
+// component is a thin <span> wrapper around these props (see
+// PurposeSourceBadge in PointNoiseReport.jsx) — verifying the pure
+// helper gives the same coverage without pulling React into this
+// node-only test config.
+describe('purposeSourceBadgeProps', () => {
+  it('returns null when source is missing (older API row)', () => {
+    expect(purposeSourceBadgeProps(null)).toBeNull()
+    expect(purposeSourceBadgeProps(undefined, 0.85)).toBeNull()
+    expect(purposeSourceBadgeProps('')).toBeNull()
+  })
+  it('returns null for an unrecognised source value', () => {
+    expect(purposeSourceBadgeProps('mystery-source', 0.5)).toBeNull()
+  })
+  it("renders '★ curated' (gold) for special_use", () => {
+    const out = purposeSourceBadgeProps('special_use')
+    expect(out.text).toBe('★ curated')
+    expect(out.color).toBe('#f59e0b')
+    expect(out.title).toMatch(/Authoritative/i)
+  })
+  it("renders 'T' (slate) for type", () => {
+    const out = purposeSourceBadgeProps('type')
+    expect(out.text).toBe('T')
+    expect(out.color).toBe('#94a3b8')
+    expect(out.title).toMatch(/ICAO type code/i)
+  })
+  it("renders 'DB' (slate) for tracked", () => {
+    const out = purposeSourceBadgeProps('tracked')
+    expect(out.text).toBe('DB')
+    expect(out.color).toBe('#94a3b8')
+    expect(out.title).toMatch(/tracks database/i)
+  })
+  it("renders '~ shape (NN%)' (cyan) for shape with confidence", () => {
+    const out = purposeSourceBadgeProps('shape', 0.873)
+    expect(out.text).toBe('~ shape (87%)')   // rounded to nearest %
+    expect(out.color).toBe('#22d3ee')
+    expect(out.title).toMatch(/purposeML/i)
+  })
+  it("renders '~ shape' (no percent) when shape confidence is missing", () => {
+    const out = purposeSourceBadgeProps('shape', null)
+    expect(out.text).toBe('~ shape')
+  })
+  it("renders '~ hedge (NN%)' (faded cyan) for shape-hedged", () => {
+    const out = purposeSourceBadgeProps('shape-hedged', 0.62)
+    expect(out.text).toBe('~ hedge (62%)')
+    expect(out.color).toBe('#67e8f9')
+    expect(out.title).toMatch(/Hedged/i)
   })
 })
