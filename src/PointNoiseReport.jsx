@@ -234,6 +234,92 @@ export function shouldWinchSegment(seg, threshold_ft, listenerElevFt) {
   return lowest < threshold_ft
 }
 
+/**
+ * §11-CLIENT §5: Project the per-segment dBA in the scenario world.
+ *
+ * Decision tree:
+ *   1. Winch on AND track was picked for winch AND this segment qualifies
+ *      under the AGL threshold → 0 dBA.
+ *   2. Track was picked for an airframe-scope substitute (VELE / EFOX /
+ *      SINU) → use `seg.alt_dba_by_substitute[code]` for that segment
+ *      (skip codes whose entry is null — substitute is a track candidate
+ *      but doesn't apply to this individual segment).
+ *   3. Otherwise → caller's baseline dBA for the segment (no scenario).
+ *
+ * The caller supplies `baseDbaForSeg` so this helper stays decoupled
+ * from the page's per-point dBA kernel — it just plays scenario-world
+ * substitution rules on top.
+ */
+export function segmentDba(track, seg, scenario, listenerElevFt, baseDbaForSeg) {
+  const tail = track?.tail
+  if (!tail) return baseDbaForSeg
+  // Winch first — it overrides any airframe-scope substitution because the
+  // segment isn't airborne (winch is a launch system, not an aircraft swap).
+  if (scenario?.winchTracks?.has(tail)
+      && shouldWinchSegment(seg, scenario.winch_agl_ft, listenerElevFt)) {
+    return 0
+  }
+  const map = seg?.alt_dba_by_substitute
+  if (map && scenario?.substituted) {
+    for (const code of ['VELE', 'EFOX', 'SINU']) {
+      if (scenario.substituted[code]?.has(tail)) {
+        const v = map[code]
+        if (v != null) return v
+      }
+    }
+  }
+  return baseDbaForSeg
+}
+
+/**
+ * §11-CLIENT §5: Re-compute the per-row peak dBA at the listener under
+ * the current scenario. Walks each track's segments, finds the loudest
+ * post-substitution segment-level dBA, and returns the scenario row
+ * (same shape as the baseline row but with `dba` overridden).
+ *
+ * For the baseline per-segment dBA we re-derive the geometry against the
+ * listener and reuse `estDbaAtListener` so the kernel stays consistent
+ * with the rest of the page. When a track has no scenario applied, the
+ * baseline row is returned untouched.
+ */
+export function applyScenarioToRow(row, scenario, listener) {
+  if (!row) return null
+  const tail = row.tail
+  const substituted = scenario?.substituted || {}
+  const winchTracks = scenario?.winchTracks || new Set()
+  const wnchOn = (scenario?.winch_agl_ft || 0) > 0
+  const hasAirframeSub = (
+    substituted.VELE?.has(tail)
+    || substituted.EFOX?.has(tail)
+    || substituted.SINU?.has(tail)
+  )
+  const hasWinchSub = wnchOn && winchTracks.has(tail)
+  if (!hasAirframeSub && !hasWinchSub) return row
+  // Walk the segments and find the loudest post-substitution dBA at the
+  // listener. We approximate each segment's geometry by the closest point
+  // within the segment to the listener — that's the per-segment peak.
+  let peak = 0
+  for (const seg of row.segments || []) {
+    const pts = seg?.points || []
+    // Closest-approach point inside this segment.
+    let bestDistFt = Infinity, bestAlt = null
+    for (const p of pts) {
+      const d = distFt(listener.lat, listener.lon, p[0], p[1])
+      if (d < bestDistFt) { bestDistFt = d; bestAlt = p[2] ?? null }
+    }
+    if (bestAlt == null) continue
+    const baseForSeg = estDbaAtListener({
+      type: row.type,
+      altMslFt: bestAlt,
+      listenerElevFt: listener.elev_ft,
+      distFt: bestDistFt,
+    })
+    const dba = segmentDba(row, seg, scenario, listener.elev_ft, baseForSeg)
+    if (dba > peak) peak = dba
+  }
+  return { ...row, dba: peak }
+}
+
 /* ───────────────────────── analysis ────────────────────────────────── */
 
 /** Compute closest approach + dBA for a single track. */
