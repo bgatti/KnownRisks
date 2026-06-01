@@ -139,64 +139,111 @@ try {
   for (const ac of sud.aircraft || []) if (ac.tail && ac.use) SPECIAL_USE_MAP.set(ac.tail.toUpperCase(), ac.use)
 } catch { /* optional */ }
 
-// Resolve a tail's purpose:
-//   1. Special-use registry (curated overrides) — wins over everything.
-//   2. PA25/PA18 type → always tow_plane (the airframe IS a tow plane even when
-//      it's in a glider-school fleet; the pilot may be training, but the
-//      aircraft's purpose is tow).
-//   3. Stored (curated) purpose on the tracks row when meaningful.
-//   4. Type-based classifier fallback so gliders / GA aren't "unknown".
-function resolvePurpose(stored, type, tail) {
-  const su = tail ? SPECIAL_USE_MAP.get(String(tail).toUpperCase()) : null
-  if (su) return purposeOf(type, tail, false, su)
-  const T = String(type || '').toUpperCase()
-  // Type-unambiguous airframes always win over school-fleet membership:
-  //   PA25/PA18 = Pawnee / Super Cub → tow planes (even at glider schools).
-  //   PIAT/PC6  = Pilatus Porter      → tow plane (SSB's tow).
-  //   GLID/AS2x/DG*/VENT/NIMB/DISC/SGS/ASTR/JS1J = gliders → glider purpose
-  //   even when in a school's fleet (the airframe IS a glider; the student
-  //   pilot's training context doesn't change that).
-  if (/^(PA25|PA18|PIAT|PC6)$/.test(T)) return 'tow_plane'
-  if (/^(GLID|VENT|NIMB|DISC|SGS|ASTR|JS1J|JS\d|LS\d|PIK|ASW|SZD)/.test(T) || /^AS\d/.test(T) || /^DG\d/.test(T)) return 'glider'
-  if (stored && stored !== 'unknown') return stored
-  return purposeOf(type, tail, false, null)
+// Convert raw 4-tuple track points (the format used everywhere else in
+// this file: `[lat, lon, alt_msl_ft, ts_ms]`) into the canonical Point
+// shape purposeML expects: `{ lat, lon, altMslFt, tsUnix }` with
+// `tsUnix` in epoch SECONDS (not ms). Points missing any of the four
+// fields are dropped — purposeML's own adapter would filter them out
+// downstream, but skipping early keeps the input array small. Also
+// accepts already-object points for callers that have them in scope.
+function pointsToPurposeMLShape(points) {
+  if (!Array.isArray(points)) return []
+  const out = []
+  for (const p of points) {
+    if (!p) continue
+    if (Array.isArray(p)) {
+      const [lat, lon, alt, ts] = p
+      if (lat == null || lon == null || alt == null || ts == null) continue
+      out.push({ lat, lon, altMslFt: alt, tsUnix: ts / 1000 })
+    } else if (typeof p === 'object') {
+      const lat = p.lat
+      const lon = p.lon
+      const alt = p.altMslFt ?? p.alt_ft ?? p.alt
+      const tsMs = p.tsUnix != null ? p.tsUnix * 1000 : (p.ts_ms ?? p.ts)
+      if (lat == null || lon == null || alt == null || tsMs == null) continue
+      out.push({ lat, lon, altMslFt: alt, tsUnix: tsMs / 1000 })
+    }
+  }
+  return out
 }
 
-// Shape-boosted purpose resolver. Mirrors resolvePurpose's priority but
-// inserts a path-shape inference step (purposeML) BEFORE the type-based
-// fallback. Returns `{ purpose, source, confidence?, reasons? }` so the
-// wire can surface where the answer came from (special_use / type /
-// tracked / shape). When `points` is omitted (or too sparse) the shape
-// step is skipped and behaviour collapses back to resolvePurpose.
-// Recipe sourced from purposeML/ADOPTING_PURPOSE_ML_API.md.
-function resolvePurposeWithShape(stored, type, tail, points, opts = {}) {
-  // 1. Special-use registry (curated overrides) — authoritative.
+// Shape-boosted purpose resolver. Mirrors the legacy resolvePurpose
+// priority but inserts a path-shape inference step (purposeML) BETWEEN
+// the stored DB value and the type-based fallback. Returns
+// `{ purpose, source, confidence?, reasons? }` so the wire can
+// distinguish where the answer came from (special_use / type / tracked
+// / shape). When `points` is omitted (or too sparse, < 30) the shape
+// step is skipped and behaviour collapses back to the legacy resolver.
+//
+// Recipe sourced from purposeML/ADOPTING_PURPOSE_ML_API.md
+// (§"Boosting an existing `purpose` field").
+//
+// Priority chain (returned `source` mirrors which step fired):
+//   1. special_use  — SPECIAL_USE_MAP hit (curated overrides)
+//   2. type         — PA25/PA18/PIAT/PC6 → tow_plane,
+//                     GLID/AS*/DG*/… → glider
+//   3. tracked      — non-'unknown' stored value on tracks.purpose
+//   4. shape        — purposeML classifyOneTrack with confidence >= 0.7
+//   5. type         — purposeOf fallback (ga_single / ga_twin / etc.)
+//
+// `schoolMap` is the global tail → { school, airport } Map built by
+// loadSchoolTailMap() / global.__SCHOOL_TAIL_AIRPORT. Pass null/undefined
+// when the caller doesn't have it — `isSchoolFleet: false` is the safe
+// default (the only behavioural change is `pattern_solo` not being
+// upgraded to `training`).
+function resolvePurposeWithShape(stored, type, tail, points, schoolMap) {
+  // 1. Special-use registry — authoritative.
   const su = tail ? SPECIAL_USE_MAP.get(String(tail).toUpperCase()) : null
   if (su) return { purpose: purposeOf(type, tail, false, su), source: 'special_use' }
-  // 2. Type-unambiguous airframes (same regex as resolvePurpose).
+  // 2. Type-unambiguous airframes always win over school-fleet membership:
+  //   PA25/PA18 = Pawnee / Super Cub → tow planes (even at glider schools).
+  //   PIAT/PC6  = Pilatus Porter      → tow plane.
+  //   GLID/AS2x/DG*/VENT/NIMB/DISC/SGS/ASTR/JS1J = gliders → glider purpose.
   const T = String(type || '').toUpperCase()
   if (/^(PA25|PA18|PIAT|PC6)$/.test(T)) return { purpose: 'tow_plane', source: 'type' }
-  if (/^(GLID|VENT|NIMB|DISC|SGS|ASTR|JS1J|JS\d|LS\d|PIK|ASW|SZD)/.test(T) || /^AS\d/.test(T) || /^DG\d/.test(T)) return { purpose: 'glider', source: 'type' }
+  if (/^(GLID|VENT|NIMB|DISC|SGS|ASTR|JS1J|JS\d|LS\d|PIK|ASW|SZD)/.test(T)
+      || /^AS\d/.test(T) || /^DG\d/.test(T)) {
+    return { purpose: 'glider', source: 'type' }
+  }
   // 3. Stored curated value on the tracks row.
   if (stored && stored !== 'unknown') return { purpose: stored, source: 'tracked' }
+  // School-fleet membership feeds the shape classifier AND the
+  // type-based fallback (a school-fleet C172 with no other signal
+  // should still resolve to `training` rather than `ga_single`).
+  const tailKey = tail ? String(tail).toUpperCase() : ''
+  const isSchoolFleet = !!(schoolMap && tailKey && schoolMap.has(tailKey))
   // 4. Path-shape inference — only when there are enough fixes to be
   //    meaningful. The classifier itself enforces 30+ points / 5+ min
   //    active; this gate is cheap and avoids the call entirely for
   //    fresh airborne flights with sparse history.
   if (Array.isArray(points) && points.length >= 30) {
     try {
-      const v = purposeMLClassify(points, {
+      const objPoints = pointsToPurposeMLShape(points)
+      const v = purposeMLClassify(objPoints, {
         typeCode: type || '',
         tail: tail || '',
-        isSchoolFleet: !!opts.isSchoolFleet,
+        isSchoolFleet,
       })
       if (v && v.confidence >= 0.7) {
         return { purpose: v.purpose, source: 'shape', confidence: v.confidence, reasons: v.reasons }
       }
-    } catch { /* swallow — fall through to type-based fallback */ }
+    } catch (err) {
+      // Fall through to type-based fallback; don't fail the request
+      // because of a classifier error.
+      console.error('[purposeML] classify failed for', tail, err && err.message)
+    }
   }
   // 5. Type-based fallback (original purposeOf behaviour).
-  return { purpose: purposeOf(type, tail, !!opts.isSchoolFleet, null), source: 'type' }
+  return { purpose: purposeOf(type, tail, isSchoolFleet, null), source: 'type' }
+}
+
+// Backwards-compatible 3-arg wrapper. Existing callers that don't yet
+// have a points array (or schoolMap) get the legacy string-only
+// behaviour: special_use → type → tracked → type-fallback (no shape
+// inference). Returns just the verdict string. New callers should use
+// `resolvePurposeWithShape` directly and read `.purpose` / `.source`.
+function resolvePurpose(stored, type, tail) {
+  return resolvePurposeWithShape(stored, type, tail, null, null).purpose
 }
 
 // Aircraft icon URL — placeholder-now, upgradable-later. Resolution order:
@@ -4940,9 +4987,16 @@ function flightsApiPlugin() {
                   tsUnix: Math.floor(p[3] / 1000),
                 })
               }
+              // schoolMap is passed as a synthetic single-entry Map when
+              // inf.school is set (the DB-cached school name is the only
+              // signal in this scope — flightsApiPlugin doesn't load the
+              // flight_schools_fleets.json file). resolvePurposeWithShape
+              // only reads `.has()` on the map.
+              const purposeSchoolMap = inf.school
+                ? new Map([[String(tail).toUpperCase(), { school: inf.school, airport }]])
+                : null
               const purposeAns = resolvePurposeWithShape(
-                inf.purpose, t.type, tail, purposePts,
-                { isSchoolFleet: !!inf.school },
+                inf.purpose, t.type, tail, purposePts, purposeSchoolMap,
               )
               flights.push({
                 id: flightId,
