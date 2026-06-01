@@ -183,5 +183,103 @@ export function businessModelColumn({ sub, scenario, nAirframes, dbDelta }) {
     opSavingsPerHr,
     years,
     rate,
+    mechanism: 'Airframe substitution',
   }
+}
+
+/* ─── regulatoryColumn ────────────────────────────────────────────── */
+/**
+ * §11-CLIENT V2 §4: business-model column for `scope: "track_eliminate"`
+ * substitutes. Different shape from airframe subs — these aren't a fleet
+ * purchase, they're a regulatory change, so the NPV reads differently:
+ *
+ *   ATPR — `cap_ex_usd = 0`. NPV is purely the one-time advocacy capex
+ *          (`-sub.advocacy_capex_usd`). No per-flight op savings flow
+ *          into the noise-abatement ROI — the flights just don't happen.
+ *
+ *   SIMX — standard NPV but `nAirframes` = `nSchoolsAffected` (one FTD
+ *          per school), `annual_hours_typical` is the sim's hours
+ *          (~1500, not the displaced flight hours), and the registry's
+ *          `op_savings_per_hr_usd` is negative (sim is cheaper than the
+ *          plane). We flip the sign so positive = annual savings from
+ *          the school's perspective.
+ */
+export function regulatoryColumn({ sub, scenario, nSchoolsAffected, dbDelta }) {
+  if (!sub || sub.scope !== 'track_eliminate' || nSchoolsAffected <= 0) return null
+  const years = scenario.horizon_yr ?? 10
+  const rate = scenario.rate ?? 0.05
+  const fuelMult = scenario.fuel_multiplier ?? 1
+
+  if (sub.code === 'ATPR') {
+    const advocacy = Number(sub.advocacy_capex_usd) || 0
+    const totalNpv = -advocacy
+    const dollarsPerDb = (dbDelta != null && dbDelta > 0 && totalNpv < 0)
+      ? Math.round(Math.abs(totalNpv) / dbDelta)
+      : null
+    return {
+      code: sub.code,
+      name: sub.name,
+      // Header reads "× N". For ATPR we surface the count of tracks the
+      // regulatory rollback removed — that's the visible scale of effect.
+      nAirframes: nSchoolsAffected,
+      capex: advocacy,
+      annualSavings: 0,
+      opSavingsUndiscounted: 0,
+      salvage: 0,
+      npv: totalNpv,
+      dollarsPerDb,
+      breakEvenHours: null,
+      hoursPerYr: 0,
+      opSavingsPerHr: 0,
+      years,
+      rate,
+      mechanism: 'Regulatory rollback',
+      capexNote: 'one-time advocacy campaign',
+    }
+  }
+
+  if (sub.code === 'SIMX') {
+    const capexPerUnit = Number(sub.cap_ex_usd) || 0
+    const capex = capexPerUnit * nSchoolsAffected
+    // School-perspective savings: registry value is negative (sim is cheaper)
+    // — flip sign so positive = annual savings.
+    const opSavingsPerHr = -(Number(sub.op_savings_per_hr_usd) || 0) * fuelMult
+    const hours = scenario.annual_hours_override?.[sub.code]
+      ?? Number(sub.annual_hours_typical) ?? 1500
+    const annualSavings = opSavingsPerHr * hours * nSchoolsAffected
+    const salvage = capex * (Number(sub.residual_value_pct) || 0)
+    const totalNpv = npv({ capex, annualSavings, salvage, rate, years })
+    const opSavingsUndiscounted = annualSavings * years
+    let breakEvenHours = null
+    if (totalNpv < 0 && opSavingsPerHr > 0 && nSchoolsAffected > 0) {
+      let pvFactor = 0
+      for (let t = 1; t <= years; t++) pvFactor += 1 / Math.pow(1 + rate, t)
+      const salvagePv = salvage / Math.pow(1 + rate, years)
+      const requiredAnnual = (capex - salvagePv) / pvFactor
+      breakEvenHours = Math.round(requiredAnnual / (opSavingsPerHr * nSchoolsAffected))
+    }
+    const dollarsPerDb = (dbDelta != null && dbDelta > 0 && totalNpv < 0)
+      ? Math.round(Math.abs(totalNpv) / dbDelta)
+      : null
+    return {
+      code: sub.code,
+      name: sub.name,
+      nAirframes: nSchoolsAffected,
+      capex,
+      annualSavings,
+      opSavingsUndiscounted,
+      salvage,
+      npv: totalNpv,
+      dollarsPerDb,
+      breakEvenHours,
+      hoursPerYr: hours,
+      opSavingsPerHr,
+      years,
+      rate,
+      mechanism: 'FAA Part 61 rulemaking + per-school FTD',
+      capexNote: `${nSchoolsAffected} school${nSchoolsAffected === 1 ? '' : 's'} × $${(capexPerUnit / 1000).toFixed(0)}k FTD`,
+    }
+  }
+
+  return null
 }
