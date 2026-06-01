@@ -4238,6 +4238,36 @@ function flightsApiPlugin() {
               const lMs = c.landing_ts ? Date.parse(c.landing_ts) : null
               cycles.push({ tMs, lMs: Number.isFinite(lMs) ? lMs : null })
             }
+            // Fallback for airborne flights with no complete cycle yet — the
+            // exact case `/api/adsb/current-flights` handles by walking back
+            // from the latest fix. Without this fallback, airborne practice-
+            // area / training flights silently drop out of CURRENT until
+            // they land (kiosk bug report 2026-06-01). Mirror the same
+            // session-gap walk-back here so an in-progress cycle gets
+            // synthesized for the latest contiguous airborne session.
+            if (!cycles.length) {
+              const SESSION_GAP_MS = 30 * 60_000
+              const STALE_MAX_S = 180
+              const lastFix = pts[pts.length - 1]
+              if (lastFix && lastFix[3] != null) {
+                const ageS = (nowMs - lastFix[3]) / 1000
+                if (ageS <= STALE_MAX_S
+                    && lastFix[2] != null && lastFix[2] > groundCeil) {
+                  let takeoffMs = lastFix[3]
+                  for (let i = pts.length - 1; i > 0; i--) {
+                    const cur = pts[i], prev = pts[i - 1]
+                    const gap = (cur[3] || 0) - (prev[3] || 0)
+                    if (gap > SESSION_GAP_MS) break
+                    if (prev[2] != null && prev[2] <= groundCeil) {
+                      takeoffMs = cur[3]
+                      break
+                    }
+                    takeoffMs = prev[3] || takeoffMs
+                  }
+                  cycles.push({ tMs: takeoffMs, lMs: null })
+                }
+              }
+            }
             if (!cycles.length) continue
             cycles.sort((a, b) => a.tMs - b.tMs)
 
