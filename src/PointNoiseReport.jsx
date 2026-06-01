@@ -906,50 +906,81 @@ function BusinessModelTable({ cols, dbDelta }) {
  *  it for the overlay histogram + business-model table), but the
  *  Advanced disclosure's open/closed state is purely local. */
 function WhatIfPanel({ scenario, setScenario, substitutes, businessModelCols, dbDelta }) {
+  // Kept as a single back-compat shell that renders sliders + financials
+  // stacked, for any caller still using the original API. New callers
+  // should use `WhatIfSliders` (the four headline sliders, suitable for
+  // the docked panel) and `WhatIfFinancials` (advanced knobs + business-
+  // model table) separately so the sliders can be locked at the bottom
+  // of the viewport while the financials scroll with the page.
+  return (
+    <div className="space-y-4">
+      <WhatIfSliders scenario={scenario} setScenario={setScenario} substitutes={substitutes} />
+      <WhatIfFinancials scenario={scenario} setScenario={setScenario} substitutes={substitutes} businessModelCols={businessModelCols} dbDelta={dbDelta} />
+    </div>
+  )
+}
+
+/** §11-CLIENT §11: Just the four headline what-if sliders.
+ *  This is what the docked bottom panel renders. Compact 2×2 grid so the
+ *  panel stays short (~140 px tall) even on narrow screens.
+ */
+function WhatIfSliders({ scenario, setScenario, substitutes }) {
+  const update = (patch) => setScenario((s) => ({ ...s, ...patch }))
+  const subVele = findSub(substitutes, 'VELE')
+  const subEfox = findSub(substitutes, 'EFOX')
+  const subSinu = findSub(substitutes, 'SINU')
+  const subWnch = findSub(substitutes, 'WNCH')
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+      <Slider
+        label={`Electric trainer % (${subVele?.name || 'VELE'})`}
+        value={scenario.electric_pct}
+        min={0} max={100} step={5}
+        onChange={(v) => update({ electric_pct: v })}
+        fmt={(v) => `${v}%`}
+      />
+      <Slider
+        label={`Eurofox tow % (${subEfox?.name || 'EFOX'})`}
+        value={scenario.eurofox_pct}
+        min={0} max={100} step={5}
+        onChange={(v) => update({ eurofox_pct: v })}
+        fmt={(v) => `${v}%`}
+      />
+      <Slider
+        label={`Sinus glider % (${subSinu?.name || 'SINU'})`}
+        value={scenario.sinus_pct}
+        min={0} max={100} step={5}
+        onChange={(v) => update({ sinus_pct: v })}
+        fmt={(v) => `${v}%`}
+      />
+      <Slider
+        label={`Winch under N ft AGL (${subWnch?.name || 'WNCH'})`}
+        value={scenario.winch_agl_ft}
+        min={0} max={3000} step={100}
+        onChange={(v) => update({ winch_agl_ft: v })}
+        fmt={(v) => (v === 0 ? 'off' : `${v.toLocaleString()} ft`)}
+      />
+    </div>
+  )
+}
+
+/** §11-CLIENT §11: financial knobs (advanced disclosure) + business-model
+ *  table. Renders inline below the noise graphs, where reading capex /
+ *  NPV / break-even numbers benefits from scrolling and a stable layout.
+ */
+function WhatIfFinancials({ scenario, setScenario, substitutes, businessModelCols, dbDelta }) {
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const update = (patch) => setScenario((s) => ({ ...s, ...patch }))
   const updateHours = (code, hours) => setScenario((s) => ({
     ...s,
     annual_hours_override: { ...s.annual_hours_override, [code]: hours },
   }))
-  // Sub registry lookups — used to display the per-substitute default for
-  // the "Annual hours per airframe" knobs and the descriptive blurbs.
   const subVele = findSub(substitutes, 'VELE')
   const subEfox = findSub(substitutes, 'EFOX')
   const subSinu = findSub(substitutes, 'SINU')
   const subWnch = findSub(substitutes, 'WNCH')
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        <Slider
-          label={`Electric trainer % (${subVele?.name || 'VELE'})`}
-          value={scenario.electric_pct}
-          min={0} max={100} step={5}
-          onChange={(v) => update({ electric_pct: v })}
-          fmt={(v) => `${v}%`}
-        />
-        <Slider
-          label={`Eurofox tow % (${subEfox?.name || 'EFOX'})`}
-          value={scenario.eurofox_pct}
-          min={0} max={100} step={5}
-          onChange={(v) => update({ eurofox_pct: v })}
-          fmt={(v) => `${v}%`}
-        />
-        <Slider
-          label={`Sinus glider % (${subSinu?.name || 'SINU'})`}
-          value={scenario.sinus_pct}
-          min={0} max={100} step={5}
-          onChange={(v) => update({ sinus_pct: v })}
-          fmt={(v) => `${v}%`}
-        />
-        <Slider
-          label={`Winch under N ft AGL (${subWnch?.name || 'WNCH'})`}
-          value={scenario.winch_agl_ft}
-          min={0} max={3000} step={100}
-          onChange={(v) => update({ winch_agl_ft: v })}
-          fmt={(v) => (v === 0 ? 'off' : `${v.toLocaleString()} ft`)}
-        />
-      </div>
       <Disclosure
         open={advancedOpen}
         onToggle={() => setAdvancedOpen((x) => !x)}
@@ -983,7 +1014,6 @@ function WhatIfPanel({ scenario, setScenario, substitutes, businessModelCols, db
           fuel halves?", 2.0× to ask "what if it doubles?". Discount rate +
           time horizon feed the NPV formula.
         </div>
-        {/* Per-substitute annual-hours overrides — one row each. */}
         <div className="space-y-3 pt-2 border-t border-white/5">
           <div className="text-[10px] uppercase tracking-wide text-white/40">
             Annual hours per airframe (override per substitute)
@@ -1005,9 +1035,6 @@ function WhatIfPanel({ scenario, setScenario, substitutes, businessModelCols, db
           })}
         </div>
       </Disclosure>
-      {/* §11-CLIENT §7: business-model table — only renders when at least
-          one substitute is active. dB delta is supplied by the parent
-          (baseline peak minus scenario peak at the listener). */}
       {businessModelCols && businessModelCols.length > 0 && (
         <div className="space-y-2">
           <div className="text-xs uppercase tracking-wide text-white/60">
@@ -1730,9 +1757,22 @@ export default function PointNoiseReport() {
     })
   }
 
+  // §11-CLIENT §11: docked slider panel can be collapsed to a thin strip
+  // so it doesn't hide the bottom of the page when the user is reading
+  // the methodology / footer. Default open when scenario is active so the
+  // user can see what they're tweaking; default open generally too —
+  // collapsing is opt-in.
+  const [dockOpen, setDockOpen] = useState(true)
+
   return (
     <div className="min-h-screen bg-neutral-950 text-white">
-      <div className="max-w-6xl mx-auto px-4 py-5 space-y-4">
+      {/* Bottom padding leaves room for the docked slider panel so the
+          final section isn't covered. ~190 px = open panel height; ~36 px
+          when collapsed. */}
+      <div
+        className="max-w-6xl mx-auto px-4 py-5 space-y-4"
+        style={{ paddingBottom: dockOpen ? 200 : 56 }}
+      >
         <header>
           <h1 className="text-2xl font-semibold">Point noise report</h1>
           <p className="text-sm text-white/50 mt-1">
@@ -1956,16 +1996,13 @@ export default function PointNoiseReport() {
           </Section>
         </div>
 
-        {/* §11-CLIENT §3 + §9: What-If panel.
-            Sits directly under the hourly+dBA-histogram pair on purpose —
-            those two charts carry the scenario overlay, so the sliders
-            and their effect are in the same viewport on most screens.
-            Render rules:
-              - substitutes === null → still loading: render nothing.
-              - substitutes.length === 0 (404 / missing config) OR no
-                track in window carries alt_airframe_candidates (older
-                deployment) → render a small inline note.
-              - otherwise → full What-If panel + business-model table. */}
+        {/* §11-CLIENT §11: What-If FINANCIALS (NPV inputs + business-model
+            table) renders inline here, right under the overlay charts.
+            The four headline sliders that drive the overlay live in a
+            FIXED-BOTTOM docked panel (rendered at the end of this
+            component) so they remain in view while the user scrolls the
+            graphs. The two parts are deliberately decoupled — slider
+            scrubs feel instant; financial reading wants a stable layout. */}
         {(() => {
           if (substitutes == null) return null
           const anyCandidate = allRows.some(
@@ -1986,10 +2023,10 @@ export default function PointNoiseReport() {
           }
           return (
             <Section
-              title="What-If: quieter fleets"
-              hint="Drag a slider to swap a fraction of the current fleet for a quieter alternative. The two charts above (hourly + dBA histogram) gain a coloured overlay showing the scenario result. NPV / $-per-dB updates live."
+              title="What-If: financial impact"
+              hint="Drag the sliders in the docked panel at the bottom of the page. NPV / $-per-dB updates live below."
             >
-              <WhatIfPanel
+              <WhatIfFinancials
                 scenario={scenario}
                 setScenario={setScenario}
                 substitutes={substitutes}
@@ -2304,6 +2341,58 @@ export default function PointNoiseReport() {
         </>
         )}
       </div>
+
+      {/* §11-CLIENT §11: docked What-If sliders.
+          Fixed at the bottom of the viewport so the user can drag any
+          slider while watching the hourly + dBA-histogram charts respond
+          live. Rendered only when substitutes are loaded AND the current
+          window has at least one substitutable track — otherwise the
+          panel has nothing to swap. */}
+      {(() => {
+        if (substitutes == null || substitutes.length === 0) return null
+        const anyCandidate = allRows.some(
+          (r) => (r.altAirframeCandidates?.length || 0) > 0
+            || (r.altSegmentCandidates?.length || 0) > 0,
+        )
+        if (!anyCandidate) return null
+        const activeCount =
+          (scenario.electric_pct > 0 ? 1 : 0)
+          + (scenario.eurofox_pct > 0 ? 1 : 0)
+          + (scenario.sinus_pct > 0 ? 1 : 0)
+          + (scenario.winch_agl_ft > 0 ? 1 : 0)
+        return (
+          <div
+            className="fixed bottom-0 inset-x-0 z-[1500] border-t border-white/15 bg-neutral-950/95 backdrop-blur shadow-[0_-8px_24px_rgba(0,0,0,0.6)]"
+          >
+            <div className="max-w-6xl mx-auto px-4 py-2">
+              <button
+                type="button"
+                onClick={() => setDockOpen((o) => !o)}
+                className="w-full flex items-center justify-between text-left text-xs uppercase tracking-wide text-white/60 hover:text-white"
+              >
+                <span className="flex items-center gap-2">
+                  <span className={dockOpen ? '' : 'opacity-60'}>What-If sliders</span>
+                  {activeCount > 0 && (
+                    <span className="text-[10px] bg-sky-500/30 text-sky-200 rounded px-1.5 py-0.5 normal-case">
+                      {activeCount} active · Δ peak {dbDelta > 0 ? `−${Math.round(dbDelta)}` : '0'} dBA
+                    </span>
+                  )}
+                </span>
+                <span className="text-white/40">{dockOpen ? '▾' : '▴'}</span>
+              </button>
+              {dockOpen && (
+                <div className="pt-2 pb-1">
+                  <WhatIfSliders
+                    scenario={scenario}
+                    setScenario={setScenario}
+                    substitutes={substitutes}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        )
+      })()}
     </div>
   )
 }
