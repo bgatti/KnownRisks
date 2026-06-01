@@ -183,6 +183,57 @@ function estDbaAtListener({
   return Math.max(0, base - vert - lateral)
 }
 
+/* ───────────────────────── what-if helpers ─────────────────────────── */
+
+/**
+ * §11-CLIENT §4: Deterministic substitution selection.
+ *
+ * Given the current track list and a slider percentage for a substitute
+ * code, return the set of tails that should be substituted. Sort by tail
+ * ascending and take the first `floor(N * pct/100)` so the selection is
+ * stable across re-renders — no random seed, no flicker when the slider
+ * tick repeats the same value.
+ *
+ * `tracks` items must carry `tail` + `altAirframeCandidates` (the shape
+ * analyzeTrack produces).
+ */
+export function pickSubstituted(tracks, code, pct) {
+  if (!pct || pct <= 0) return new Set()
+  const eligible = []
+  for (const t of tracks || []) {
+    const cands = t?.altAirframeCandidates || []
+    if (cands.includes(code) && t.tail) eligible.push(t.tail)
+  }
+  eligible.sort()
+  const k = Math.floor((eligible.length * pct) / 100)
+  return new Set(eligible.slice(0, k))
+}
+
+/**
+ * §11-CLIENT §4: Winch is an AGL threshold rather than a track fraction —
+ * any segment of a tow track whose lowest AGL point falls below the
+ * threshold should be substituted with WNCH (base_dba = 0). Returns true
+ * iff the segment qualifies under the current threshold.
+ *
+ * `seg.points` is the raw [lat, lon, alt_msl, ts?] tuple shape the server
+ * emits; we read alt_msl from index 2 and compare against
+ * `listenerElevFt`. Threshold <= 0 means winch is off entirely.
+ */
+export function shouldWinchSegment(seg, threshold_ft, listenerElevFt) {
+  if (!threshold_ft || threshold_ft <= 0) return false
+  const pts = seg?.points
+  if (!Array.isArray(pts) || pts.length === 0) return false
+  let lowest = Infinity
+  for (const p of pts) {
+    const altMsl = p?.[2]
+    if (altMsl == null) continue
+    const agl = altMsl - listenerElevFt
+    if (agl < lowest) lowest = agl
+  }
+  if (!Number.isFinite(lowest)) return false
+  return lowest < threshold_ft
+}
+
 /* ───────────────────────── analysis ────────────────────────────────── */
 
 /** Compute closest approach + dBA for a single track. */
