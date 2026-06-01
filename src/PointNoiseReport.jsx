@@ -248,6 +248,18 @@ function analyzeTrack(track, listener, fleetIndex) {
     distFt: bestDistFt,
     distNm: bestDistFt / 6076,
     dba,
+    // §11-CLIENT §2: pass the new What-If fields through verbatim so the
+    // scenario layer can sub in alternative-airframe dBA without needing
+    // a second roundtrip. Optional chaining + array defaults keep this
+    // safe against older deployments that don't ship them yet.
+    altAirframeCandidates: Array.isArray(track.alt_airframe_candidates)
+      ? track.alt_airframe_candidates : [],
+    altSegmentCandidates: Array.isArray(track.alt_segment_candidates)
+      ? track.alt_segment_candidates : [],
+    // Carry the raw segments through too — the scenario re-aggregator
+    // walks them per-point with shouldWinchSegment() and reads each
+    // segment's alt_dba_by_substitute map.
+    segments: Array.isArray(track.segments) ? track.segments : [],
   }
 }
 
