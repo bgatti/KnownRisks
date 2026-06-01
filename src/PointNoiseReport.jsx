@@ -452,6 +452,36 @@ function fmtDay(ts) {
 }
 
 /**
+ * §11-CLIENT V3 §4: one-line legend explaining what each source
+ * badge means. Renders once on the page (next to the headline
+ * purpose section); the "shape" cell links to /api/purpose-ml/buckets
+ * so a curious viewer can see the full purposeML bucket taxonomy.
+ */
+function PurposeSourceLegend() {
+  return (
+    <div className="text-[10px] text-white/50 leading-tight whitespace-nowrap">
+      <span className="text-white/40 mr-1">Purpose source:</span>
+      <span style={{ color: '#f59e0b' }} className="font-mono">★ curated</span>
+      <span className="text-white/30 mx-1">·</span>
+      <span style={{ color: '#94a3b8' }} className="font-mono">T type</span>
+      <span className="text-white/30 mx-1">·</span>
+      <span style={{ color: '#94a3b8' }} className="font-mono">DB tracked</span>
+      <span className="text-white/30 mx-1">·</span>
+      <a
+        href="/api/purpose-ml/buckets"
+        target="_blank"
+        rel="noreferrer noopener"
+        title="Open the purposeML bucket taxonomy"
+        className="font-mono hover:underline"
+        style={{ color: '#22d3ee' }}
+      >
+        ~ shape (N%)
+      </a>
+    </div>
+  )
+}
+
+/**
  * §11-CLIENT V3 §2: render the provenance badge produced by
  * purposeSourceBadgeProps(). Returns null when no badge applies
  * (older API rows). Small monospace pill — sits to the right of the
@@ -2166,6 +2196,7 @@ export default function PointNoiseReport() {
         <Section
           title="Why was this noise here? — by purpose"
           hint="Click a row to focus the rest of the report on that category. This is the most-asked question of a noise report: who's flying, why?"
+          right={<PurposeSourceLegend />}
         >
           <PurposeBars
             counts={purposeCounts}
