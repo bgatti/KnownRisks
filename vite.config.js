@@ -3509,7 +3509,21 @@ function computeFlightIndicators(grpCycles, allPts, tail, type, airport, complai
   }
 
   // ── worst_segment — 30 s sliding window over pattern-excluded fixes ──
-  out.worst_segment = computeWorstSegment(nonPatternPts, POPGRID?.popAt, airport, engineless, calib.offset_ft)
+  // Falls back to the full track (flagged `is_pattern: true`) when the
+  // flight had no non-pattern fixes. Without the fallback, a sortie
+  // that stayed entirely in an airport pattern envelope (e.g. a KBDU
+  // student doing T&Gs all day) reports `pop_impact > 0` (pattern
+  // contributes at PATTERN_WEIGHT=0.3) but no `worst_segment` polyline,
+  // so the kiosk has nothing to highlight on the map (operator-filed
+  // 2026-06-01 — "two flights at KBDU right now, neither showing
+  // worst segment"). The kiosk can opt to style is_pattern segments
+  // differently (subtler color, dashed, etc.).
+  let _ws = computeWorstSegment(nonPatternPts, POPGRID?.popAt, airport, engineless, calib.offset_ft)
+  if (!_ws && flightPts.length >= 3) {
+    _ws = computeWorstSegment(flightPts, POPGRID?.popAt, airport, engineless, calib.offset_ft)
+    if (_ws) _ws.is_pattern = true
+  }
+  out.worst_segment = _ws
 
   // ── incursion_segments — per-zone in-polygon runs (Ask #6) ───────────
   out.incursion_segments = computeIncursionSegments(flightPts, airport, engineless, ap, calib.offset_ft)
