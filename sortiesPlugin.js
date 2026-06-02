@@ -177,22 +177,38 @@ function computeSortieAltOffset(rawPath, sortieAp) {
 }
 
 // ── Path bridging — patch coverage gaps with synthesized fixes ───
-// Returns { path, bridgedCount, bridgedMaxGapS, bridgedTotalGapS }
-// where path is the augmented 5-tuple array with quality flags.
+// Returns { path, bridgedCount, bridgedMaxGapS, bridgedTotalGapS,
+//           gaps: [{ before_index, gap_seconds, reason }] }
+// where path is the augmented 5-tuple array with quality flags AND
+// gaps[] surfaces every UNBRIDGED coverage gap so the client can
+// break the rendered polyline there (instead of drawing a misleading
+// straight line through the missing data).
 function bridgeSortiePath(rawPath, altOffset) {
   if (!Array.isArray(rawPath) || rawPath.length < 2) {
-    return { path: [], bridgedCount: 0, bridgedMaxGapS: 0, bridgedTotalGapS: 0 }
+    return { path: [], bridgedCount: 0, bridgedMaxGapS: 0, bridgedTotalGapS: 0, gaps: [] }
   }
   const out = []
   let bridged = 0, maxGap = 0, totalGap = 0
+  const gaps = []
   // Helper to append a corrected real point
   const pushReal = (p) => out.push([p[0], p[1], (p[2] != null) ? p[2] - altOffset : null, p[3], 'observed'])
+  // Record an UNBRIDGED gap. `before_index` is the index of the next
+  // observed point — i.e. the polyline should be broken just BEFORE
+  // out.length.
+  const recordGap = (dtMs, reason) => {
+    gaps.push({ before_index: out.length, gap_seconds: Math.round(dtMs / 1000), reason })
+  }
   pushReal(rawPath[0])
   for (let i = 1; i < rawPath.length; i++) {
     const a = rawPath[i - 1]
     const b = rawPath[i]
     const dtMs = (b[3] || 0) - (a[3] || 0)
-    if (dtMs <= SORTIE_BRIDGE_GAP_MS || dtMs > SORTIE_BRIDGE_MAX_MS) {
+    if (dtMs <= SORTIE_BRIDGE_GAP_MS) {
+      pushReal(b)
+      continue
+    }
+    if (dtMs > SORTIE_BRIDGE_MAX_MS) {
+      recordGap(dtMs, 'too_long')
       pushReal(b)
       continue
     }
@@ -218,7 +234,13 @@ function bridgeSortiePath(rawPath, altOffset) {
     if (prevKts != null && nextKts != null) nodeKts = (prevKts + nextKts) / 2
     else if (prevKts != null) nodeKts = prevKts
     else if (nextKts != null) nodeKts = nextKts
-    if (nodeKts == null || nodeKts < 30 || nodeKts > 400) {
+    if (nodeKts == null) {
+      recordGap(dtMs, 'no_node_speed')
+      pushReal(b)
+      continue
+    }
+    if (nodeKts < 30 || nodeKts > 400) {
+      recordGap(dtMs, 'implausible_neighbor_speed')
       pushReal(b)
       continue
     }
@@ -226,6 +248,7 @@ function bridgeSortiePath(rawPath, altOffset) {
     const impliedKts = gapDistNm / (dtMs / 3_600_000)
     if (impliedKts < nodeKts * (1 - SORTIE_BRIDGE_TOLERANCE)
         || impliedKts > nodeKts * (1 + SORTIE_BRIDGE_TOLERANCE)) {
+      recordGap(dtMs, 'speed_mismatch')
       pushReal(b)
       continue
     }
@@ -246,7 +269,13 @@ function bridgeSortiePath(rawPath, altOffset) {
     totalGap += gapSec
     pushReal(b)
   }
-  return { path: out, bridgedCount: bridged, bridgedMaxGapS: Math.round(maxGap), bridgedTotalGapS: Math.round(totalGap) }
+  return {
+    path: out,
+    bridgedCount: bridged,
+    bridgedMaxGapS: Math.round(maxGap),
+    bridgedTotalGapS: Math.round(totalGap),
+    gaps,
+  }
 }
 
 // ── Max-pop segment within the sortie path ───────────────────────
@@ -344,17 +373,6 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
           const sortieFieldElev = sortieAp.elev
           const sortiePatternRadius = sortieAp.pattern_radius_nm || 2
 
-          let sortieLive
-          if (db && db.useDb) sortieLive = await db.loadLiveFromDb(sortieHours)
-          else {
-            try {
-              const fs2 = await import('fs/promises')
-              const path = await import('path')
-              const buf = await fs2.default.readFile(path.default.resolve('public/tracks_live.json'), 'utf8')
-              sortieLive = JSON.parse(buf)
-            } catch { sortieLive = { tracks: [] } }
-          }
-          const sortieTracks = sortieLive.tracks || []
           // Window cutoffs — day-mode is [00:00 day, +24h], hours-mode is rolling.
           let sortieCutoffStartMs, sortieCutoffEndMs
           if (sortieDayParam) {
@@ -368,6 +386,35 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             sortieCutoffEndMs = Date.now()
             sortieCutoffStartMs = sortieCutoffEndMs - sortieHours * 3600 * 1000
           }
+
+          // Load source — historical via loadLiveFromDbByDateRange
+          // when ?day= or ?days= is set; live rolling window
+          // otherwise. Both routes hit live_tracks (which has per-UTC-
+          // day rows + retention going back as far as the DB keeps
+          // them). Deep-historical (months+) over the `tracks` table
+          // is the next iteration when the test page asks for it.
+          let sortieLive
+          let sortieSource
+          if (db && db.useDb) {
+            if (sortieDayParam || sortieDaysParam) {
+              const fromDate = new Date(sortieCutoffStartMs).toISOString().slice(0, 10)
+              const toDate   = new Date(sortieCutoffEndMs - 1).toISOString().slice(0, 10)
+              sortieLive = await db.loadLiveFromDbByDateRange(fromDate, toDate)
+              sortieSource = `historical:live_tracks ${fromDate}..${toDate}`
+            } else {
+              sortieLive = await db.loadLiveFromDb(sortieHours)
+              sortieSource = 'live'
+            }
+          } else {
+            try {
+              const fs2 = await import('fs/promises')
+              const path = await import('path')
+              const buf = await fs2.default.readFile(path.default.resolve('public/tracks_live.json'), 'utf8')
+              sortieLive = JSON.parse(buf)
+              sortieSource = 'file:tracks_live.json'
+            } catch { sortieLive = { tracks: [] }; sortieSource = 'empty' }
+          }
+          const sortieTracks = sortieLive.tracks || []
 
           // Schools index for operator resolution.
           const schoolsIdx = loadSchoolsIndex()
@@ -484,7 +531,15 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                   bridged_count: bridged.bridgedCount,
                   bridged_max_gap_s: bridged.bridgedMaxGapS,
                   bridged_total_gap_s: bridged.bridgedTotalGapS,
+                  unbridged_gap_count: bridged.gaps.length,
+                  unbridged_max_gap_s: bridged.gaps.reduce((m, g) => Math.max(m, g.gap_seconds), 0),
                 },
+                // Coverage breaks the bridger refused — the polyline
+                // must NOT be drawn through these or it becomes a
+                // misleading straight line. `before_index` is the
+                // index of the first observed point AFTER the gap;
+                // break the polyline immediately before it.
+                sortie_path_gaps: bridged.gaps,
                 sortie_max_pop_segment: null,
               }
 
@@ -516,9 +571,10 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             sortie_day: sortieDayParam,
             sortie_days: sortieDaysParam,
             sortie_school: sortieSchoolFilter,
+            sortie_source: sortieSource,
             sortie_count: sortieResults.length,
             sortie_invariant: 'sortie_max_pop_segment.sortie_max_pop_points === sortie_path.slice(sortie_max_pop_index_start, sortie_max_pop_index_end + 1).',
-            sortie_path_format: '[lat, lon, alt_msl_corrected_ft, ts_ms, quality] — quality ∈ {"observed", "bridged"}.',
+            sortie_path_format: '[lat, lon, alt_msl_corrected_ft, ts_ms, quality] — quality ∈ {"observed", "bridged"}. sortie_path_gaps lists unbridged coverage breaks; do not draw a straight line through them.',
             sorties: sortieResults,
           }))
         } catch (err) {
