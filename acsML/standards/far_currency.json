@@ -1,0 +1,64 @@
+{
+  "regulation": "14 CFR § 61.57",
+  "title": "Recent flight experience: Pilot in command",
+  "rules": [
+    {
+      "code": "61.57(a)",
+      "title": "General experience (carrying passengers, day)",
+      "requirement": "Within the preceding 90 days, performed 3 takeoffs and 3 landings as sole manipulator of the flight controls in an aircraft of the same category, class, and type (if a type rating is required).",
+      "lookback_days": 90,
+      "events_required": {
+        "takeoffs": 3,
+        "landings": 3
+      },
+      "type_must_match": "category+class+type_if_required",
+      "track_rule": "Each detected (takeoff + landing) pair within 90 days counts as one event. Either touch_and_go or landed_full_stop satisfies the landing leg.",
+      "notes": "Currency is per-pilot; per-tail we can only track per-aircraft activity. Useful for displaying 'this aircraft made N currency-eligible legs in the last 90 days.'"
+    },
+    {
+      "code": "61.57(a)(2)",
+      "title": "Tailwheel currency",
+      "requirement": "For tailwheel aircraft, the landings must be FULL-STOP (not touch-and-go).",
+      "lookback_days": 90,
+      "events_required": {
+        "full_stop_landings": 3
+      },
+      "type_must_match": "tailwheel",
+      "track_rule": "Count only phaseML landed_full_stop events. touch_and_go does NOT satisfy tailwheel currency.",
+      "type_codes_tailwheel_hint": ["BL8", "C170", "C180", "C185", "PA12", "PA18", "PA22", "AC8", "PIT2", "S2S", "AEAT", "T6", "DC3", "BE18"]
+    },
+    {
+      "code": "61.57(b)",
+      "title": "Night experience (carrying passengers, night)",
+      "requirement": "Within the preceding 90 days, performed 3 takeoffs and 3 landings TO A FULL STOP at night.",
+      "lookback_days": 90,
+      "events_required": {
+        "night_full_stop_landings": 3,
+        "night_takeoffs": 3
+      },
+      "night_definition": "FAR 1.1: from end of evening civil twilight to beginning of morning civil twilight, when sun is more than 6° below horizon. For 61.57(b) currency, FAA uses 1 hour after sunset to 1 hour before sunrise.",
+      "track_rule": "Detect takeoff and landed_full_stop events whose timestamp at the airport lat/lon falls in the night window. touch_and_go does NOT count.",
+      "notes": "Touch-and-go landings explicitly do NOT count for night currency — even though they count for day 61.57(a)."
+    },
+    {
+      "code": "61.57(c)",
+      "title": "Instrument experience",
+      "requirement": "Within the preceding 6 calendar months, in the appropriate category of aircraft for the instrument privileges sought, performed 6 instrument approaches, holding procedures and tasks, and intercepting and tracking courses through use of navigational electronic systems.",
+      "lookback_days_months": 6,
+      "events_required": {
+        "approaches": 6,
+        "holding": 1,
+        "intercept_track": 1
+      },
+      "track_rule": "Approach detection requires inbound profile alignment with a known runway (descent to MAP / DA) — non-trivial from track alone. Defer to v2 (separate approaches.js module that reads CIFP/airport runway data).",
+      "v0_status": "deferred"
+    },
+    {
+      "code": "61.56",
+      "title": "Flight review",
+      "requirement": "Within preceding 24 calendar months, a flight review consisting of 1 hour of flight training and 1 hour of ground training.",
+      "track_rule": "Cannot be inferred from tail's flight activity alone — flight review is performed in any aircraft and logged by the pilot.",
+      "v0_status": "out_of_scope"
+    }
+  ]
+}

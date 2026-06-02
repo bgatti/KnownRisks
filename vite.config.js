@@ -30,6 +30,20 @@ try {
 } catch (err) {
   console.warn('[purposeML] library unavailable — shape inference disabled:', err && err.message)
 }
+
+// acsML — ACS task identifier + FAR 61.57 currency tracker. Same
+// optional-load pattern as purposeML. See acsML/README.md.
+let acsMLIdentify = null
+let acsMLApiPlugin = () => ({ name: 'acs-ml-noop' })
+try {
+  const { createRequire } = await import('module')
+  const requireOpt = createRequire(import.meta.url)
+  const mod = requireOpt('./acsML/index.js')
+  if (mod && typeof mod.identifyOneTrack === 'function') acsMLIdentify = mod.identifyOneTrack
+  if (mod && typeof mod.acsMLApiPlugin === 'function') acsMLApiPlugin = mod.acsMLApiPlugin
+} catch (err) {
+  console.warn('[acsML] library unavailable — ACS tag inference disabled:', err && err.message)
+}
 import { synthesizeInProgressCycle } from './flightCycles.js'
 import {
   computeFlightAltOffset,
@@ -9128,6 +9142,7 @@ export default defineConfig({
     adsbApiPlugin(),
     phaseMLApiPlugin(), // /api/phase-ml/{health,airports,classify,classify-archive}
     purposeMLApiPlugin(), // /api/purpose-ml/{health,buckets,classify,classify-archive,extract}
+    acsMLApiPlugin(),     // /api/acs-ml/{health,standards,identify,identify-archive}
     flightImpactPlugin(),
     aircraftIconsPlugin(),
     noiseZonesApiPlugin(),

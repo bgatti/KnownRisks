@@ -1,0 +1,344 @@
+{
+  "document": "FAA-S-ACS-6B",
+  "name": "Private Pilot — Airplane Airman Certification Standards",
+  "effective": "2018-06-11",
+  "scope_for_track_inference": "Tasks listed here are the ones whose performance can be observed (or partially observed) from an ADS-B / live track. Tasks marked detect=knowledge are oral-exam items not detectable from path and are omitted. Tasks marked detect=partial can be inferred from track shape but with caveats noted.",
+  "areas_of_operation": [
+    {
+      "code": "I",
+      "name": "Preflight Preparation",
+      "note": "Ground-only / knowledge tasks; not detectable from track.",
+      "tasks": []
+    },
+    {
+      "code": "II",
+      "name": "Preflight Procedures",
+      "tasks": [
+        {
+          "code": "II.D",
+          "name": "Engine Start",
+          "detect": "ground_state",
+          "phaseml_signals": ["on_ground"],
+          "performance_standard": "n/a from track",
+          "notes": "Existence implied if the track starts with on_ground samples followed by taxi."
+        }
+      ]
+    },
+    {
+      "code": "III",
+      "name": "Airport and Seaplane Base Operations",
+      "tasks": [
+        {
+          "code": "III.A",
+          "name": "Communications, Light Signals, and Runway Lighting Systems",
+          "detect": "knowledge"
+        },
+        {
+          "code": "III.B",
+          "name": "Traffic Patterns",
+          "detect": "full",
+          "phaseml_signals": ["pattern"],
+          "performance_standard": {
+            "pattern_altitude_ft_agl": "±100 ft of published TPA",
+            "airspeed": "±10 kts of recommended",
+            "ground_track": "maintained within 1/4 mile of the pattern"
+          },
+          "track_rule": "phase 'pattern' duration ≥ 60 s within 2.5 nm of an airport and AGL 100–1500 ft."
+        }
+      ]
+    },
+    {
+      "code": "IV",
+      "name": "Takeoffs, Landings, and Go-Arounds",
+      "tasks": [
+        {
+          "code": "IV.A",
+          "name": "Normal Takeoff and Climb",
+          "detect": "full",
+          "phaseml_signals": ["takeoff"],
+          "performance_standard": {
+            "rotate_speed": "VR ±5 kts",
+            "climb_speed": "VY ±5 kts (or specified)"
+          },
+          "track_rule": "Synthetic 'takeoff' event emitted by the identifier on every on_ground→airborne transition. Preempted by IV.E (short-field) or IV.C (soft-field) when those differentiators fire."
+        },
+        {
+          "code": "IV.B",
+          "name": "Normal Approach and Landing",
+          "detect": "full",
+          "phaseml_signals": ["landed_full_stop"],
+          "performance_standard": {
+            "touchdown_speed": "1.3 VSO +10 / -5 kts",
+            "touchdown_point": "within 400 ft beyond a specified point"
+          },
+          "track_rule": "phaseML detection landed_full_stop event."
+        },
+        {
+          "code": "IV.C",
+          "name": "Soft-Field Takeoff and Climb",
+          "detect": "partial",
+          "phaseml_signals": ["soft_field_takeoff"],
+          "performance_standard": {
+            "technique": "lift-off as soon as possible; accelerate in ground effect"
+          },
+          "track_rule": "acsML soft_field_takeoff detection. Heuristic only — pilot input cannot be confirmed from track.",
+          "notes": "Defaults to IV.A Normal Takeoff unless this differentiator detection fires."
+        },
+        {
+          "code": "IV.D",
+          "name": "Soft-Field Approach and Landing",
+          "detect": "partial",
+          "phaseml_signals": ["soft_field_landing"],
+          "track_rule": "acsML soft_field_landing detection (touchdown sink rate < 100 fpm). Suspected only.",
+          "preempts": ["IV.B"]
+        },
+        {
+          "code": "IV.E",
+          "name": "Short-Field Takeoff and Maximum Performance Climb",
+          "detect": "partial",
+          "phaseml_signals": ["short_field_takeoff"],
+          "performance_standard": {
+            "rotate_speed": "VR specified",
+            "climb_speed": "VX +5/-0 kts, then VY"
+          },
+          "track_rule": "acsML short_field_takeoff detection (sustained ≥ 700 fpm from low AGL).",
+          "preempts": ["IV.A"]
+        },
+        {
+          "code": "IV.F",
+          "name": "Short-Field Approach and Landing",
+          "detect": "partial",
+          "phaseml_signals": ["short_field_landing"],
+          "track_rule": "acsML short_field_landing detection (sustained ≥ 600 fpm into touchdown).",
+          "preempts": ["IV.B"]
+        },
+        {
+          "code": "IV.K",
+          "name": "Go-Around/Rejected Landing",
+          "detect": "full",
+          "phaseml_signals": ["touch_and_go"],
+          "performance_standard": {
+            "decision_promptness": "decision and configuration changes made promptly",
+            "climb": "Vy ±10 kts"
+          },
+          "track_rule": "phaseML touch_and_go event (a non-full-stop landing that climbed out). Distinguishes from landed_full_stop via the post-touchdown climbout."
+        }
+      ]
+    },
+    {
+      "code": "V",
+      "name": "Performance and Ground Reference Maneuvers",
+      "tasks": [
+        {
+          "code": "V.A",
+          "name": "Steep Turns",
+          "detect": "full",
+          "phaseml_signals": ["steep_turn"],
+          "performance_standard": {
+            "bank_angle": "45° ±5°",
+            "altitude": "±100 ft",
+            "airspeed": "±10 kts",
+            "rollout_heading": "±10°",
+            "turn_amount": "360° in one direction or 180° each side"
+          },
+          "track_rule": "phaseML steep_turn detection with bank evidence ≥ 40° (within ACS tolerance)."
+        },
+        {
+          "code": "V.B",
+          "name": "Ground Reference Maneuvers — Rectangular Course",
+          "detect": "partial",
+          "phaseml_signals": [],
+          "performance_standard": {
+            "altitude": "600–1000 ft AGL",
+            "airspeed": "manufacturer recommended ±10 kts",
+            "ground_track": "maintained against wind drift"
+          },
+          "track_rule": "Four 90° turns in sequence centered on a fixed ground reference; legs roughly parallel/perpendicular; AGL 600–1000.",
+          "notes": "phaseML doesn't have a rectangular-course detector yet. Added in acsML/features.js."
+        },
+        {
+          "code": "V.C",
+          "name": "Ground Reference Maneuvers — S-Turns Across a Road",
+          "detect": "full",
+          "phaseml_signals": ["s_turns_across_road"],
+          "performance_standard": {
+            "altitude": "600–1000 ft AGL",
+            "airspeed": "manufacturer recommended ±10 kts",
+            "bank_max": "approximately 45°",
+            "wings_level_at_reference": true
+          }
+        },
+        {
+          "code": "V.D",
+          "name": "Ground Reference Maneuvers — Turns Around a Point",
+          "detect": "full",
+          "phaseml_signals": ["turn_around_a_point"],
+          "performance_standard": {
+            "altitude": "600–1000 ft AGL",
+            "airspeed": "manufacturer recommended ±10 kts",
+            "turns_completed": "two 360° turns in one direction",
+            "bank_max": "approximately 45° at closest point"
+          }
+        }
+      ]
+    },
+    {
+      "code": "VI",
+      "name": "Navigation",
+      "tasks": [
+        {
+          "code": "VI.A",
+          "name": "Pilotage and Dead Reckoning",
+          "detect": "partial",
+          "track_rule": "Long XC leg (> 25 nm) with direct line and altitude held; tortuosity < 1.2.",
+          "notes": "Can't tell from track whether pilotage vs GPS navigation was used."
+        },
+        {
+          "code": "VI.B",
+          "name": "Navigation Systems and Radar Services",
+          "detect": "knowledge"
+        },
+        {
+          "code": "VI.C",
+          "name": "Diversion",
+          "detect": "partial",
+          "track_rule": "Mid-XC heading change > 60° followed by sustained new heading to a different airport.",
+          "notes": "Can't tell intentional diversion from a planned waypoint without flight plan."
+        },
+        {
+          "code": "VI.D",
+          "name": "Lost Procedures",
+          "detect": "knowledge"
+        }
+      ]
+    },
+    {
+      "code": "VII",
+      "name": "Slow Flight and Stalls",
+      "tasks": [
+        {
+          "code": "VII.A",
+          "name": "Maneuvering During Slow Flight",
+          "detect": "full",
+          "phaseml_signals": ["slow_flight"],
+          "performance_standard": {
+            "airspeed": "an airspeed above stall warning",
+            "altitude": "±100 ft",
+            "heading": "±10°",
+            "bank": "established and maintained, around 20°"
+          }
+        },
+        {
+          "code": "VII.B",
+          "name": "Power-Off Stalls",
+          "detect": "partial",
+          "phaseml_signals": ["stall_recovery"],
+          "track_rule": "phaseML stall_recovery detection whose pre-event vsFpm shows POWER-OFF context (mean pre-vs < 0). The identifier checks the evidence trail.",
+          "selector": "pre_vs_negative"
+        },
+        {
+          "code": "VII.C",
+          "name": "Power-On Stalls",
+          "detect": "partial",
+          "phaseml_signals": ["stall_recovery"],
+          "track_rule": "phaseML stall_recovery detection whose pre-event vsFpm shows POWER-ON context (mean pre-vs > 0).",
+          "selector": "pre_vs_positive"
+        },
+        {
+          "code": "VII.D",
+          "name": "Spin Awareness",
+          "detect": "knowledge"
+        }
+      ]
+    },
+    {
+      "code": "VIII",
+      "name": "Basic Instrument Maneuvers",
+      "tasks": [
+        {
+          "code": "VIII.A",
+          "name": "Straight-and-Level Flight (Instruments)",
+          "detect": "indistinguishable",
+          "notes": "Same path shape as VFR straight-and-level. Not detectable as ACS task without hood/instrument context."
+        },
+        {
+          "code": "VIII.B",
+          "name": "Constant Airspeed Climbs (Instruments)",
+          "detect": "indistinguishable"
+        },
+        {
+          "code": "VIII.C",
+          "name": "Constant Airspeed Descents (Instruments)",
+          "detect": "indistinguishable"
+        },
+        {
+          "code": "VIII.D",
+          "name": "Turns to Headings (Instruments)",
+          "detect": "indistinguishable"
+        },
+        {
+          "code": "VIII.E",
+          "name": "Recovery from Unusual Flight Attitudes (Instruments)",
+          "detect": "partial",
+          "track_rule": "Sudden large altitude excursion (> 500 ft) + heading deviation > 30° with recovery within 30 s."
+        }
+      ]
+    },
+    {
+      "code": "IX",
+      "name": "Emergency Operations",
+      "tasks": [
+        {
+          "code": "IX.A",
+          "name": "Emergency Descent",
+          "detect": "full",
+          "phaseml_signals": ["emergency_descent"],
+          "performance_standard": {
+            "configuration": "manufacturer published or VNE",
+            "bank": "30°–45° initial",
+            "airspeed": "specified by AFM",
+            "altitude_loss": "≥ 1000 ft if practicing to recovery"
+          }
+        },
+        {
+          "code": "IX.B",
+          "name": "Emergency Approach and Landing (Simulated)",
+          "detect": "partial",
+          "track_rule": "Power-off shallow circling descent toward a field, terminating at low AGL before climb-out (don't actually land).",
+          "notes": "From track alone, looks like a high tortuosity descent toward an off-airport landmark."
+        }
+      ]
+    },
+    {
+      "code": "X",
+      "name": "Multiengine Operations",
+      "note": "Not applicable to single-engine Private Pilot.",
+      "tasks": []
+    },
+    {
+      "code": "XI",
+      "name": "Night Operations",
+      "tasks": [
+        {
+          "code": "XI.A",
+          "name": "Night Operations",
+          "detect": "full",
+          "track_rule": "Any flight whose takeoff or landing time is between 1 hr after sunset and 1 hr before sunrise at the airport's lat/lon.",
+          "notes": "ACS task XI is not flight-tested in PP ACS — it's knowledge — but the same time-of-day criterion is used for FAR 61.57(b) currency."
+        }
+      ]
+    },
+    {
+      "code": "XII",
+      "name": "Postflight Procedures",
+      "tasks": [
+        {
+          "code": "XII.A",
+          "name": "After Landing, Parking, and Securing",
+          "detect": "ground_state",
+          "phaseml_signals": ["on_ground", "taxiing"]
+        }
+      ]
+    }
+  ]
+}
