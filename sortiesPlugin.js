@@ -36,12 +36,19 @@ import { impactSegments } from './src/popGrid.js'
 import { distFt, isEnginelessType } from './src/geo.js'
 
 const SORTIE_GROUND_MS = 5 * 60_000
-// Gliders turn around faster than powered aircraft: unhitch, pull
-// back to launch position, hook the next tow. 2-3 min is normal at
-// busy glider ops (KBDU on a thermal day). With the powered 5-min
-// threshold, two adjacent glider sorties get merged into one bogus
-// "double tow." Operator brief 2026-06-02.
-const SORTIE_GROUND_MS_GLIDER = 2 * 60_000
+// Gliders AND tow planes turn around faster than typical powered
+// aircraft: unhitch, pull back to launch position, hook the next
+// tow. 2-3 min is normal at busy glider ops (KBDU on a thermal day).
+// With the 5-min powered threshold, two adjacent tow sorties (or
+// glider sorties) get merged into one bogus "double tow." Operator
+// brief 2026-06-02.
+const SORTIE_GROUND_MS_SHORT_TURN = 2 * 60_000
+// Tow-plane type codes — Pawnee / Super Cub / Pilatus Porter / PC-6.
+// Same set the server's `purposeOf` regex uses for `tow_plane`.
+const TOW_PLANE_TYPE_RE = /^(PA25|PA18|PIAT|PC6)$/
+function isTowPlaneType(type) {
+  return TOW_PLANE_TYPE_RE.test(String(type || '').toUpperCase())
+}
 const SORTIE_GROUND_AGL_FT = 200
 const SORTIE_AIRPORT_NEAR_NM = 4
 const SORTIE_MAX_POP_WINDOW_MS = 30_000
@@ -380,12 +387,15 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             if (sortieTailFilter && sortieTail !== sortieTailFilter) continue
             const sortieAllPts = (sortieTrack.points || []).slice().sort((a, b) => (a[3] || 0) - (b[3] || 0))
             if (sortieAllPts.length < 3) continue
-            // Gliders turn around faster — use a 2 min threshold instead
-            // of the powered 5 min. Without this, two consecutive glider
-            // tows (unhitch, line-up, hook the next tow) get merged into
-            // one bogus "double tow."
+            // Gliders AND tow planes turn around faster than typical
+            // powered aircraft — both get the 2 min threshold. Without
+            // it, two consecutive glider sorties (or two consecutive
+            // tow climbs by the same tug) merge into a bogus "double
+            // tow."
             const sortieIsGlider = isEnginelessType(sortieTrack.type || '')
-            const sortieGroundMsForType = sortieIsGlider ? SORTIE_GROUND_MS_GLIDER : SORTIE_GROUND_MS
+            const sortieIsTowPlane = isTowPlaneType(sortieTrack.type || '')
+            const sortieShortTurn = sortieIsGlider || sortieIsTowPlane
+            const sortieGroundMsForType = sortieShortTurn ? SORTIE_GROUND_MS_SHORT_TURN : SORTIE_GROUND_MS
             const sortieList = detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMsForType)
             for (const s of sortieList) {
               const sortieStartPt = sortieAllPts[s.s]
@@ -449,6 +459,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_tail: sortieTail,
                 sortie_type: sortieTrack.type || null,
                 sortie_is_glider: sortieIsGlider,
+                sortie_is_tow_plane: sortieIsTowPlane,
                 sortie_ground_threshold_min: sortieGroundMsForType / 60_000,
                 sortie_operator: sortieOperator,
                 sortie_operator_name: sortieOperatorName,
