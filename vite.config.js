@@ -12,6 +12,7 @@ import {
 } from './scenarioSubstitutes.js'
 import { NOISE_ZONES } from './src/noiseZones.js'
 import { classifyOneTrack, phaseMLApiPlugin } from './phaseML/index.js'
+import { sortiesApiPlugin } from './sortiesPlugin.js'
 // purposeML is an optional sibling library. When present, the shape
 // branch of resolvePurposeWithShape fires; when absent, the branch is
 // skipped and the resolver falls through to the type-based fallback
@@ -9121,6 +9122,7 @@ export default defineConfig({
     noiseReportsApiPlugin(),
     pilotApiPlugin(),
     flightsApiPlugin(),
+    sortiesApiPlugin({ db, ENRICH_AP, POPGRID }), // GET /api/sorties
     !db.useDb && liveCapturePlugin(),
     livePositionsPlugin(),
     adsbApiPlugin(),
