@@ -33,9 +33,15 @@
 
 import fs from 'fs'
 import { impactSegments } from './src/popGrid.js'
-import { distFt } from './src/geo.js'
+import { distFt, isEnginelessType } from './src/geo.js'
 
 const SORTIE_GROUND_MS = 5 * 60_000
+// Gliders turn around faster than powered aircraft: unhitch, pull
+// back to launch position, hook the next tow. 2-3 min is normal at
+// busy glider ops (KBDU on a thermal day). With the powered 5-min
+// threshold, two adjacent glider sorties get merged into one bogus
+// "double tow." Operator brief 2026-06-02.
+const SORTIE_GROUND_MS_GLIDER = 2 * 60_000
 const SORTIE_GROUND_AGL_FT = 200
 const SORTIE_AIRPORT_NEAR_NM = 4
 const SORTIE_MAX_POP_WINDOW_MS = 30_000
@@ -98,7 +104,7 @@ function slugifySchool(name) {
 }
 
 // ── Sortie detection ──────────────────────────────────────────────
-function detectSortiesInTrack(sortieAllPts, sortieGroundCeil) {
+function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = SORTIE_GROUND_MS) {
   const sortieList = []
   if (!Array.isArray(sortieAllPts) || sortieAllPts.length < 2) return sortieList
   const sortieSessions = []
@@ -125,7 +131,7 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil) {
   for (let i = 1; i < sortieSessions.length; i++) {
     const next = sortieSessions[i]
     const sortieGroundGapMs = (sortieAllPts[next.s][3] || 0) - (sortieAllPts[sortieCur.e][3] || 0)
-    if (sortieGroundGapMs < SORTIE_GROUND_MS) {
+    if (sortieGroundGapMs < sortieGroundMs) {
       sortieCur.e = next.e
       sortieCur.cycles += 1
       if (next.open) sortieCur.open = true
@@ -374,7 +380,13 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             if (sortieTailFilter && sortieTail !== sortieTailFilter) continue
             const sortieAllPts = (sortieTrack.points || []).slice().sort((a, b) => (a[3] || 0) - (b[3] || 0))
             if (sortieAllPts.length < 3) continue
-            const sortieList = detectSortiesInTrack(sortieAllPts, sortieGroundCeil)
+            // Gliders turn around faster — use a 2 min threshold instead
+            // of the powered 5 min. Without this, two consecutive glider
+            // tows (unhitch, line-up, hook the next tow) get merged into
+            // one bogus "double tow."
+            const sortieIsGlider = isEnginelessType(sortieTrack.type || '')
+            const sortieGroundMsForType = sortieIsGlider ? SORTIE_GROUND_MS_GLIDER : SORTIE_GROUND_MS
+            const sortieList = detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMsForType)
             for (const s of sortieList) {
               const sortieStartPt = sortieAllPts[s.s]
               const sortieEndPt = sortieAllPts[s.e]
@@ -436,6 +448,8 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_id: sortieId,
                 sortie_tail: sortieTail,
                 sortie_type: sortieTrack.type || null,
+                sortie_is_glider: sortieIsGlider,
+                sortie_ground_threshold_min: sortieGroundMsForType / 60_000,
                 sortie_operator: sortieOperator,
                 sortie_operator_name: sortieOperatorName,
                 sortie_base: sortieBase,
