@@ -35,6 +35,26 @@ import fs from 'fs'
 import { impactSegments } from './src/popGrid.js'
 import { distFt, isEnginelessType } from './src/geo.js'
 
+// ── purposeML — lazy loaded so a missing sibling library (which has
+// happened mid-deploy before) doesn't crash module init. First call
+// sticks the result. Returns null when the library isn't installed
+// and we fall through to the geometry classifier.
+let _purposeMLClassify = null
+let _purposeMLAttempted = false
+async function getPurposeMLClassify() {
+  if (_purposeMLAttempted) return _purposeMLClassify
+  _purposeMLAttempted = true
+  try {
+    const mod = await import('./purposeML/index.js')
+    if (mod && typeof mod.classifyOneTrack === 'function') {
+      _purposeMLClassify = mod.classifyOneTrack
+    }
+  } catch (err) {
+    console.warn('[sorties] purposeML unavailable, falling through to geometry classifier:', err && err.message)
+  }
+  return _purposeMLClassify
+}
+
 const SORTIE_GROUND_MS = 5 * 60_000
 // Gliders AND tow planes turn around faster than typical powered
 // aircraft: unhitch, pull back to launch position, hook the next
@@ -191,7 +211,7 @@ function bridgeSortiePath(rawPath, altOffset) {
   let bridged = 0, maxGap = 0, totalGap = 0
   const gaps = []
   // Helper to append a corrected real point
-  const pushReal = (p) => out.push([p[0], p[1], (p[2] != null) ? p[2] - altOffset : null, p[3], 'observed'])
+  const pushReal = (p) => out.push([p[0], p[1], (p[2] != null) ? p[2] - altOffset : null, p[3], 'real'])
   // Record an UNBRIDGED gap. `before_index` is the index of the next
   // observed point — i.e. the polyline should be broken just BEFORE
   // out.length.
@@ -261,7 +281,7 @@ function bridgeSortiePath(rawPath, altOffset) {
       let alt = null
       if (a[2] != null && b[2] != null) alt = (a[2] + (b[2] - a[2]) * t) - altOffset
       const ts = Math.round((a[3] || 0) + dtMs * t)
-      out.push([lat, lon, alt, ts, 'bridged'])
+      out.push([lat, lon, alt, ts, 'repaired'])
       bridged++
     }
     const gapSec = dtMs / 1000
@@ -283,10 +303,20 @@ function findSortieMaxPopSegment(sortiePath, popAt, sortieFieldElevFt) {
   if (!Array.isArray(sortiePath) || sortiePath.length < 3 || !popAt) return null
   let sortieBest = null
   for (let i = 0; i < sortiePath.length; i++) {
+    // EVALUATION RULE — the max-pop window must contain ONLY real
+    // points. Repaired (synthesized) points are rendering aids and
+    // are not safe to score. Window starts must be on a real point;
+    // we skip any window that contains a repaired point.
+    if (sortiePath[i][4] !== 'real') continue
     let j = i
     while (j < sortiePath.length && (sortiePath[j][3] - sortiePath[i][3]) < SORTIE_MAX_POP_WINDOW_MS) j++
     const sortieEndIdx = j - 1
     if (sortieEndIdx - i < 2) continue
+    let allReal = true
+    for (let k = i; k <= sortieEndIdx; k++) {
+      if (sortiePath[k][4] !== 'real') { allReal = false; break }
+    }
+    if (!allReal) continue
     const sortieWin = sortiePath.slice(i, sortieEndIdx + 1)
     let sortiePeakPop = 0, sortiePeakDba = 0
     for (const p of sortieWin) {
@@ -418,6 +448,9 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
 
           // Schools index for operator resolution.
           const schoolsIdx = loadSchoolsIndex()
+          // purposeML — lazy-loaded once per process. When unavailable,
+          // sortie_purpose falls through to the geometry classifier.
+          const purposeMLClassifyFn = await getPurposeMLClassify()
 
           // Pre-pass to collect tails so we can batch the base lookup.
           const tailsSeen = new Set()
@@ -493,13 +526,53 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
               const sortieDurationMin = Math.round((sortieEndPt[3] - sortieStartPt[3]) / 60_000 * 10) / 10
               const sortieId = `${sortieAirport.toLowerCase()}-${sortieTail.toLowerCase()}-${new Date(sortieStartPt[3]).toISOString().slice(0, 16).replace(/[-T:]/g, '')}`
 
-              const sortiePurpose = classifySortiePurpose({
-                cycles: s.cycles,
-                maxExcursionNm: maxExcNm,
-                landedAirport: sortieAirport,
-                baseAirport: sortieBase,
-                patternRadiusNm: sortiePatternRadius,
-              })
+              // EVALUATION RULE — purposeML must run on REAL points
+              // only (no repaired/synthesized fixes). Build the
+              // canonical purposeML shape from the real subset of the
+              // sortie path; fall through to the geometry classifier
+              // when purposeML is unavailable OR confidence < 0.7.
+              let sortiePurpose = null
+              let sortiePurposeSource = null
+              let sortiePurposeConfidence = null
+              let sortiePurposeReasons = null
+              if (purposeMLClassifyFn) {
+                const purposeRealPts = []
+                for (const p of sortiePath) {
+                  if (p[4] !== 'real') continue
+                  if (p[0] == null || p[1] == null || p[2] == null || p[3] == null) continue
+                  purposeRealPts.push({
+                    lat: p[0], lon: p[1], altMslFt: p[2],
+                    tsUnix: Math.floor(p[3] / 1000),
+                  })
+                }
+                if (purposeRealPts.length >= 30) {
+                  try {
+                    const v = purposeMLClassifyFn(purposeRealPts, {
+                      typeCode: sortieTrack.type || '',
+                      tail: sortieTail,
+                      isSchoolFleet: !!sortieOperator,
+                    })
+                    if (v && v.confidence >= 0.7) {
+                      sortiePurpose = v.purpose
+                      sortiePurposeSource = 'shape'
+                      sortiePurposeConfidence = v.confidence
+                      sortiePurposeReasons = v.reasons || []
+                    }
+                  } catch (err) {
+                    console.warn('[sorties] purposeML classify error for', sortieTail, err && err.message)
+                  }
+                }
+              }
+              if (!sortiePurpose) {
+                sortiePurpose = classifySortiePurpose({
+                  cycles: s.cycles,
+                  maxExcursionNm: maxExcNm,
+                  landedAirport: sortieAirport,
+                  baseAirport: sortieBase,
+                  patternRadiusNm: sortiePatternRadius,
+                })
+                sortiePurposeSource = 'geometry'
+              }
 
               const sortieRow = {
                 sortie_id: sortieId,
@@ -512,6 +585,9 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_operator_name: sortieOperatorName,
                 sortie_base: sortieBase,
                 sortie_purpose: sortiePurpose,
+                sortie_purpose_source: sortiePurposeSource,
+                sortie_purpose_confidence: sortiePurposeConfidence,
+                sortie_purpose_reasons: sortiePurposeReasons,
                 sortie_takeoff_ts: sortieTakeoffTs,
                 sortie_takeoff_day: sortieTakeoffTs.slice(0, 10),
                 sortie_landing_ts: sortieLandingTs,
@@ -572,9 +648,25 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             sortie_days: sortieDaysParam,
             sortie_school: sortieSchoolFilter,
             sortie_source: sortieSource,
+            sortie_purpose_classifier: purposeMLClassifyFn ? 'purposeML (real-points only, confidence ≥ 0.7) → geometry fallback' : 'geometry only (purposeML unavailable)',
             sortie_count: sortieResults.length,
-            sortie_invariant: 'sortie_max_pop_segment.sortie_max_pop_points === sortie_path.slice(sortie_max_pop_index_start, sortie_max_pop_index_end + 1).',
-            sortie_path_format: '[lat, lon, alt_msl_corrected_ft, ts_ms, quality] — quality ∈ {"observed", "bridged"}. sortie_path_gaps lists unbridged coverage breaks; do not draw a straight line through them.',
+            sortie_invariant: 'sortie_max_pop_segment.sortie_max_pop_points === sortie_path.slice(sortie_max_pop_index_start, sortie_max_pop_index_end + 1). Every point in the slice has quality="real".',
+            sortie_path_format: '[lat, lon, alt_msl_corrected_ft, ts_ms, quality] — quality ∈ {"real", "repaired"}. sortie_path_gaps lists "broken" coverage breaks; render those as hint lines, not solid path.',
+            sortie_evaluation_rules: {
+              // Load-bearing operator contract 2026-06-02: the path
+              // carries three categories of data with different
+              // rendering and evaluation rules. Clients MUST respect
+              // these — making them explicit on every payload so a
+              // new consumer can't accidentally evaluate against
+              // synthesized data.
+              real:     'quality="real" points — observed ADS-B fixes with alt amended by sortie_path_amendment.alt_offset_ft. SAFE for any metric / evaluation / classification.',
+              repaired: 'quality="repaired" points — synthesized to patch a coverage gap < 5 min where motion is consistent. SAFE to render as solid path; NOT safe for any evaluation (max_pop / purposeML / pop_impact / dBA peak / etc.).',
+              broken:   'sortie_path_gaps[] — coverage gaps the bridger refused (> 5 min, no node speed, implausible neighbor speed, or speed mismatch). DO NOT render as a solid line; use a hint line / dashed style between the bracketing real fixes. NEVER use these to compute anything.',
+              guarantees: {
+                sortie_max_pop_segment: 'computed from real-only windows (no repaired point ever lands inside the window); literal-slice invariant preserved',
+                sortie_purpose:         'computed from real-only points when sortie_purpose_source="shape"; geometry classifier falls through when no shape verdict ≥ 0.7 confidence',
+              },
+            },
             sorties: sortieResults,
           }))
         } catch (err) {
