@@ -839,9 +839,24 @@ function findSortieMaxPopSegment(sortiePath, popAt, sortieFieldElevFt, opts = {}
   // sortie_path, 0..1 fractional throttle (null = unknown → weight 1).
   const pathThrottle = Array.isArray(opts.pathThrottle) ? opts.pathThrottle : null
   let sortieBest = null
+  // Skip the takeoff and landing windows when picking the peak-impact
+  // segment. ADS-B coverage near the runway is sparse: first/last
+  // captured fixes are often 1+ nm out at low/implausible AGL because
+  // the rotation and touchdown weren't captured. Picking those as
+  // "peak impact" produces nonsense like 75 ft AGL at 1 nm (the data
+  // claims so, but the data is bad there). The real noise impact —
+  // the part the operator cares about — is during the pattern /
+  // cruise / climb-out at altitude.
+  const SORTIE_PEAK_SKIP_TAKEOFF_MS = 90_000
+  const SORTIE_PEAK_SKIP_LANDING_MS = 90_000
+  const sortieTakeoffTs = sortiePath[0][3]
+  const sortieLandingTs = sortiePath[sortiePath.length - 1][3]
   for (let i = 0; i < sortiePath.length; i++) {
     // Window starts must be on a real point.
     if (sortiePath[i][4] !== 'real') continue
+    const ts = sortiePath[i][3]
+    if (ts - sortieTakeoffTs < SORTIE_PEAK_SKIP_TAKEOFF_MS) continue
+    if (sortieLandingTs - ts < SORTIE_PEAK_SKIP_LANDING_MS) continue
     let j = i
     while (j < sortiePath.length && (sortiePath[j][3] - sortiePath[i][3]) < SORTIE_MAX_POP_WINDOW_MS) j++
     const sortieEndIdx = j - 1
@@ -937,7 +952,15 @@ function findSortieMaxPopSegment(sortiePath, popAt, sortieFieldElevFt, opts = {}
 // ── Purpose classifier from geometry (S-3) ───────────────────────
 function classifySortiePurpose({ cycles, maxExcursionNm, landedAirport, baseAirport, patternRadiusNm = 2 }) {
   if (cycles >= 2 && maxExcursionNm < patternRadiusNm + 1) return 'pattern'
-  if (cycles === 1 && maxExcursionNm < SORTIE_PURPOSE_XC_NM && landedAirport && landedAirport === baseAirport) return 'local'
+  // FAR 61.1(b): cross-country requires landing at an airport other than
+  // the point of departure (and >50 nm straight-line for some ratings).
+  // Same dep/arr airport = local (short) or practice_area (long excursion);
+  // operator directive 2026-06-03: a flight that departs KBJC and lands at
+  // KBJC is NOT cross-country regardless of how far the practice area was.
+  if (landedAirport && baseAirport && landedAirport === baseAirport) {
+    if (maxExcursionNm >= SORTIE_PURPOSE_XC_NM) return 'practice_area'
+    return 'local'
+  }
   if (maxExcursionNm >= SORTIE_PURPOSE_XC_NM) return 'cross_country'
   if (landedAirport && baseAirport && landedAirport !== baseAirport) return 'cross_country'
   if (landedAirport && !baseAirport) return 'transient'
