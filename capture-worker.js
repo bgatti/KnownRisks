@@ -8,17 +8,18 @@ import pg from 'pg'
 import { classifyPoint, distFt } from './src/geo.js'
 import { NOISE_ZONES } from './src/noiseZones.js'
 
-// Ask #19 — was [KBDU, 15 nm]. Every track was getting truncated
-// before it reached live_tracks, so /api/sorties at KBJC showed
-// flight paths clipped where they crossed 15 nm of KBDU. Aligned
-// with the dev liveCapturePlugin in vite.config.js: geographic
-// centroid of the 6 Front Range fields + 36 nm radius covers
-// KBDU + KBJC + KLMO + KEIK + KAPA + KGXY with headroom for the
-// practice areas east of DIA.
+// Ask #19 — was [KBDU, 15 nm], which clipped every track that
+// crossed beyond 15 nm of KBDU before it reached live_tracks. Now
+// centred on the geographic centroid of the 6 Front Range fields
+// with a 25 nm radius — operator pizza-math 2026-06-03: 25 nm
+// reaches all 6 fields (KBDU + KBJC + KLMO + KEIK + KAPA + KGXY)
+// with modest headroom for nearby practice areas, while cutting
+// ADS-B fetch volume vs. the 36 nm trial. Trim again if cost data
+// suggests further reduction.
 const CENTER = [40.0211, -105.0063]
-const RADIUS_NM = 36
+const RADIUS_NM = 25
 const POLL_MS = 5_000
-const ALT_MAX_FT = 10_000
+const ALT_MAX_FT = 11_000
 const SEVERITY = { yellow: 1, orange: 2, red: 3, purple: 4 }
 
 // Build bands + stats from a track's points
@@ -60,8 +61,8 @@ function classifyTrackLive(points) {
 }
 
 const FEEDS = [
-  (lat, lon, nm) => `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${nm}`,
-  (lat, lon, nm) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${nm}`,
+  { name: 'airplanes.live', url: (lat, lon, nm) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${nm}` },
+  { name: 'adsb.lol',       url: (lat, lon, nm) => `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${nm}` },
 ]
 
 const todayUTC = () => new Date().toISOString().slice(0, 10)
@@ -170,21 +171,43 @@ async function poll() {
   try {
     await rotateIfNeeded()
 
-    let d = null
-    for (const make of FEEDS) {
-      try {
-        const r = await fetch(make(CENTER[0], CENTER[1], RADIUS_NM))
-        if (!r.ok) continue
-        const j = await r.json()
-        if (j && Array.isArray(j.ac)) { d = j; break }
-      } catch {}
+    // Fetch all feeds in parallel; union aircraft by hex, preferring the entry
+    // with the freshest position (lowest seen_pos). The existing point-dedup
+    // (last lat/lon) keeps the merged track from double-counting.
+    const settled = await Promise.allSettled(
+      FEEDS.map((f) => fetch(f.url(CENTER[0], CENTER[1], RADIUS_NM))
+        .then((r) => (r.ok ? r.json() : null)))
+    )
+    const byHexThisPoll = new Map()
+    let feedsOK = 0
+    for (let i = 0; i < settled.length; i++) {
+      const s = settled[i]
+      if (s.status !== 'fulfilled' || !s.value || !Array.isArray(s.value.ac)) {
+        const err = s.status === 'rejected' ? (s.reason?.message || s.reason) : 'no ac array'
+        console.warn(`[capture-worker] ${FEEDS[i].name} skipped: ${err}`)
+        continue
+      }
+      feedsOK++
+      for (const ac of s.value.ac) {
+        if (!ac.hex) continue
+        const prev = byHexThisPoll.get(ac.hex)
+        const newSeen = typeof ac.seen_pos === 'number' ? ac.seen_pos : Infinity
+        const prevSeen = prev && typeof prev.seen_pos === 'number' ? prev.seen_pos : Infinity
+        if (!prev || newSeen < prevSeen) byHexThisPoll.set(ac.hex, ac)
+      }
     }
-    if (!d) return
+    if (!feedsOK) return
 
-    for (const ac of d.ac) {
+    for (const ac of byHexThisPoll.values()) {
       if (ac.lat == null || ac.lon == null) continue
-      const alt = typeof ac.alt_baro === 'number' ? ac.alt_baro : null
-      if (alt == null || alt <= 0 || alt >= ALT_MAX_FT) continue
+      // Coerce "ground" → 0 MSL so taxi / ramp points enter the pipeline;
+      // downstream phase detection treats anything below the field's ground
+      // ceiling (field_elev + 150) as on-ground regardless.
+      let alt
+      if (typeof ac.alt_baro === 'number') alt = ac.alt_baro
+      else if (ac.alt_baro === 'ground') alt = 0
+      else continue
+      if (alt < 0 || alt >= ALT_MAX_FT) continue
       const hex = ac.hex
       if (!hex) continue
       const reg = ((ac.r || '') + '').trim()

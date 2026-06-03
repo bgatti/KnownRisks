@@ -1874,31 +1874,20 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                 // index of the first observed point AFTER the gap;
                 // break the polyline immediately before it.
                 sortie_path_gaps: bridged.gaps,
-                sortie_max_pop_segment: null,
               }
 
+              // Ask #17 — sortie_max_pop_segment row field RETIRED.
+              // Replaced by sortie_noise_segments[type="pop"] (built
+              // below in buildSortieNoiseSegments). The wire is now
+              // single-shape; kiosks dispatching on noise.type get
+              // the pop entry the same way they get report / vnap.
               const sortieMaxPop = findSortieMaxPopSegment(sortiePath, POPGRID?.popAt, sortieFieldElev)
-              // Ask #15c revised — derive sortie_pop_grade from the
-              // segment's score (operator directive). The score lives
-              // on findSortieMaxPopSegment's return shape and matches
-              // what sortie_max_pop_segment / sortie_noise_segments
-              // emit on the wire, so the chip and the polyline agree.
+              // Ask #15c (revised) — derive sortie_pop_grade from
+              // the segment's score (operator directive). The chip
+              // and the polyline read the same number, sourced from
+              // sortie_noise_segments[type="pop"].noise.properties.score.
               if (sortieMaxPop) {
                 sortieRow.sortie_pop_grade = gradeForSegmentScore(sortieMaxPop.score)
-              }
-              if (sortieMaxPop) {
-                const sortieMaxPopPoints = sortiePath.slice(sortieMaxPop.startIdx, sortieMaxPop.endIdx + 1)
-                sortieRow.sortie_max_pop_segment = {
-                  sortie_max_pop_index_start: sortieMaxPop.startIdx,
-                  sortie_max_pop_index_end: sortieMaxPop.endIdx,
-                  sortie_max_pop_score: sortieMaxPop.score,
-                  sortie_max_pop_dba_peak: sortieMaxPop.dba_peak,
-                  sortie_max_pop_density_peak: sortieMaxPop.density_peak,
-                  sortie_max_pop_length_nm: sortieMaxPop.length_nm,
-                  sortie_max_pop_start_ts: new Date(sortieMaxPopPoints[0][3]).toISOString(),
-                  sortie_max_pop_end_ts: new Date(sortieMaxPopPoints[sortieMaxPopPoints.length - 1][3]).toISOString(),
-                  sortie_max_pop_points: sortieMaxPopPoints,
-                }
               }
 
               // Unified sortie_noise_segments[] — operator brief 2026-06-03:
@@ -2155,14 +2144,14 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
             // Ask #15c — pop_grade rule echoed so client fallbacks
             // agree on the score → letter mapping.
             sortie_pop_grade_rule: SORTIE_POP_GRADE_RULE,
-            sortie_pop_grade_input: 'sortie_max_pop_segment.sortie_max_pop_score (segment-derived, same value sortie_noise_segments[type="pop"].noise.properties.score carries)',
+            sortie_pop_grade_input: 'sortie_noise_segments[type="pop"].noise.properties.score',
             // Ask #15e — observability for the filter currently in effect.
             sortie_ack_filter: ackFilter,
             sortie_ack_count_total: sortieResults.length,
             sortie_ack_count_acked: sortieResults.filter(r => r.sortie_acknowledged).length,
             sortie_ack_count_open: sortieResults.filter(r => !r.sortie_acknowledged).length,
             sortie_count: filteredSortieResults.length,
-            sortie_invariant: 'sortie_max_pop_segment.sortie_max_pop_points === sortie_path.slice(sortie_max_pop_index_start, sortie_max_pop_index_end + 1). Every point in the slice has quality="real".',
+            sortie_invariant: 'sortie_noise_segments[i].points === sortie_path.slice(point_index_start, point_index_end + 1) for every entry. Every point in a noise.type="pop" slice has quality="real" (pop is computed from real-only windows). Reports and vnap entries may include repaired points; their indices still walk through sortie_path[].',
             sortie_path_format: '[lat, lon, alt_msl_corrected_ft, ts_ms, quality] — quality ∈ {"real", "repaired"}. sortie_path_gaps lists "broken" coverage breaks; render those as hint lines, not solid path. sortie_path_throttle[i] is a parallel array of 0..1 throttle estimates aligned with sortie_path[i]; null entries mean either repaired/engineless or no prior real fix within 60 s.',
             sortie_throttle_model: 'climb_fraction + level_flight_fraction. climb_fraction = max(0, vs_fpm / vs_max_fpm); level_flight_fraction = (gs_kts / cruise_kts)^3 × cruise_throttle. Table-anchored (aircraftPerf.js) with sea-level vs_max + cruise derated ~3 %/1000 ft for non-turbocharged engines. Indicator-grade — wind, density altitude (without OAT), and turbo critical alts not modelled. See sortie_performance.throttle_at_takeoff as the per-sortie sanity check: ~1.0 means the table matches the airframe; << 0.9 means vs_max is over-reported in the table.',
             sortie_evaluation_rules: {
@@ -2176,7 +2165,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
               repaired: 'quality="repaired" points — synthesized to patch a coverage gap < 5 min where motion is consistent. SAFE to render as solid path; NOT safe for any evaluation (max_pop / purposeML / pop_impact / dBA peak / etc.).',
               broken:   'sortie_path_gaps[] — coverage gaps the bridger refused (> 5 min, no node speed, implausible neighbor speed, or speed mismatch). DO NOT render as a solid line; use a hint line / dashed style between the bracketing real fixes. NEVER use these to compute anything.',
               guarantees: {
-                sortie_max_pop_segment: 'computed from real-only windows (no repaired point ever lands inside the window); literal-slice invariant preserved',
+                sortie_noise_segments_pop: 'computed from real-only windows (no repaired point ever lands inside a type="pop" window); literal-slice invariant preserved. sortie_max_pop_segment row field RETIRED 2026-06-03 (Ask #17) — same data lives in sortie_noise_segments[type="pop"].',
                 sortie_purpose:         'computed from real-only points when sortie_purpose_source="shape"; geometry classifier falls through when no shape verdict ≥ 0.7 confidence',
                 sortie_path_throttle:   'non-null entries only at indices where sortie_path[i].quality === "real" AND a prior real fix exists within 60 s. Repaired/synthesized points always carry null. Engineless types (gliders, balloons) return all-null arrays and sortie_performance.perf_source="engineless".',
                 sortie_path_pop_impact: 'people/km² × (REF_AGL / AGL)² evaluated at each fix (popGrid.js pointImpact kernel — same one impactSegments and findSortieMaxPopSegment use). Non-null only at indices where sortie_path[i].quality === "real". Repaired points carry null per the evaluation rule. Scale is consistent across sorties so clients can autoscale by percentile. When POPGRID is unavailable on the server, the array is all-null.',
