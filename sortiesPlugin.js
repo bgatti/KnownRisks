@@ -57,6 +57,25 @@ async function getPurposeMLClassify() {
   return _purposeMLClassify
 }
 
+// ── acsML — same lazy-load pattern. Identifies ACS tasks demonstrated
+// + emits FAR 61.57 currency events from the real-only points. Falls
+// through to null (no sortie_acs field) when unavailable.
+let _acsMLIdentify = null
+let _acsMLAttempted = false
+async function getAcsMLIdentify() {
+  if (_acsMLAttempted) return _acsMLIdentify
+  _acsMLAttempted = true
+  try {
+    const mod = await import('./acsML/index.js')
+    if (mod && typeof mod.identifyOneTrack === 'function') {
+      _acsMLIdentify = mod.identifyOneTrack
+    }
+  } catch (err) {
+    console.warn('[sorties] acsML unavailable, sortie_acs will be null:', err && err.message)
+  }
+  return _acsMLIdentify
+}
+
 const SORTIE_GROUND_MS = 5 * 60_000
 // Gliders AND tow planes turn around faster than typical powered
 // aircraft: unhitch, pull back to launch position, hook the next
@@ -453,6 +472,9 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
           // purposeML — lazy-loaded once per process. When unavailable,
           // sortie_purpose falls through to the geometry classifier.
           const purposeMLClassifyFn = await getPurposeMLClassify()
+          // acsML — lazy-loaded once per process. Identifies ACS tasks
+          // demonstrated + 61.57 currency events from REAL-ONLY points.
+          const acsMLIdentifyFn = await getAcsMLIdentify()
 
           // Pre-pass to collect tails so we can batch the base lookup.
           const tailsSeen = new Set()
@@ -618,6 +640,44 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortiePurposeSource = 'geometry'
               }
 
+              // ── acsML — identify ACS tasks demonstrated + emit
+              // 61.57 currency events from REAL-only points. Same
+              // points array used for purposeML (we'd already
+              // filtered to quality==='real' above; reuse it).
+              let sortieAcs = null
+              if (acsMLIdentifyFn) {
+                // Rebuild the real-points array in case the purposeML
+                // block was skipped (fn null path).
+                const acsRealPts = []
+                for (const p of sortiePath) {
+                  if (p[4] !== 'real') continue
+                  if (p[0] == null || p[1] == null || p[2] == null || p[3] == null) continue
+                  acsRealPts.push({
+                    lat: p[0], lon: p[1], altMslFt: p[2],
+                    tsUnix: Math.floor(p[3] / 1000),
+                  })
+                }
+                if (acsRealPts.length >= 30) {
+                  try {
+                    const a = acsMLIdentifyFn(acsRealPts, {
+                      typeCode: sortieTrack.type || '',
+                      tail: sortieTail,
+                    })
+                    if (a) {
+                      sortieAcs = {
+                        tasks_demonstrated: a.tasks_demonstrated || [],
+                        scores: a.scores || [],
+                        currency_events: a.currency_events || [],
+                        phase_summary: a.phase_summary || {},
+                        notes: a.notes || [],
+                      }
+                    }
+                  } catch (err) {
+                    console.warn('[sorties] acsML identify error for', sortieTail, err && err.message)
+                  }
+                }
+              }
+
               const sortieRow = {
                 sortie_id: sortieId,
                 sortie_tail: sortieTail,
@@ -645,6 +705,11 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_path_point_count: sortiePath.length,
                 sortie_path: sortiePath,
                 sortie_path_throttle: sortiePathThrottle,
+                // Per ACS Areas of Operation (Private Pilot ACS) +
+                // FAR 61.57 currency. Computed from REAL-only points.
+                // Null when acsML is unavailable or the sortie has <
+                // 30 real points. See acsML/README.md.
+                sortie_acs: sortieAcs,
                 sortie_performance: sortiePerf && sortiePerf.vs_max_fpm > 0 ? {
                   perf_source: sortiePerf.source,
                   vy_kts: sortiePerf.vy_kts,
@@ -704,6 +769,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             sortie_school: sortieSchoolFilter,
             sortie_source: sortieSource,
             sortie_purpose_classifier: purposeMLClassifyFn ? 'purposeML (real-points only, confidence ≥ 0.7) → geometry fallback' : 'geometry only (purposeML unavailable)',
+            sortie_acs_classifier: acsMLIdentifyFn ? 'acsML (real-points only, ≥ 30 pts) — Private Pilot ACS Areas of Operation + FAR 61.57 currency. See acsML/README.md and kickoff_sorties_test.md.' : 'unavailable',
             sortie_count: sortieResults.length,
             sortie_invariant: 'sortie_max_pop_segment.sortie_max_pop_points === sortie_path.slice(sortie_max_pop_index_start, sortie_max_pop_index_end + 1). Every point in the slice has quality="real".',
             sortie_path_format: '[lat, lon, alt_msl_corrected_ft, ts_ms, quality] — quality ∈ {"real", "repaired"}. sortie_path_gaps lists "broken" coverage breaks; render those as hint lines, not solid path. sortie_path_throttle[i] is a parallel array of 0..1 throttle estimates aligned with sortie_path[i]; null entries mean either repaired/engineless or no prior real fix within 60 s.',
@@ -722,6 +788,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_max_pop_segment: 'computed from real-only windows (no repaired point ever lands inside the window); literal-slice invariant preserved',
                 sortie_purpose:         'computed from real-only points when sortie_purpose_source="shape"; geometry classifier falls through when no shape verdict ≥ 0.7 confidence',
                 sortie_path_throttle:   'non-null entries only at indices where sortie_path[i].quality === "real" AND a prior real fix exists within 60 s. Repaired/synthesized points always carry null. Engineless types (gliders, balloons) return all-null arrays and sortie_performance.perf_source="engineless".',
+                sortie_acs:             'computed from REAL-only points (purposeML uses the same filter). Null when acsML lib missing OR the sortie has < 30 real points after the quality filter. tasks_demonstrated lists every ACS code that fired; currency_events lists per-takeoff/per-landing 61.57(a)/(b) events tagged day vs night by airport lat/lon. scores covers V.A/V.B/V.C/V.D performance-standard verdicts. Mean throttle from sortie_path_throttle drives the VII.B/VII.C/IX.A/IX.B selectors — see kickoff_sorties_test.md round-4 notes.',
               },
             },
             sorties: sortieResults,
