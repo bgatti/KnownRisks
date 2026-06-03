@@ -936,9 +936,156 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
     return out
   }
 
+  // Module-scope cache for /api/sorties/busiest-days. The
+  // computation walks every retention day so we cache aggressively
+  // — 1 h is the right granularity for a dropdown picker, and the
+  // operator can always cache-bust with ?v=…
+  const BUSIEST_CACHE_TTL_MS = 60 * 60_000
+  const _busiestCache = new Map()  // key → { ts, payload }
+
   return {
     name: 'sorties-api',
     configureServer(server) {
+      // ── /api/sorties/busiest-days — Ask S-15 ─────────────────
+      // Smallest defensible scope per S-15a + S-15e: airport + per_year
+      // (or fall-back limit) → { day, year, sortie_count } per row.
+      // Scoped to live_tracks retention window today; deep history
+      // (months+) needs Ask S-11 (sorties Postgres table backfill).
+      // window_note is surfaced in the response so callers can
+      // see exactly what was covered.
+      server.middlewares.use('/api/sorties/busiest-days', async (req, res, next) => {
+        if (req.method !== 'GET') return next()
+        res.setHeader('Content-Type', 'application/json')
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('Cache-Control', 'public, max-age=600')
+        try {
+          const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
+          const airport = (u.searchParams.get('airport') || 'KBDU').trim().toUpperCase()
+          const perYearParam = u.searchParams.get('per_year')
+          const limitParam = u.searchParams.get('limit')
+          const perYear = perYearParam ? Math.max(1, Math.min(10, Number(perYearParam))) : null
+          const limit = limitParam ? Math.max(1, Math.min(100, Number(limitParam))) : null
+          // If neither supplied, default to per_year=2 per S-15e.
+          const effectivePerYear = perYear == null && limit == null ? 2 : perYear
+
+          const ap = ENRICH_AP.find(a => a.code === airport)
+          if (!ap) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: `unknown airport ${airport}` }))
+          }
+          const groundCeil = ap.elev + SORTIE_GROUND_AGL_FT
+
+          const cacheKey = `${airport}|${effectivePerYear || ''}|${limit || ''}`
+          const cached = _busiestCache.get(cacheKey)
+          if (cached && Date.now() - cached.ts < BUSIEST_CACHE_TTL_MS) {
+            return res.end(JSON.stringify(cached.payload))
+          }
+
+          // Discover retention horizon.
+          let horizon = null
+          if (db && db.useDb && typeof db.getLiveDataHorizon === 'function') {
+            try {
+              const HZN_TIMEOUT = 1500
+              horizon = await Promise.race([
+                db.getLiveDataHorizon(),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('horizon_timeout')), HZN_TIMEOUT)),
+              ])
+            } catch (err) {
+              console.warn('[sorties/busiest-days] horizon lookup degraded:', err && err.message)
+              horizon = null
+            }
+          }
+          if (!horizon || !horizon.oldest_day || !horizon.newest_day) {
+            return res.end(JSON.stringify({
+              airport,
+              per_year: effectivePerYear,
+              limit,
+              window: null,
+              window_note: 'live_tracks horizon unavailable; data needs sorties table (Ask S-11) for deep history.',
+              days: [],
+              source: 'live_tracks (horizon unavailable)',
+            }))
+          }
+          const dayList = []
+          {
+            const start = new Date(horizon.oldest_day + 'T00:00:00Z')
+            const end = new Date(horizon.newest_day + 'T00:00:00Z')
+            for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+              dayList.push(d.toISOString().slice(0, 10))
+            }
+          }
+
+          // Sortie count per day at this airport. Use the production
+          // detector so the counts match /api/sorties exactly (no
+          // separate heuristic that could drift).
+          const PER_DAY_TIMEOUT = 4000
+          const days = []
+          for (const day of dayList) {
+            try {
+              const range = await Promise.race([
+                db.loadLiveFromDbByDateRange(day, day),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('day_load_timeout')), PER_DAY_TIMEOUT)),
+              ])
+              let count = 0
+              for (const t of (range.tracks || [])) {
+                const tail = (t.call || '').trim().toUpperCase()
+                if (!tail || tail.startsWith('~')) continue
+                const pts = (t.points || []).slice().sort((a, b) => (a[3] || 0) - (b[3] || 0))
+                if (pts.length < 3) continue
+                const sortieIsGlider = isEnginelessType(t.type || '')
+                const sortieIsTowPlane = isTowPlaneType(t.type || '')
+                const baseGroundMs = sortieIsTowPlane ? SORTIE_GROUND_MS_TOW_PLANE
+                  : sortieIsGlider ? SORTIE_GROUND_MS_SHORT_TURN
+                  : SORTIE_GROUND_MS
+                const sList = detectSortiesInTrack(pts, groundCeil, baseGroundMs, [])
+                for (const s of sList) {
+                  const endP = pts[s.e]
+                  if (!endP) continue
+                  const distNm = distNmAp(endP[0], endP[1], ap.lat, ap.lon)
+                  if (distNm <= SORTIE_AIRPORT_NEAR_NM) count++
+                }
+              }
+              if (count > 0) days.push({ day, year: Number(day.slice(0, 4)), sortie_count: count })
+            } catch (err) {
+              // Skip days that fail — don't poison the whole response.
+              console.warn('[sorties/busiest-days] day skipped:', day, err && err.message)
+            }
+          }
+
+          // Group + rank.
+          let outDays = []
+          if (effectivePerYear != null) {
+            const byYear = new Map()
+            for (const r of days) {
+              if (!byYear.has(r.year)) byYear.set(r.year, [])
+              byYear.get(r.year).push(r)
+            }
+            for (const [year, list] of [...byYear.entries()].sort((a, b) => b[0] - a[0])) {
+              list.sort((a, b) => b.sortie_count - a.sortie_count)
+              outDays.push(...list.slice(0, effectivePerYear))
+            }
+          } else {
+            outDays = days.slice().sort((a, b) => b.sortie_count - a.sortie_count).slice(0, limit)
+          }
+
+          const payload = {
+            airport,
+            per_year: effectivePerYear,
+            limit,
+            window: { oldest_day: horizon.oldest_day, newest_day: horizon.newest_day },
+            window_note: 'Days scanned cover the live_tracks retention window only (typically the last ~14 days). Deep history needs the sorties Postgres table — see Ask S-11.',
+            source: 'live_tracks',
+            days: outDays,
+          }
+          _busiestCache.set(cacheKey, { ts: Date.now(), payload })
+          res.end(JSON.stringify(payload))
+        } catch (err) {
+          console.error('[sorties/busiest-days] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+
       server.middlewares.use('/api/sorties', async (req, res, next) => {
         if (req.method !== 'GET') return next()
         res.setHeader('Content-Type', 'application/json')
