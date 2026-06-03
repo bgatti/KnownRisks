@@ -33,7 +33,9 @@
 
 import fs from 'fs'
 import { impactSegments, pointImpact } from './src/popGrid.js'
-import { distFt, isEnginelessType } from './src/geo.js'
+import { distFt, isEnginelessType, pointInPolygon } from './src/geo.js'
+import { NOISE_ZONES } from './src/noiseZones.js'
+import { matchVoices } from './flightScore.js'
 import { perfForType } from './aircraftPerf.js'
 import { estimateThrottle } from './throttleEstimate.js'
 
@@ -701,6 +703,161 @@ function classifySortiePurpose({ cycles, maxExcursionNm, landedAirport, baseAirp
   return 'unknown'
 }
 
+// Complaints loader — cached so each sortie request doesn't re-read
+// the file. Mirrors loadComplaintsCached() in vite.config.js but
+// kept local so the sorties plugin doesn't depend on that surface.
+const COMPLAINT_CACHE_TTL_MS = 30_000
+let _complaintCache = { ts: 0, list: [] }
+async function loadComplaintsForSorties() {
+  const now = Date.now()
+  if (now - _complaintCache.ts < COMPLAINT_CACHE_TTL_MS) return _complaintCache.list
+  let list = []
+  try {
+    const fs2 = await import('fs/promises')
+    const path = await import('path')
+    const buf = await fs2.default.readFile(path.default.resolve('data/complaints.json'), 'utf8')
+    list = JSON.parse(buf).complaints || []
+  } catch { list = [] }
+  _complaintCache = { ts: now, list }
+  return list
+}
+
+// Build the unified sortie_noise_segments[] for one sortie. Each entry
+// shares the same outer shape — index range into sortie_path + ts
+// bookends + literal points slice (S-6 invariant) — and carries a
+// noise.type (pop | report | vnap) with type-specific properties.
+// Lets the test page render all three with a single halo path.
+function buildSortieNoiseSegments({ sortiePath, sortieMaxPop, sortieComplaints, sortieZones, sortieFieldElevFt, sortieTakeoffMs, sortieLandingMs }) {
+  const out = []
+  // ── pop: project from the existing max-pop window. Same literal-
+  //    slice invariant as sortie_max_pop_segment.
+  if (sortieMaxPop) {
+    const pts = sortiePath.slice(sortieMaxPop.startIdx, sortieMaxPop.endIdx + 1)
+    out.push({
+      noise: {
+        type: 'pop',
+        properties: {
+          score: sortieMaxPop.score,
+          dba_peak: sortieMaxPop.dba_peak,
+          density_peak: sortieMaxPop.density_peak,
+          length_nm: sortieMaxPop.length_nm,
+        },
+      },
+      point_index_start: sortieMaxPop.startIdx,
+      point_index_end: sortieMaxPop.endIdx,
+      ts_start: new Date(pts[0][3]).toISOString(),
+      ts_end: new Date(pts[pts.length - 1][3]).toISOString(),
+      points: pts,
+    })
+  }
+  // ── report: matched complaints. Each complaint becomes one entry
+  //    bracketing the sortie path between the complaint's observed
+  //    window. Tail-only complaints (no observed range) halo the
+  //    entire sortie span.
+  for (const c of (sortieComplaints || [])) {
+    const obsStart = c.startedAt ? Date.parse(c.startedAt) : sortieTakeoffMs
+    const obsEnd = c.endedAt ? Date.parse(c.endedAt) : obsStart
+    const winStart = Math.max(sortieTakeoffMs, isFinite(obsStart) ? obsStart : sortieTakeoffMs)
+    const winEnd = Math.min(sortieLandingMs, isFinite(obsEnd) ? obsEnd : sortieLandingMs)
+    if (!(winEnd >= winStart)) continue
+    // Locate index bounds — first path point at or after winStart,
+    // last path point at or before winEnd.
+    let s = -1, e = -1
+    for (let k = 0; k < sortiePath.length; k++) {
+      const ts = sortiePath[k][3] || 0
+      if (s < 0 && ts >= winStart) s = k
+      if (ts <= winEnd) e = k
+    }
+    if (s < 0 || e < s) {
+      // No path inside the window — anchor to full sortie span so
+      // the halo still renders.
+      s = 0
+      e = sortiePath.length - 1
+    }
+    const pts = sortiePath.slice(s, e + 1)
+    out.push({
+      noise: {
+        type: 'report',
+        properties: {
+          complaint_id: c.id || null,
+          klass: c.klass || null,            // yellow / orange / red
+          zone: c.zone || null,
+          reporter: c.reporter || null,
+          reported_ts: c.createdAt || null,
+          observed_ts_start: c.startedAt || null,
+          observed_ts_end: c.endedAt || c.startedAt || null,
+          notes: c.notes || null,
+        },
+      },
+      point_index_start: s,
+      point_index_end: e,
+      ts_start: new Date(pts[0][3]).toISOString(),
+      ts_end: new Date(pts[pts.length - 1][3]).toISOString(),
+      points: pts,
+    })
+  }
+  // ── vnap: scan for contiguous runs of real points inside any
+  //    noise-abatement polygon. One entry per run, per zone. agl
+  //    extremes are reported so consumers can flag floor violations.
+  if (Array.isArray(sortieZones) && sortieZones.length) {
+    for (const zone of sortieZones) {
+      let runStart = -1
+      let aglMin = Infinity, aglMax = -Infinity
+      for (let k = 0; k <= sortiePath.length; k++) {
+        const p = k < sortiePath.length ? sortiePath[k] : null
+        const inside = p && p[0] != null && p[1] != null
+          && pointInPolygon(p[0], p[1], zone.polygon)
+        if (inside) {
+          if (runStart < 0) {
+            runStart = k
+            aglMin = Infinity
+            aglMax = -Infinity
+          }
+          if (p[2] != null) {
+            const agl = p[2] - sortieFieldElevFt
+            if (agl < aglMin) aglMin = agl
+            if (agl > aglMax) aglMax = agl
+          }
+        } else if (runStart >= 0) {
+          const e = k - 1
+          if (e >= runStart) {
+            const pts = sortiePath.slice(runStart, e + 1)
+            const ceilingFt = zone.ceiling_ft || null
+            const floorViolated = ceilingFt != null && (aglMin + sortieFieldElevFt) > ceilingFt
+            out.push({
+              noise: {
+                type: 'vnap',
+                properties: {
+                  zone_name: zone.name,
+                  zone_note: zone.note || null,
+                  zone_airport: zone.airport || null,
+                  ceiling_ft: ceilingFt,
+                  agl_min_ft: isFinite(aglMin) ? Math.round(aglMin) : null,
+                  agl_max_ft: isFinite(aglMax) ? Math.round(aglMax) : null,
+                  // severity heuristic: under published ceiling AND
+                  // under published floor (when zones have one) → warning;
+                  // else advisory. v0 leaves floor undefined; treat
+                  // ceiling-only zones as advisory unless explicitly
+                  // crossed.
+                  severity: 'advisory',
+                  floor_violated: floorViolated,
+                },
+              },
+              point_index_start: runStart,
+              point_index_end: e,
+              ts_start: new Date(pts[0][3]).toISOString(),
+              ts_end: new Date(pts[pts.length - 1][3]).toISOString(),
+              points: pts,
+            })
+          }
+          runStart = -1
+        }
+      }
+    }
+  }
+  return out
+}
+
 // ── Plugin ────────────────────────────────────────────────────────
 // Module-scope per-tail base cache. The base airport for a tail is
 // stable over hours, so we share the lookup across all sortie
@@ -869,6 +1026,8 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
           // sortie boundary signal (overrides ground-threshold merge)
           // and expose the segment list per sortie as sortie_phases.
           const phaseMLClassifyFn = await getPhaseMLClassify()
+          // Complaints (cached) for unified noise-segment matching.
+          const sortieComplaintsAll = await loadComplaintsForSorties()
 
           // Pre-pass to collect tails so we can batch the base lookup.
           const tailsSeen = new Set()
@@ -1399,6 +1558,34 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 }
               }
 
+              // Unified sortie_noise_segments[] — operator brief 2026-06-03:
+              //   "we have the concept of maximum population impact, noise
+              //    report, and vnap incursion ... ensure that these are
+              //    treated in the data with uniformity / segment.noise.
+              //    type (pop, report, vnap).properties."
+              // Same outer shape across all three so the test page can
+              // render every kind with one halo renderer. Per-kind props
+              // live under noise.properties. sortie_max_pop_segment is
+              // preserved verbatim for backward compat — consumers
+              // adopting the unified field can switch incrementally.
+              const sortieMatchedComplaints = matchVoices(
+                sortieComplaintsAll, sortieTail,
+                sortieStartPt[3] || 0, sortieEndPt[3] || 0
+              )
+              const sortieZonesForAirport = NOISE_ZONES.filter(z => {
+                const apToken = String(z.name || '').split(/\s+/)[0]
+                return !apToken || apToken === sortieAirport
+              })
+              sortieRow.sortie_noise_segments = buildSortieNoiseSegments({
+                sortiePath,
+                sortieMaxPop,
+                sortieComplaints: sortieMatchedComplaints,
+                sortieZones: sortieZonesForAirport,
+                sortieFieldElevFt: sortieFieldElev,
+                sortieTakeoffMs: sortieStartPt[3] || 0,
+                sortieLandingMs: sortieEndPt[3] || 0,
+              })
+
               sortieResults.push(sortieRow)
             }
           }
@@ -1624,6 +1811,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_boundary_source: 'how this sortie was bounded from the next. Values: "phaseml_landed_full_stop:{no_new_takeoff|crew_swap_hour_marker|track_ended}" (phaseML hard signal — preferred), "gs_stop:{N}kt" (ground samples in the gap show the aircraft actually stopped at gs < 25 kt — catches tow rehooks and full-stop landings even when type-based threshold says merge), "ground_threshold" (type-based merge fired on gap duration alone), "track_end" (last sortie of the day, clean end), "track_edge" (last sortie of the day, still airborne).',
                 sortie_related_sorties: 'cross-sortie glider ↔ tow pairings. A pair fires when [takeoff_ts, landing_ts] windows overlap ≥ 30 s AND ≥ 50 % of the tow plane\'s real fixes during the overlap have a nearest-time glider fix within 900 ft lateral + 300 ft vertical. Entries are bidirectional — the tow row carries role="towed_glider" pointing at the glider sortie, the glider row carries role="tow_plane" pointing at the tow. mean_lateral_ft and mean_vertical_ft summarise the formation. Tow-side acceptance includes both type-flagged (PA25 etc.) AND auto-detected (auto_short_cycle_pattern) tracks so unknown-type tow planes still pair.',
                 sortie_tow_release:     'per-cycle tow release blob projected from acsML.phase_summary.climb_cycles[]. Detector gates echoed at sortie_tow_detector. Each entry: cycle_index (1-based), release_ts, release_lat/lon, release_alt_msl_ft / release_alt_agl_ft, climb_start_ts, climb_origin_alt_msl_ft, climb_gain_ft, climb_wallclock_s, climb_active_s (active climb only; excludes cruise plateaus + ADS-B coverage gaps), avg_climb_rate_fpm (over active), avg_climb_rate_wallclock_fpm (over wall-clock for comparison), release_path_index (resolved against sortie_path), detector_confidence, tow_ref (paired glider sortie_id for tow planes, tow-plane sortie_id for gliders, null when no pair found). Null on sorties whose climb shape did not pass the detector gates.',
+                sortie_noise_segments: 'unified container for max-pop / community-report / VNAP-incursion segments. Each entry has the same outer shape — { noise: { type, properties }, point_index_start, point_index_end, ts_start, ts_end, points } — and the same literal-subset invariant as sortie_max_pop_segment (points === sortie_path.slice(start, end+1)). noise.type ∈ {"pop","report","vnap"}; noise.properties carries the type-specific payload (score/dba/density for pop; complaint_id/klass/zone/reporter for report; zone_name/agl_min_ft/agl_max_ft/ceiling_ft/severity for vnap). pop projects from sortie_max_pop_segment; report matches data/complaints.json by tail + ±10 min window; vnap walks sortie_path against NOISE_ZONES polygons for the queried airport. sortie_max_pop_segment is preserved verbatim for backward compat — consumers can adopt the unified field at their own pace.',
                 sortie_landings:        'altitude-derived landing count via AGL hysteresis (low gate 300 ft, high gate 500 ft) walking REAL points only. touch_and_go = each high → low → high cycle; full_stop = sortie ended in the low state. total = touch_and_go + full_stop. Reads directly off the altitude track so it works on any sortie regardless of sortie_cycles (which counts airborne-session merges and can differ when ADS-B holds altitude through a brief dip).',
               },
             },
