@@ -170,6 +170,39 @@ const SORTIE_ACS_TAXONOMY_FILTER = {
 }
 const SORTIE_ACS_CLASSIFIER_TYPE = 'private_pilot_airplane'
 
+// Ask #15c (kiosk) — sortie_pop_grade rule. Matches the existing
+// pop_grade rule on /api/flights/current (impactGrade in
+// vite.config.js) so dispatchers see the same letter on both
+// surfaces. impact_index is (Σ ft·pop)/Σ ft / POP_SCALE_GRADE
+// computed over the whole sortie path. Echoed at sortie_pop_grade_rule
+// on the top of every response so client-side fallbacks agree.
+const SORTIE_POP_SCALE_GRADE = 1000
+const SORTIE_POP_GRADE_RULE = {
+  A: 'impact_index < 0.3',
+  B: 'impact_index < 0.6',
+  C: 'impact_index < 1.2',
+  D: 'impact_index < 2.0',
+  F: 'impact_index >= 2.0',
+}
+function gradeForImpactIndex(idx) {
+  if (idx == null) return null
+  if (idx < 0.3) return 'A'
+  if (idx < 0.6) return 'B'
+  if (idx < 1.2) return 'C'
+  if (idx < 2.0) return 'D'
+  return 'F'
+}
+
+// Ask #15d (kiosk) — read JSON body off a request stream. Vite's
+// connect middleware doesn't include a body parser; this mirrors the
+// pattern in vite.config.js's complaints handler.
+async function readSortieJsonBody(req) {
+  const chunks = []
+  for await (const c of req) chunks.push(c)
+  const raw = Buffer.concat(chunks).toString('utf8')
+  return raw ? JSON.parse(raw) : {}
+}
+
 // Ask S-16a — detector gates surface from acsML/climbMetrics.js
 // (climbCycleMetrics). Echoed at the top of every response so the
 // operator can audit gates without diving into source.
@@ -943,9 +976,110 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
   const BUSIEST_CACHE_TTL_MS = 60 * 60_000
   const _busiestCache = new Map()  // key → { ts, payload }
 
+  // Ask #15d (kiosk) — sortie ack store. Persists via the existing
+  // notifications table (kind='sortie_ack'), so no schema migration.
+  // 30 s cache mirrors the existing complaint cache pattern. Local
+  // shape: sortie_id → { acknowledged: true, at, by, tail }. We dedupe
+  // by sortie_id at read time (latest at wins) so re-acks are
+  // idempotent without write-side dedup.
+  const ACK_CACHE_TTL_MS = 30_000
+  let _ackCache = { ts: 0, map: new Map() }
+  async function loadSortieAcks() {
+    const now = Date.now()
+    if (now - _ackCache.ts < ACK_CACHE_TTL_MS) return _ackCache.map
+    const map = new Map()
+    if (db && db.useDb && typeof db.getNotifications === 'function') {
+      try {
+        const rows = await Promise.race([
+          db.getNotifications(null, 'sortie_ack'),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('ack_load_timeout')), 1500)),
+        ])
+        for (const r of (rows || [])) {
+          const id = r && r.sortie_id
+          if (!id) continue
+          const prev = map.get(id)
+          if (!prev || (r.at && r.at > prev.at)) {
+            map.set(id, {
+              acknowledged: true,
+              at: r.at || null,
+              by: r.by || null,
+              tail: r.tail || null,
+            })
+          }
+        }
+      } catch (err) {
+        console.warn('[sorties] ack load degraded:', err && err.message)
+      }
+    }
+    _ackCache = { ts: now, map }
+    return map
+  }
+  function invalidateAckCache() { _ackCache.ts = 0 }
+
   return {
     name: 'sorties-api',
     configureServer(server) {
+      // ── /api/sorties/acknowledge — Ask #15d ──────────────────
+      // POST body: { sortie_id, by, tail? }. Idempotent: re-acks
+      // overwrite the at/by/tail with the most-recent values and
+      // invalidate the read cache so subsequent /api/sorties calls
+      // see the change within the next request. Failure modes return
+      // a 4xx with reason; DB unavailability returns 503 so the kiosk
+      // can keep trying without thinking the ack succeeded.
+      server.middlewares.use('/api/sorties/acknowledge', async (req, res, next) => {
+        if (req.method !== 'POST') return next()
+        res.setHeader('Content-Type', 'application/json')
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        try {
+          let body
+          try { body = await readSortieJsonBody(req) }
+          catch (err) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: 'invalid JSON body', detail: err && err.message }))
+          }
+          const sortie_id = body && typeof body.sortie_id === 'string' ? body.sortie_id.trim() : ''
+          const by = body && typeof body.by === 'string' ? body.by.trim() : ''
+          const tail = body && typeof body.tail === 'string' ? body.tail.trim().toUpperCase() : ''
+          if (!sortie_id) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: 'sortie_id required' }))
+          }
+          if (!by) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: 'by required (operator identifier)' }))
+          }
+          if (!db || !db.useDb || typeof db.addNotification !== 'function') {
+            res.statusCode = 503
+            return res.end(JSON.stringify({ error: 'ack persistence unavailable' }))
+          }
+          const at = new Date().toISOString()
+          const record = { kind: 'sortie_ack', sortie_id, tail: tail || null, by, at }
+          try {
+            await Promise.race([
+              db.addNotification(record),
+              new Promise((_, rej) => setTimeout(() => rej(new Error('ack_write_timeout')), 2000)),
+            ])
+          } catch (err) {
+            console.warn('[sorties/acknowledge] write failed:', err && err.message)
+            res.statusCode = 503
+            return res.end(JSON.stringify({ error: 'ack write failed', detail: err && err.message }))
+          }
+          invalidateAckCache()
+          res.statusCode = 200
+          res.end(JSON.stringify({
+            ok: true,
+            sortie_id,
+            sortie_acknowledged: true,
+            sortie_acknowledged_at: at,
+            sortie_acknowledged_by: by,
+          }))
+        } catch (err) {
+          console.error('[sorties/acknowledge] error', err)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: String(err) }))
+        }
+      })
+
       // ── /api/sorties/busiest-days — Ask S-15 ─────────────────
       // Smallest defensible scope per S-15a + S-15e: airport + per_year
       // (or fall-back limit) → { day, year, sortie_count } per row.
@@ -1190,6 +1324,19 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
           const phaseMLClassifyFn = await getPhaseMLClassify()
           // Complaints (cached) for unified noise-segment matching.
           const sortieComplaintsAll = await loadComplaintsForSorties(db)
+          // Ask #15d — ack map (cached) used to stamp sortie_acknowledged
+          // + variants per row and apply the ?ack filter below.
+          const sortieAckMap = await loadSortieAcks()
+          // Ask #15e — ?ack=open|all|acked filter on the response.
+          // Default open per the kiosk's "list shape lives on the
+          // server" policy so a long-running kiosk doesn't accumulate
+          // already-handled rows. Open hides acked; acked shows only
+          // those; all returns everything regardless of state.
+          const ackFilter = (u.searchParams.get('ack') || 'open').trim().toLowerCase()
+          if (!['open', 'all', 'acked'].includes(ackFilter)) {
+            res.statusCode = 400
+            return res.end(JSON.stringify({ error: 'ack must be one of: open, all, acked' }))
+          }
 
           // Pre-pass to collect tails so we can batch the base lookup.
           const tailsSeen = new Set()
@@ -1401,6 +1548,21 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                   if (p[0] == null || p[1] == null) continue
                   const v = pointImpact(p[0], p[1], p[2] || 0, sortiePopAt)
                   sortiePathPopImpact[k] = Number.isFinite(v) ? Math.round(v * 100) / 100 : null
+                }
+              }
+
+              // Ask #15c — sortie-wide impact_index + pop_grade letter.
+              // Same scale as the kiosk's /api/flights/current pop_grade
+              // (POP_SCALE=1000, A/B/C/D/F thresholds 0.3/0.6/1.2/2.0).
+              // Real-points-only path is sufficient: impactSegments
+              // skips zero-length / null-pop segments naturally.
+              let sortiePopImpactIndex = null
+              let sortiePopGrade = null
+              if (sortiePopAt && sortiePath.length >= 2) {
+                const { total, lenFt } = impactSegments(sortiePath, sortiePopAt, distFt)
+                if (lenFt > 0) {
+                  sortiePopImpactIndex = Math.round(((total / lenFt) / SORTIE_POP_SCALE_GRADE) * 1000) / 1000
+                  sortiePopGrade = gradeForImpactIndex(sortiePopImpactIndex)
                 }
               }
 
@@ -1656,6 +1818,10 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_path: sortiePath,
                 sortie_path_throttle: sortiePathThrottle,
                 sortie_path_pop_impact: sortiePathPopImpact,
+                // Ask #15c (kiosk) — sortie-wide pop_impact + letter
+                // grade. Same rule as /api/flights/current's pop_grade.
+                sortie_pop_impact_index: sortiePopImpactIndex,
+                sortie_pop_grade: sortiePopGrade,
                 // Per ACS Areas of Operation (Private Pilot ACS) +
                 // FAR 61.57 currency. Computed from REAL-only points.
                 // Null when acsML is unavailable or the sortie has <
@@ -1753,6 +1919,29 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
           }
 
           sortieResults.sort((a, b) => b.sortie_landing_ts.localeCompare(a.sortie_landing_ts))
+
+          // Ask #15d — stamp per-row ack fields. Open sorties default
+          // to acknowledged:false; rows with a sortie_ack notification
+          // in the cache inherit the most-recent at/by.
+          for (const row of sortieResults) {
+            const a = sortieAckMap.get(row.sortie_id)
+            if (a && a.acknowledged) {
+              row.sortie_acknowledged = true
+              row.sortie_acknowledged_at = a.at || null
+              row.sortie_acknowledged_by = a.by || null
+            } else {
+              row.sortie_acknowledged = false
+              row.sortie_acknowledged_at = null
+              row.sortie_acknowledged_by = null
+            }
+          }
+          // Ask #15e — apply the ?ack filter post-stamp.
+          let filteredSortieResults = sortieResults
+          if (ackFilter === 'open') {
+            filteredSortieResults = sortieResults.filter(r => !r.sortie_acknowledged)
+          } else if (ackFilter === 'acked') {
+            filteredSortieResults = sortieResults.filter(r => r.sortie_acknowledged)
+          }
 
           // Glider ↔ tow pairing — operator brief 2026-06-03: "maybe
           // we have gliders correlated to tow, but also tow correlated
@@ -1948,7 +2137,16 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             // 2026-06-03 operator brief: "I need to be able to request a
             // sample of flights that covers the maneuvers."
             sortie_acs_index: sortieAcsIndex,
-            sortie_count: sortieResults.length,
+            // Ask #15c — pop_grade rule echoed so client fallbacks
+            // agree on the score → letter mapping.
+            sortie_pop_grade_rule: SORTIE_POP_GRADE_RULE,
+            sortie_pop_grade_scale: SORTIE_POP_SCALE_GRADE,
+            // Ask #15e — observability for the filter currently in effect.
+            sortie_ack_filter: ackFilter,
+            sortie_ack_count_total: sortieResults.length,
+            sortie_ack_count_acked: sortieResults.filter(r => r.sortie_acknowledged).length,
+            sortie_ack_count_open: sortieResults.filter(r => !r.sortie_acknowledged).length,
+            sortie_count: filteredSortieResults.length,
             sortie_invariant: 'sortie_max_pop_segment.sortie_max_pop_points === sortie_path.slice(sortie_max_pop_index_start, sortie_max_pop_index_end + 1). Every point in the slice has quality="real".',
             sortie_path_format: '[lat, lon, alt_msl_corrected_ft, ts_ms, quality] — quality ∈ {"real", "repaired"}. sortie_path_gaps lists "broken" coverage breaks; render those as hint lines, not solid path. sortie_path_throttle[i] is a parallel array of 0..1 throttle estimates aligned with sortie_path[i]; null entries mean either repaired/engineless or no prior real fix within 60 s.',
             sortie_throttle_model: 'climb_fraction + level_flight_fraction. climb_fraction = max(0, vs_fpm / vs_max_fpm); level_flight_fraction = (gs_kts / cruise_kts)^3 × cruise_throttle. Table-anchored (aircraftPerf.js) with sea-level vs_max + cruise derated ~3 %/1000 ft for non-turbocharged engines. Indicator-grade — wind, density altitude (without OAT), and turbo critical alts not modelled. See sortie_performance.throttle_at_takeoff as the per-sortie sanity check: ~1.0 means the table matches the airframe; << 0.9 means vs_max is over-reported in the table.',
@@ -1977,7 +2175,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_landings:        'altitude-derived landing count via AGL hysteresis (low gate 300 ft, high gate 500 ft) walking REAL points only. touch_and_go = each high → low → high cycle; full_stop = sortie ended in the low state. total = touch_and_go + full_stop. Reads directly off the altitude track so it works on any sortie regardless of sortie_cycles (which counts airborne-session merges and can differ when ADS-B holds altitude through a brief dip).',
               },
             },
-            sorties: sortieResults,
+            sorties: filteredSortieResults,
           }))
         } catch (err) {
           console.error('[sorties-api] error', err)
