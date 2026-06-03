@@ -524,17 +524,25 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
     }
     return null
   }
-  // Operator brief 2026-06-03: when the aircraft actually STOPPED
-  // during the gap (gs dropped < 25 kt), treat that as a hard sortie
-  // boundary regardless of the type-based ground threshold. A trainer
-  // T&G rolls through at 60+ kts so won't trigger; a tow plane's
-  // rehook stop or any aircraft's full-stop landing will. This catches
-  // N143J-style low-altitude tow patterns whose peak alt is too low
-  // for the auto-tow heuristic but whose ground samples show clear
-  // stops. When ADS-B has no ground samples in the gap, minGs is
-  // null and we fall through to the existing threshold + phaseML
-  // logic — no behaviour change on coverage-loss tracks.
+  // Operator brief 2026-06-03: when the aircraft STOPPED during the
+  // gap (gs dropped < 25 kt) AND remained on the ground for at least
+  // REAL_STOP_DWELL_MS, treat that as a hard sortie boundary regardless
+  // of the type-based ground threshold. A trainer T&G rolls through at
+  // 60+ kts so won't trigger; a brief taxi-back stop between training
+  // sessions (1-2 min) won't either. A sustained full-stop with
+  // shutdown / debrief / refuel DOES trigger.
+  //
+  // Earlier the rule fired on any stop regardless of dwell. That
+  // fragmented trainers (N3547L, N52993, N4593Y) on every full-stop
+  // landing between training cycles — operator-reported 2026-06-03:
+  // "sortie 17 minutes ago and another 3 minutes ago. sound right to
+  // you?" Fix: realStop now requires ≥ 3 min on the ground. Properly
+  // typed tow planes still split via SORTIE_GROUND_MS_TOW_PLANE =
+  // 20 s; un-typed tow planes with 3+ short-cycle climbs still split
+  // via the auto_short_cycle_pattern override. Trainers with quick
+  // taxi-backs no longer split.
   const REAL_STOP_GS_KTS = 25
+  const REAL_STOP_DWELL_MS = 3 * 60_000
   let sortieCur = { ...sortieSessions[0], cycles: 1, ended_by: null }
   for (let i = 1; i < sortieSessions.length; i++) {
     const next = sortieSessions[i]
@@ -543,7 +551,9 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
     const sortieGroundGapMs = gapEnd - gapStart
     const cue = cueForGap(gapStart, gapEnd)
     const minGapGs = minGroundGapGsKts(sortieAllPts, sortieCur.e, next.s)
-    const realStop = minGapGs != null && minGapGs < REAL_STOP_GS_KTS
+    const realStop = minGapGs != null
+      && minGapGs < REAL_STOP_GS_KTS
+      && sortieGroundGapMs >= REAL_STOP_DWELL_MS
     if (sortieGroundGapMs < effectiveGroundMs && !cue && !realStop) {
       sortieCur.e = next.e
       sortieCur.cycles += 1
