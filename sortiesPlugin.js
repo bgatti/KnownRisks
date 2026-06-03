@@ -34,6 +34,8 @@
 import fs from 'fs'
 import { impactSegments } from './src/popGrid.js'
 import { distFt, isEnginelessType } from './src/geo.js'
+import { perfForType } from './aircraftPerf.js'
+import { estimateThrottle } from './throttleEstimate.js'
 
 // ── purposeML — lazy loaded so a missing sibling library (which has
 // happened mid-deploy before) doesn't crash module init. First call
@@ -508,6 +510,48 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
               const sortiePath = bridged.path
               if (sortiePath.length < 3) continue
 
+              // Throttle estimate — per-point, real-only. Repaired
+              // points get null per the evaluation rule. For each real
+              // point, we compute gs (kts) + vs (fpm) from the nearest
+              // prior real point within 60 s, then ask the throttle
+              // model for an estimate. `throttle_at_takeoff` is the
+              // model's reading at the first airborne real fix; the
+              // operator's calibration is "should be ~1.0 at takeoff
+              // for healthy table entries — values << 0.9 mean the
+              // table's vs_max is over-reported for this airframe."
+              const sortiePerf = perfForType(sortieTrack.type || '')
+              const sortiePathThrottle = new Array(sortiePath.length).fill(null)
+              let throttleAtTakeoff = null
+              if (sortiePerf && sortiePerf.vs_max_fpm > 0) {
+                for (let k = 0; k < sortiePath.length; k++) {
+                  const cur = sortiePath[k]
+                  if (cur[4] !== 'real') continue
+                  // Find prior real point within 60 s.
+                  let priorIdx = -1
+                  for (let m = k - 1; m >= 0; m--) {
+                    if (sortiePath[m][4] !== 'real') continue
+                    const dt = (cur[3] - sortiePath[m][3]) / 1000
+                    if (dt > 0 && dt <= 60) priorIdx = m
+                    break
+                  }
+                  if (priorIdx < 0) continue
+                  const prev = sortiePath[priorIdx]
+                  const dtS = (cur[3] - prev[3]) / 1000
+                  if (!(dtS > 0)) continue
+                  const nm = distFt(prev[0], prev[1], cur[0], cur[1]) / 6076.12
+                  const gsKts = (nm / dtS) * 3600
+                  let vsFpm = null
+                  if (prev[2] != null && cur[2] != null) vsFpm = ((cur[2] - prev[2]) / dtS) * 60
+                  const est = estimateThrottle(gsKts, vsFpm, cur[2], sortiePerf)
+                  if (est) {
+                    sortiePathThrottle[k] = est.throttle
+                    if (throttleAtTakeoff == null && cur[2] != null && cur[2] > sortieGroundCeil) {
+                      throttleAtTakeoff = est.throttle
+                    }
+                  }
+                }
+              }
+
               // Metrics over the FINAL path (post-amendment).
               let pathLenNm = 0, maxExcNm = 0
               const apCenterLat = sortieAp.lat, apCenterLon = sortieAp.lon
@@ -600,6 +644,17 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_is_open: !!s.open,
                 sortie_path_point_count: sortiePath.length,
                 sortie_path: sortiePath,
+                sortie_path_throttle: sortiePathThrottle,
+                sortie_performance: sortiePerf && sortiePerf.vs_max_fpm > 0 ? {
+                  perf_source: sortiePerf.source,
+                  vy_kts: sortiePerf.vy_kts,
+                  vs_max_fpm: sortiePerf.vs_max_fpm,
+                  cruise_kts: sortiePerf.cruise_kts,
+                  max_kts: sortiePerf.max_kts,
+                  hp: sortiePerf.hp,
+                  cruise_throttle: sortiePerf.cruise_throttle,
+                  throttle_at_takeoff: throttleAtTakeoff,
+                } : { perf_source: 'engineless', throttle_at_takeoff: null },
                 sortie_path_amendment: {
                   alt_offset_ft: altCal.offset_ft,
                   alt_offset_source: altCal.source,
@@ -651,7 +706,8 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             sortie_purpose_classifier: purposeMLClassifyFn ? 'purposeML (real-points only, confidence ≥ 0.7) → geometry fallback' : 'geometry only (purposeML unavailable)',
             sortie_count: sortieResults.length,
             sortie_invariant: 'sortie_max_pop_segment.sortie_max_pop_points === sortie_path.slice(sortie_max_pop_index_start, sortie_max_pop_index_end + 1). Every point in the slice has quality="real".',
-            sortie_path_format: '[lat, lon, alt_msl_corrected_ft, ts_ms, quality] — quality ∈ {"real", "repaired"}. sortie_path_gaps lists "broken" coverage breaks; render those as hint lines, not solid path.',
+            sortie_path_format: '[lat, lon, alt_msl_corrected_ft, ts_ms, quality] — quality ∈ {"real", "repaired"}. sortie_path_gaps lists "broken" coverage breaks; render those as hint lines, not solid path. sortie_path_throttle[i] is a parallel array of 0..1 throttle estimates aligned with sortie_path[i]; null entries mean either repaired/engineless or no prior real fix within 60 s.',
+            sortie_throttle_model: 'climb_fraction + level_flight_fraction. climb_fraction = max(0, vs_fpm / vs_max_fpm); level_flight_fraction = (gs_kts / cruise_kts)^3 × cruise_throttle. Table-anchored (aircraftPerf.js) with sea-level vs_max + cruise derated ~3 %/1000 ft for non-turbocharged engines. Indicator-grade — wind, density altitude (without OAT), and turbo critical alts not modelled. See sortie_performance.throttle_at_takeoff as the per-sortie sanity check: ~1.0 means the table matches the airframe; << 0.9 means vs_max is over-reported in the table.',
             sortie_evaluation_rules: {
               // Load-bearing operator contract 2026-06-02: the path
               // carries three categories of data with different
@@ -665,6 +721,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
               guarantees: {
                 sortie_max_pop_segment: 'computed from real-only windows (no repaired point ever lands inside the window); literal-slice invariant preserved',
                 sortie_purpose:         'computed from real-only points when sortie_purpose_source="shape"; geometry classifier falls through when no shape verdict ≥ 0.7 confidence',
+                sortie_path_throttle:   'non-null entries only at indices where sortie_path[i].quality === "real" AND a prior real fix exists within 60 s. Repaired/synthesized points always carry null. Engineless types (gliders, balloons) return all-null arrays and sortie_performance.perf_source="engineless".',
               },
             },
             sorties: sortieResults,
