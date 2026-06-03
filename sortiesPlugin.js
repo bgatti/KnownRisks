@@ -158,6 +158,17 @@ function slugifySchool(name) {
 }
 
 // ── Sortie detection ──────────────────────────────────────────────
+// Returns a list of sortie sessions. Each one carries the effective
+// ground threshold used to bracket it AND a short string explaining
+// why ("type_default" / "auto_short_cycle_pattern") so the wire row
+// can surface it for the operator. The "auto" detector fires when a
+// track contains ≥ 3 airborne sessions whose median inter-session
+// ground gap is < 5 min — classic tow-plane or pattern-rich training
+// behaviour. In that case we tighten to the tow-plane threshold so
+// every land + (re-hook | re-board | shutdown-check) becomes its
+// own sortie, even when the type code is null and the tail isn't in
+// the PA25/PA18/PIAT/PC6 regex. Operator brief 2026-06-03 —
+// "we should have the tow planes well identified."
 function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = SORTIE_GROUND_MS) {
   const sortieList = []
   if (!Array.isArray(sortieAllPts) || sortieAllPts.length < 2) return sortieList
@@ -181,11 +192,36 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
     sortieSessions.push({ s: sortieSessionStart, e: sortieAllPts.length - 1, open: true })
   }
   if (!sortieSessions.length) return sortieList
+
+  // Pattern-aware threshold override. Only widens (never tightens
+  // beyond) the requested default — so a glider/tow-typed caller that
+  // already asked for SORTIE_GROUND_MS_TOW_PLANE / SORTIE_GROUND_MS_
+  // SHORT_TURN keeps that. The override only fires for tracks that
+  // asked for the long 5-min default but display a short-cycle shape.
+  let effectiveGroundMs = sortieGroundMs
+  let thresholdSource = sortieGroundMs === SORTIE_GROUND_MS ? 'type_default'
+    : sortieGroundMs === SORTIE_GROUND_MS_TOW_PLANE ? 'type_tow_plane'
+    : sortieGroundMs === SORTIE_GROUND_MS_SHORT_TURN ? 'type_glider' : 'caller_supplied'
+  if (sortieGroundMs > SORTIE_GROUND_MS_TOW_PLANE && sortieSessions.length >= 3) {
+    const sortieGaps = []
+    for (let i = 1; i < sortieSessions.length; i++) {
+      const gapMs = (sortieAllPts[sortieSessions[i].s][3] || 0)
+                  - (sortieAllPts[sortieSessions[i - 1].e][3] || 0)
+      sortieGaps.push(gapMs)
+    }
+    sortieGaps.sort((a, b) => a - b)
+    const sortieMedianGapMs = sortieGaps[Math.floor(sortieGaps.length / 2)]
+    if (sortieMedianGapMs < 5 * 60_000) {
+      effectiveGroundMs = SORTIE_GROUND_MS_TOW_PLANE
+      thresholdSource = 'auto_short_cycle_pattern'
+    }
+  }
+
   let sortieCur = { ...sortieSessions[0], cycles: 1 }
   for (let i = 1; i < sortieSessions.length; i++) {
     const next = sortieSessions[i]
     const sortieGroundGapMs = (sortieAllPts[next.s][3] || 0) - (sortieAllPts[sortieCur.e][3] || 0)
-    if (sortieGroundGapMs < sortieGroundMs) {
+    if (sortieGroundGapMs < effectiveGroundMs) {
       sortieCur.e = next.e
       sortieCur.cycles += 1
       if (next.open) sortieCur.open = true
@@ -195,6 +231,13 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
     }
   }
   sortieList.push(sortieCur)
+  // Stamp the effective threshold + source on every sortie in this
+  // track. Callers read these to populate sortie_ground_threshold_min
+  // and sortie_ground_threshold_source on the wire row.
+  for (const s of sortieList) {
+    s.effective_ground_ms = effectiveGroundMs
+    s.threshold_source = thresholdSource
+  }
   return sortieList
 }
 
@@ -696,7 +739,8 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_type: sortieTrack.type || null,
                 sortie_is_glider: sortieIsGlider,
                 sortie_is_tow_plane: sortieIsTowPlane,
-                sortie_ground_threshold_min: sortieGroundMsForType / 60_000,
+                sortie_ground_threshold_min: (s.effective_ground_ms || sortieGroundMsForType) / 60_000,
+                sortie_ground_threshold_source: s.threshold_source || null,
                 sortie_operator: sortieOperator,
                 sortie_operator_name: sortieOperatorName,
                 sortie_base: sortieBase,
