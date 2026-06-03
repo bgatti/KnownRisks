@@ -224,8 +224,22 @@ async function poll() {
     }
     if (!feedsOK) return
 
+    // Per-poll diagnostic counters. Surfacing these in logs so we can see
+    // why effective append rates are well below the 12/min poll ceiling.
+    let appended = 0
+    const skip = { no_pos: 0, alt_str: 0, ground_far: 0, alt_oob: 0, no_hex: 0, dedup_xy: 0 }
+    const seenBuckets = { lt2: 0, lt5: 0, lt15: 0, lt60: 0, ge60: 0, missing: 0 }
+
     for (const ac of byHexThisPoll.values()) {
-      if (ac.lat == null || ac.lon == null) continue
+      const sp = typeof ac.seen_pos === 'number' ? ac.seen_pos : null
+      if (sp == null) seenBuckets.missing++
+      else if (sp < 2) seenBuckets.lt2++
+      else if (sp < 5) seenBuckets.lt5++
+      else if (sp < 15) seenBuckets.lt15++
+      else if (sp < 60) seenBuckets.lt60++
+      else seenBuckets.ge60++
+
+      if (ac.lat == null || ac.lon == null) { skip.no_pos++; continue }
       // Coerce "ground" → nearest-airport field elevation (MSL) so taxi / ramp
       // points enter the pipeline at a physically plausible altitude. Front
       // Range fields sit at ~4700–5900 ft MSL; storing 0 here would break
@@ -235,11 +249,11 @@ async function poll() {
       if (typeof ac.alt_baro === 'number') alt = ac.alt_baro
       else if (ac.alt_baro === 'ground') {
         alt = groundElevAt(ac.lat, ac.lon)
-        if (alt == null) continue
-      } else continue
-      if (alt < 0 || alt >= ALT_MAX_FT) continue
+        if (alt == null) { skip.ground_far++; continue }
+      } else { skip.alt_str++; continue }
+      if (alt < 0 || alt >= ALT_MAX_FT) { skip.alt_oob++; continue }
       const hex = ac.hex
-      if (!hex) continue
+      if (!hex) { skip.no_hex++; continue }
       const reg = ((ac.r || '') + '').trim()
       const call = reg || ((ac.flight || '') + '').trim() || hex
       let t = state.byHex.get(hex)
@@ -251,10 +265,16 @@ async function poll() {
         t.call = reg
       }
       const last = t.points[t.points.length - 1]
-      if (!last || last[0] !== ac.lat || last[1] !== ac.lon) {
-        t.points.push([ac.lat, ac.lon, alt, Date.now()])
-      }
+      const same = last && last[0] === ac.lat && last[1] === ac.lon
+      // Suspend lat/lon dedup with CAPTURE_NODEDUP=1 to see raw poll rates.
+      // With dedup on (default), a parked aircraft with a stable position
+      // doesn't get re-appended even though the feed re-reports it.
+      if (same && !process.env.CAPTURE_NODEDUP) { skip.dedup_xy++; continue }
+      t.points.push([ac.lat, ac.lon, alt, Date.now()])
+      appended++
     }
+
+    console.log(`[poll] merged=${byHexThisPoll.size} appended=${appended} skip=${JSON.stringify(skip)} seen_pos=${JSON.stringify(seenBuckets)}`)
 
     await flush()
   } catch (e) {
