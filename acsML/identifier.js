@@ -164,28 +164,103 @@ export function identifyAcsSegments(points, { typeCode = '', tail = '' } = {}) {
     }
     prevGround = isGround
   }
-  // If no explicit on_ground samples (ADS-B dropout near field), use
-  // the FIRST airborne fix near an airport as an implied takeoff.
-  if (takeoffs.length === 0 && samples.length) {
+  // ── Implied takeoffs (defensive) ─────────────────────────────────────
+  //
+  // ADS-B can drop out during taxi/initial climb, so a real takeoff
+  // sometimes has NO on_ground samples in the captured track. We can
+  // imply one ONLY when the first fix has the actual signature of a
+  // takeoff — not an in-progress transit overflight that happens to
+  // pass near an airport.
+  //
+  // Operator round-7 feedback: "I see takeoff implied outside of an
+  // airport... seriously taking off is pretty well regulated."
+  //
+  // Fixed-wing rule (gated):
+  //   - first fix is < 3 nm from a known airport
+  //   - first fix AGL < 1500 ft above the nearby field
+  //   - within the first ~60 s of captured track, mean VS > +200 fpm
+  //     (the aircraft was actually CLIMBING — a transit at level cruise
+  //     would have vs ≈ 0 or descending)
+  //
+  // Helicopter exemption: helicopter type codes can legitimately
+  // depart from off-airport sites (medevac at a hospital pad, fire
+  // ops at a staging point, police at a scene). For helicopters we
+  // accept an implied takeoff anywhere AS LONG AS the climb signature
+  // is present and the first fix is < 800 ft AGL above local terrain
+  // (or below 1500 ft MSL surrogate when terrain isn't known).
+  if (takeoffs.length === 0 && samples.length >= 2) {
     const s0 = samples[0]
-    const ap = nearestAirport(s0.point.lat, s0.point.lon, { maxNm: 5 })
+    // Climb signature: mean VS over first ~60 s of captured data.
+    let climbVs = 0
+    let climbCount = 0
+    const t0 = s0.point.tsUnix
+    for (let i = 0; i < samples.length; i++) {
+      if (samples[i].point.tsUnix - t0 > 60) break
+      if (samples[i].isSessionBreak) continue
+      climbVs += samples[i].vsFpm
+      climbCount++
+    }
+    const meanEarlyVs = climbCount > 0 ? climbVs / climbCount : 0
+
+    const isHeliType = /^(R22|R44|R66|EC|AS|S76|B06|B40|B47|H50|H125|MD5|H47|UH|MH|CH|S70|S92|A109|A139)/
+      .test(String(typeCode || '').toUpperCase())
+
+    // Fixed-wing path: airport + AGL + climb gates.
+    let impliedTakeoff = null
+    const ap = nearestAirport(s0.point.lat, s0.point.lon, { maxNm: 3 })
     if (ap.airport) {
-      takeoffs.push({
+      const agl = s0.point.altMslFt - ap.airport.fieldElevFt
+      if (agl < 1500 && meanEarlyVs > 200) {
+        impliedTakeoff = {
+          ts: s0.point.tsUnix, lat: s0.point.lat, lon: s0.point.lon,
+          implied: true, idx: 0,
+          source: 'fixed_wing_low_climb',
+          aglFt: Math.round(agl), meanEarlyVs: Math.round(meanEarlyVs),
+          airportIcao: ap.airport.icao, distNm: +ap.distanceNm.toFixed(2),
+        }
+      }
+    }
+    // Helicopter exemption: off-airport implied takeoff is legitimate
+    // if climb is steep enough and start altitude is low.
+    if (!impliedTakeoff && isHeliType && meanEarlyVs > 300
+        && s0.point.altMslFt < 8000) {
+      impliedTakeoff = {
         ts: s0.point.tsUnix, lat: s0.point.lat, lon: s0.point.lon,
         implied: true, idx: 0,
-      })
+        source: 'helicopter_off_airport',
+        meanEarlyVs: Math.round(meanEarlyVs),
+        airportIcao: null, distNm: ap.airport ? +ap.distanceNm.toFixed(2) : null,
+      }
     }
+    if (impliedTakeoff) takeoffs.push(impliedTakeoff)
+    // Otherwise: NO implied takeoff. The track starts already
+    // airborne (overflight / transit) and we leave it that way.
+    // A missing IV.A is more honest than a spurious one.
   }
 
   // Emit a synthetic 'takeoff' detection for each takeoff event so
   // IV.A Normal Takeoff fires. Short-field detections preempt these.
   for (const to of takeoffs) {
+    let expl
+    if (!to.implied) expl = 'takeoff (on_ground → airborne transition)'
+    else if (to.source === 'helicopter_off_airport') {
+      expl = `implied helicopter takeoff off-airport (mean early VS +${to.meanEarlyVs} fpm)`
+    } else if (to.source === 'fixed_wing_low_climb') {
+      expl = `implied takeoff from ${to.airportIcao} (${to.distNm} nm, ${to.aglFt} ft AGL, +${to.meanEarlyVs} fpm mean climb)`
+    } else expl = 'implied takeoff'
     const synthetic = {
       type: 'takeoff', startIdx: to.idx, endIdx: to.idx,
-      startTs: to.ts, endTs: to.ts, durationS: 0, confidence: to.implied ? 0.6 : 0.9,
-      explanation: to.implied ? 'implied takeoff (no on-ground fix; first in-radius airborne fix near airport)'
-        : 'takeoff (on_ground → airborne transition)',
-      evidence: { implied: !!to.implied },
+      startTs: to.ts, endTs: to.ts, durationS: 0,
+      confidence: to.implied ? 0.7 : 0.9,
+      explanation: expl,
+      evidence: {
+        implied: !!to.implied,
+        source: to.source || 'observed',
+        airport: to.airportIcao || null,
+        distNm: to.distNm || null,
+        aglFt: to.aglFt || null,
+        meanEarlyVsFpm: to.meanEarlyVs || null,
+      },
     }
     const hits = SIGNAL_INDEX.get('takeoff') || []
     for (const h of hits) {
