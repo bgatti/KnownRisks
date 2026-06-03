@@ -425,7 +425,7 @@ function aircraftIconsPlugin() {
           if (photo) {
             res.statusCode = 302
             res.setHeader('Location', photo)
-            res.setHeader('Cache-Control', 'public, max-age=86400')
+            res.setHeader('Cache-Control', 'public, max-age=300')
             return res.end()
           }
           // 3. Last resort: generated placeholder (rare — obscure/unmatched type).
