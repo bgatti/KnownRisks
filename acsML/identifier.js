@@ -116,7 +116,67 @@ export function identifyAcsSegments(points, { typeCode = '', tail = '' } = {}) {
     out.notes.push('track too short — < 2 points')
     return out
   }
-  const { samples, phaseLabels, detections } = extractAcsSignals(points, { typeCode })
+  const { samples, phaseLabels, detections: rawDetections } = extractAcsSignals(points, { typeCode })
+
+  // ── Dedup near-duplicate landing events ─────────────────────────────
+  // Operator round-9: "go-around is detecting more than once per
+  // circuit, maybe we can look into dedup?" phaseML emits both literal
+  // (AGL-crossing) and implied (ADS-B-gap) touch_and_go detections;
+  // when an aircraft's actual touchdown is bracketed by a coverage
+  // dropout, the literal AND implied paths can both fire for the
+  // SAME touchdown. The same applies to landed_full_stop. Real T&G
+  // circuits in a typical pattern aircraft take ≥ 90 s — two
+  // touchdown events of the same TYPE at the same airport closer
+  // than that are the same event re-detected.
+  //
+  // Dedup strategy: walk chronologically, keep the FIRST event of
+  // each (type, nearest-airport) group, suppress subsequent events
+  // within DEDUP_WINDOW_S of a kept event. Higher-confidence events
+  // take precedence when they collide (literal > implied), which
+  // we approximate by sorting same-ts ties so explicit beats implied.
+  // Real C172 pattern circuits at busy fields can be as tight as ~60 s
+  // (KLMO has a low TPA + short legs). Same-touchdown re-detections
+  // (literal + implied paths firing for the same event, or implied
+  // detector retriggering on the same coverage gap) are typically < 60 s
+  // apart. 60 s keeps real circuits and squashes re-detections.
+  const LANDING_DEDUP_WINDOW_S = 60
+  const LANDING_DEDUP_TYPES = new Set(['touch_and_go', 'landed_full_stop'])
+  let dedupSuppressed = 0
+  const lastKeptAtAirport = new Map()   // key: type + '|' + icao → endTs of last kept
+  const detections = []
+  // Process in chronological order; tiebreak by impliedness so a
+  // literal detection at the same instant wins over an implied one.
+  const sortedRaw = [...rawDetections].sort((a, b) => {
+    if (a.startTs !== b.startTs) return a.startTs - b.startTs
+    const aImp = (a.evidence && a.evidence.implied) ? 1 : 0
+    const bImp = (b.evidence && b.evidence.implied) ? 1 : 0
+    return aImp - bImp
+  })
+  for (const det of sortedRaw) {
+    if (!LANDING_DEDUP_TYPES.has(det.type)) {
+      detections.push(det)
+      continue
+    }
+    // Resolve the airport this event happened near (5 nm cap).
+    let icao = det.evidence && det.evidence.airport
+      ? String(det.evidence.airport).toUpperCase() : null
+    if (!icao) {
+      const s = samples[det.startIdx]
+      const ap = s ? nearestAirport(s.point.lat, s.point.lon, { maxNm: 5 }) : null
+      icao = ap?.airport?.icao || null
+    }
+    const key = det.type + '|' + (icao || '?')
+    const lastTs = lastKeptAtAirport.get(key)
+    if (lastTs != null && det.startTs - lastTs < LANDING_DEDUP_WINDOW_S) {
+      dedupSuppressed++
+      continue
+    }
+    lastKeptAtAirport.set(key, det.startTs)
+    detections.push(det)
+  }
+  if (dedupSuppressed > 0) {
+    out.notes.push(`landing dedup: suppressed ${dedupSuppressed} touch_and_go/landed_full_stop event(s) within ${LANDING_DEDUP_WINDOW_S}s of an earlier same-airport event`)
+  }
 
   // ── Map detections → ACS tasks ──────────────────────────────────────
   // We collect candidate task pairs from BOTH the natural detections
