@@ -170,26 +170,28 @@ const SORTIE_ACS_TAXONOMY_FILTER = {
 }
 const SORTIE_ACS_CLASSIFIER_TYPE = 'private_pilot_airplane'
 
-// Ask #15c (kiosk) — sortie_pop_grade rule. Matches the existing
-// pop_grade rule on /api/flights/current (impactGrade in
-// vite.config.js) so dispatchers see the same letter on both
-// surfaces. impact_index is (Σ ft·pop)/Σ ft / POP_SCALE_GRADE
-// computed over the whole sortie path. Echoed at sortie_pop_grade_rule
-// on the top of every response so client-side fallbacks agree.
-const SORTIE_POP_SCALE_GRADE = 1000
+// Ask #15c — sortie_pop_grade rule. Operator directive 2026-06-03:
+// grade is now derived from the MAX-POP SEGMENT'S score so the chip
+// agrees with the polyline. The segment score (0-100, integrated
+// over the 30 s peak window) is on a different scale than the
+// whole-flight impact_index /api/flights/current.pop_grade uses, so
+// the boundaries are calibrated against observed segment-score
+// distributions instead of being copied verbatim. Echoed at
+// sortie_pop_grade_rule on every response so consumers know which
+// signal is being graded.
 const SORTIE_POP_GRADE_RULE = {
-  A: 'impact_index < 0.3',
-  B: 'impact_index < 0.6',
-  C: 'impact_index < 1.2',
-  D: 'impact_index < 2.0',
-  F: 'impact_index >= 2.0',
+  A: 'segment_score < 1',
+  B: 'segment_score < 3',
+  C: 'segment_score < 8',
+  D: 'segment_score < 20',
+  F: 'segment_score >= 20',
 }
-function gradeForImpactIndex(idx) {
-  if (idx == null) return null
-  if (idx < 0.3) return 'A'
-  if (idx < 0.6) return 'B'
-  if (idx < 1.2) return 'C'
-  if (idx < 2.0) return 'D'
+function gradeForSegmentScore(score) {
+  if (score == null || !Number.isFinite(score)) return null
+  if (score < 1) return 'A'
+  if (score < 3) return 'B'
+  if (score < 8) return 'C'
+  if (score < 20) return 'D'
   return 'F'
 }
 
@@ -1877,17 +1879,12 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
 
               const sortieMaxPop = findSortieMaxPopSegment(sortiePath, POPGRID?.popAt, sortieFieldElev)
               // Ask #15c revised — derive sortie_pop_grade from the
-              // SEGMENT'S impact_index (kiosk operator directive). Same
-              // POP_SCALE=1000 + impactGrade rule as
-              // /api/flights/current.pop_grade so the letter agrees
-              // across endpoints.
-              if (sortieMaxPop && sortiePopAt) {
-                const segPts = sortiePath.slice(sortieMaxPop.startIdx, sortieMaxPop.endIdx + 1)
-                const { total, lenFt } = impactSegments(segPts, sortiePopAt, distFt)
-                if (lenFt > 0) {
-                  const segIndex = (total / lenFt) / SORTIE_POP_SCALE_GRADE
-                  sortieRow.sortie_pop_grade = gradeForImpactIndex(segIndex)
-                }
+              // segment's score (operator directive). The score lives
+              // on findSortieMaxPopSegment's return shape and matches
+              // what sortie_max_pop_segment / sortie_noise_segments
+              // emit on the wire, so the chip and the polyline agree.
+              if (sortieMaxPop) {
+                sortieRow.sortie_pop_grade = gradeForSegmentScore(sortieMaxPop.score)
               }
               if (sortieMaxPop) {
                 const sortieMaxPopPoints = sortiePath.slice(sortieMaxPop.startIdx, sortieMaxPop.endIdx + 1)
@@ -2158,7 +2155,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
             // Ask #15c — pop_grade rule echoed so client fallbacks
             // agree on the score → letter mapping.
             sortie_pop_grade_rule: SORTIE_POP_GRADE_RULE,
-            sortie_pop_grade_scale: SORTIE_POP_SCALE_GRADE,
+            sortie_pop_grade_input: 'sortie_max_pop_segment.sortie_max_pop_score (segment-derived, same value sortie_noise_segments[type="pop"].noise.properties.score carries)',
             // Ask #15e — observability for the filter currently in effect.
             sortie_ack_filter: ackFilter,
             sortie_ack_count_total: sortieResults.length,
