@@ -61,6 +61,31 @@ function selectorMatches(selector, det) {
   if (selector === 'spiraling') {
     return det.evidence && det.evidence.spiraling === true
   }
+  // Throttle-based selectors (added when the main API surfaced
+  // throttle as a first-class sortie field 2026-06-01).
+  if (selector === 'pre_throttle_low') {
+    return det.evidence && typeof det.evidence.preEventThrottle === 'number'
+      && det.evidence.preEventThrottle < 0.3
+  }
+  if (selector === 'pre_throttle_high') {
+    return det.evidence && typeof det.evidence.preEventThrottle === 'number'
+      && det.evidence.preEventThrottle > 0.7
+  }
+  if (selector === 'throttle_idle') {
+    // For maneuvers that should occur at idle (IX.B emergency
+    // approach, simulated glide). meanThrottle is null for engineless
+    // aircraft — treat as "passes" for gliders.
+    if (!det.evidence) return true
+    if (det.evidence.meanThrottle == null) return true
+    return det.evidence.meanThrottle < 0.4
+  }
+  if (selector === 'spiraling_and_idle') {
+    if (!(det.evidence && det.evidence.spiraling === true)) return false
+    // If throttle data available, require idle. If unavailable (e.g.
+    // type with no perf table), trust the spiraling gate alone.
+    if (det.evidence.meanThrottle == null) return true
+    return det.evidence.meanThrottle < 0.4
+  }
   return true
 }
 

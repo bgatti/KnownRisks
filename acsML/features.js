@@ -21,6 +21,35 @@ import {
   angleDiffAbs, haversineNm, signedHeadingChange,
 } from '../phaseML/geometry.js'
 import { nearestAirport } from '../phaseML/airports.js'
+import { perfForType } from '../aircraftPerf.js'
+import { estimateThrottle } from '../throttleEstimate.js'
+
+// Per-sample throttle estimate (0..1) using the same model that the
+// sortie API uses (climb_fraction + level_flight_fraction against the
+// type's POH-derived performance table). Returns an array parallel
+// to samples, with null entries where the type is engineless or the
+// estimate isn't reliable.
+export function estimateThrottleSeries(samples, typeCode) {
+  const perf = perfForType(typeCode || '')
+  const out = new Array(samples.length).fill(null)
+  if (!perf || perf.vs_max_fpm <= 0) return out   // glider / balloon
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i]
+    if (s.isSessionBreak && i > 0) continue
+    const est = estimateThrottle(s.gsKts, s.vsFpm, s.point.altMslFt, perf)
+    if (est) out[i] = est.throttle
+  }
+  return out
+}
+
+// Mean throttle over the inclusive index range [lo, hi].
+export function meanThrottle(throttleSeries, lo, hi) {
+  let sum = 0, n = 0
+  for (let i = lo; i <= hi && i < throttleSeries.length; i++) {
+    if (throttleSeries[i] != null) { sum += throttleSeries[i]; n++ }
+  }
+  return n > 0 ? sum / n : null
+}
 
 function makeDetection(type, samples, lo, hi, confidence, explanation, evidence) {
   return {
@@ -300,7 +329,7 @@ export function detectEmergencyApproach(samples) {
 // labels.
 export function extractAcsSignals(points, { typeCode = '' } = {}) {
   if (!Array.isArray(points) || points.length < 2) {
-    return { samples: [], phaseLabels: [], detections: [] }
+    return { samples: [], phaseLabels: [], detections: [], throttleSeries: [] }
   }
   const samples = enrich(points)
   const phaseLabels = phaseClassifyTrack(points)
@@ -314,6 +343,24 @@ export function extractAcsSignals(points, { typeCode = '' } = {}) {
   acsDetections.push(...detectUnusualAttitudeRecovery(samples))
   acsDetections.push(...detectEmergencyApproach(samples))
 
+  // Per-sample throttle (first-class sortie field per main API). Attach
+  // mean-throttle and pre-event-throttle to every detection's evidence
+  // so selectors and gates can be driven by power, not just kinematics.
+  const throttleSeries = estimateThrottleSeries(samples, typeCode)
+
   const merged = [...phaseDetections, ...acsDetections].sort((a, b) => a.startTs - b.startTs)
-  return { samples, phaseLabels, detections: merged }
+  for (const det of merged) {
+    const meanT = meanThrottle(throttleSeries, det.startIdx, det.endIdx)
+    if (meanT != null) {
+      det.evidence = det.evidence || {}
+      det.evidence.meanThrottle = Math.round(meanT * 1000) / 1000
+      // Pre-event throttle (5 s window before startIdx) — useful for
+      // distinguishing power-on vs power-off stalls.
+      let preLo = det.startIdx - 1
+      while (preLo > 0 && samples[det.startIdx].point.tsUnix - samples[preLo].point.tsUnix < 5) preLo--
+      const preT = meanThrottle(throttleSeries, preLo, det.startIdx - 1)
+      if (preT != null) det.evidence.preEventThrottle = Math.round(preT * 1000) / 1000
+    }
+  }
+  return { samples, phaseLabels, detections: merged, throttleSeries }
 }

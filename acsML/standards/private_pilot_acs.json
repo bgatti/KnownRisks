@@ -233,16 +233,17 @@
           "name": "Power-Off Stalls",
           "detect": "partial",
           "phaseml_signals": ["stall_recovery"],
-          "track_rule": "phaseML stall_recovery detection whose pre-event vsFpm shows POWER-OFF context (mean pre-vs < 0). The identifier checks the evidence trail.",
-          "selector": "pre_vs_negative"
+          "track_rule": "phaseML stall_recovery detection whose PRE-EVENT throttle estimate (5 s window before the break) is LOW (< 0.3 = idle / approach config).",
+          "selector": "pre_throttle_low",
+          "notes": "Was selector='pre_vs_negative' before throttle was available; throttle is the direct signal."
         },
         {
           "code": "VII.C",
           "name": "Power-On Stalls",
           "detect": "partial",
           "phaseml_signals": ["stall_recovery"],
-          "track_rule": "phaseML stall_recovery detection whose pre-event vsFpm shows POWER-ON context (mean pre-vs > 0).",
-          "selector": "pre_vs_positive"
+          "track_rule": "phaseML stall_recovery detection whose PRE-EVENT throttle estimate is HIGH (> 0.7 = climb / takeoff config).",
+          "selector": "pre_throttle_high"
         },
         {
           "code": "VII.D",
@@ -299,15 +300,16 @@
             "airspeed": "specified by AFM",
             "altitude_loss": "≥ 1000 ft if practicing to recovery"
           },
-          "selector": "spiraling",
-          "notes": "Routine airline / biz-jet step-down descents trip the underlying phaseML emergency_descent detector (1200+ fpm sustained 30+ s) without bank. ACS IX.A requires the turn — selector='spiraling' filters to evidence.spiraling===true so only practice descents (which always include a 30-45° bank) count."
+          "selector": "spiraling_and_idle",
+          "notes": "Filter chain: (a) phaseML emergency_descent fires on any 1200+ fpm sustained descent, (b) spiraling===true gates out straight-line airline descents, (c) throttle gate requires meanThrottle < 0.4 (idle / drag descent). The combo eliminates airline routine descents that include procedural turns (they keep the throttle on)."
         },
         {
           "code": "IX.B",
           "name": "Emergency Approach and Landing (Simulated)",
           "detect": "partial",
           "phaseml_signals": ["emergency_approach_landing"],
-          "track_rule": "acsML emergency_approach_landing detector: sustained descent (VS < -300 fpm, 60+ s) terminating < 800 AGL more than 3 nm from any airport, followed by a sustained climb (recovery). Speed must stay within 50 kts range (no rapid deceleration).",
+          "selector": "throttle_idle",
+          "track_rule": "acsML emergency_approach_landing detector: sustained descent (VS < -300 fpm, 60+ s) terminating < 800 AGL more than 3 nm from any airport, followed by a sustained climb (recovery). Speed must stay within 50 kts range (no rapid deceleration). PLUS mean throttle during the descent < 0.4 (idle / glide).",
           "performance_standard": {
             "best_glide_speed": "1.3 VSO ±10 kts (≈ 65 KIAS for C172)",
             "field_selection": "based on wind, suitable surface, obstacle clearance"

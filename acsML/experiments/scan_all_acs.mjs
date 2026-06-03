@@ -89,3 +89,13 @@ console.log(`Steep turn directions:  left=${steepLeft}  right=${steepRight}`)
 console.log(`Emergency Descent (IX.A): ${emergDescent}`)
 console.log(`Turns Around a Point (V.D): ${turnAroundPoint}`)
 console.log(`Rectangular Course (V.B): ${rectangularCourse}`)
+console.log()
+console.log('Example IX.B evidence (throttle in evidence?):')
+const ixb = examples['IX.B']
+if (ixb) console.log(`  ${ixb.tail} — ${ixb.explanation}`)
+console.log('Example VII.B Power-Off:')
+const viib = examples['VII.B']
+if (viib) console.log(`  ${viib.tail} — ${viib.explanation}`)
+console.log('Example VII.C Power-On (NEW with throttle):')
+const viic = examples['VII.C']
+if (viic) console.log(`  ${viic.tail} — ${viic.explanation}`)
