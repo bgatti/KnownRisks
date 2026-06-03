@@ -427,21 +427,65 @@ function classifySortiePurpose({ cycles, maxExcursionNm, landedAirport, baseAirp
 }
 
 // ── Plugin ────────────────────────────────────────────────────────
+// Module-scope per-tail base cache. The base airport for a tail is
+// stable over hours, so we share the lookup across all sortie
+// requests. Misses (tails we didn't get a row for) are also cached
+// so we don't repeatedly query the DB for the same orphan tails.
+const TAIL_BASE_CACHE = new Map()     // tail → { base: string|null, ts: number }
+const TAIL_BASE_TTL_MS = 60 * 60_000  // 1 h — bases rarely change
+
 export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
-  // Per-tail base lookup, cached. Query `tracks` for the latest
-  // non-null base_airport per tail. Bulk-batched per request.
+  // Per-tail base lookup. Hits the module-scope cache first, queries
+  // `tracks` ONLY for tails we don't have a fresh entry for, and
+  // bounds the DB call so a stuck pg-pool can't take the whole sortie
+  // endpoint down with it. The `out` map is built from the cache +
+  // any new rows; cache misses get inserted even when null so we don't
+  // re-query orphan tails on every request.
   async function fetchTailBases(tails) {
     const out = new Map()
-    if (!db || !db.useDb || !tails.length) return out
+    const now = Date.now()
+    const need = []
+    for (const t of tails) {
+      const c = TAIL_BASE_CACHE.get(t)
+      if (c && now - c.ts < TAIL_BASE_TTL_MS) {
+        if (c.base) out.set(t, c.base)
+      } else {
+        need.push(t)
+      }
+    }
+    if (!need.length || !db || !db.useDb) return out
+    // Hard cap on the DB hop so a saturated pool can't gate the whole
+    // sortie response. When the timeout fires the response still
+    // serves — bases for these tails just fall through to the school
+    // index's airport (or null), and we DO NOT poison the cache so
+    // the next request will retry.
+    const ROW_TIMEOUT_MS = 1500
     try {
-      const r = await db.queryDb(
+      const query = db.queryDb(
         `SELECT call,
            (array_agg(base_airport ORDER BY date DESC) FILTER (WHERE base_airport IS NOT NULL))[1] AS base
          FROM tracks WHERE call = ANY($1) GROUP BY call`,
-        [tails],
+        [need],
       )
-      for (const row of r.rows) if (row.base) out.set(row.call.toUpperCase(), row.base)
-    } catch { /* swallow — base just becomes null */ }
+      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('row_timeout')), ROW_TIMEOUT_MS))
+      const r = await Promise.race([query, timeout])
+      const seen = new Set()
+      for (const row of r.rows) {
+        const tail = String(row.call || '').toUpperCase()
+        const base = row.base || null
+        seen.add(tail)
+        TAIL_BASE_CACHE.set(tail, { base, ts: now })
+        if (base) out.set(tail, base)
+      }
+      // Tails the DB returned nothing for: cache the negative result
+      // so we don't re-query them next request either.
+      for (const t of need) {
+        if (!seen.has(t)) TAIL_BASE_CACHE.set(t, { base: null, ts: now })
+      }
+    } catch (err) {
+      // DB unhappy or timed out — degrade quietly. Do NOT cache.
+      console.warn('[sorties] fetchTailBases degraded:', err && err.message)
+    }
     return out
   }
 
