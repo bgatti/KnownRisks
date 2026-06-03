@@ -175,6 +175,7 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
   const sortieSessions = []
   let sortieInAir = false
   let sortieSessionStart = -1
+  let sortieSessionPeakAlt = 0
   for (let i = 0; i < sortieAllPts.length; i++) {
     const p = sortieAllPts[i]
     if (p[2] == null || p[3] == null) continue
@@ -182,14 +183,18 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
     if (!sortieInAir && isAir) {
       sortieInAir = true
       sortieSessionStart = i
+      sortieSessionPeakAlt = p[2]
+    } else if (sortieInAir && isAir) {
+      if (p[2] > sortieSessionPeakAlt) sortieSessionPeakAlt = p[2]
     } else if (sortieInAir && !isAir) {
       sortieInAir = false
-      sortieSessions.push({ s: sortieSessionStart, e: i, open: false })
+      sortieSessions.push({ s: sortieSessionStart, e: i, open: false, peakAlt: sortieSessionPeakAlt })
       sortieSessionStart = -1
+      sortieSessionPeakAlt = 0
     }
   }
   if (sortieInAir && sortieSessionStart >= 0) {
-    sortieSessions.push({ s: sortieSessionStart, e: sortieAllPts.length - 1, open: true })
+    sortieSessions.push({ s: sortieSessionStart, e: sortieAllPts.length - 1, open: true, peakAlt: sortieSessionPeakAlt })
   }
   if (!sortieSessions.length) return sortieList
 
@@ -202,14 +207,18 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
   //   • ≥ 3 airborne sessions
   //   • median session DURATION < 5 min (climb-only profile, not a
   //     pattern T&G or training session)
+  //   • median session PEAK ALT ≥ groundCeil + 1500 ft (tow release
+  //     altitude is typically 2000-3500 ft AGL; pattern T&Gs peak at
+  //     ~ 800-1200 ft AGL — this is the load-bearing discriminator
+  //     since pattern T&Gs can also have short session durations)
   //   • median inter-session ground gap < 3 min (continuous re-hook
   //     cadence, not a re-brief / re-board)
   //
-  // Early auto-detection over-fired on trainers (C172/RV10) doing
-  // 30-min pattern work between full-stop breaks — they have multiple
-  // sessions with short gaps too, but their session DURATIONS are
-  // ~ 7-30 min (full pattern lap or actual flight), while a tow plane
-  // session is ~ 2-4 min (climb + steep descent).
+  // Earlier rounds over-fired on trainers (C172/RV10) doing pattern
+  // work — their sessions are short too, but stay LOW. Adding the
+  // peak-altitude condition eliminates that false positive without
+  // losing tow-plane detection on type-null tracks like N143J.
+  const SORTIE_AUTO_TOW_PEAK_AGL_FT = 1500
   let effectiveGroundMs = sortieGroundMs
   let thresholdSource = sortieGroundMs === SORTIE_GROUND_MS ? 'type_default'
     : sortieGroundMs === SORTIE_GROUND_MS_TOW_PLANE ? 'type_tow_plane'
@@ -217,10 +226,12 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
   if (sortieGroundMs > SORTIE_GROUND_MS_TOW_PLANE && sortieSessions.length >= 3) {
     const sortieGaps = []
     const sortieDurs = []
+    const sortiePeaks = []
     for (let i = 0; i < sortieSessions.length; i++) {
       const dMs = (sortieAllPts[sortieSessions[i].e][3] || 0)
                 - (sortieAllPts[sortieSessions[i].s][3] || 0)
       sortieDurs.push(dMs)
+      sortiePeaks.push(sortieSessions[i].peakAlt || 0)
       if (i > 0) {
         const gapMs = (sortieAllPts[sortieSessions[i].s][3] || 0)
                     - (sortieAllPts[sortieSessions[i - 1].e][3] || 0)
@@ -229,9 +240,14 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
     }
     sortieGaps.sort((a, b) => a - b)
     sortieDurs.sort((a, b) => a - b)
+    sortiePeaks.sort((a, b) => a - b)
     const sortieMedianGapMs = sortieGaps[Math.floor(sortieGaps.length / 2)]
     const sortieMedianDurMs = sortieDurs[Math.floor(sortieDurs.length / 2)]
-    if (sortieMedianGapMs < 3 * 60_000 && sortieMedianDurMs < 5 * 60_000) {
+    const sortieMedianPeakAlt = sortiePeaks[Math.floor(sortiePeaks.length / 2)]
+    const sortieFieldElev = sortieGroundCeil - SORTIE_GROUND_AGL_FT
+    if (sortieMedianGapMs < 3 * 60_000
+        && sortieMedianDurMs < 5 * 60_000
+        && sortieMedianPeakAlt >= sortieFieldElev + SORTIE_AUTO_TOW_PEAK_AGL_FT) {
       effectiveGroundMs = SORTIE_GROUND_MS_TOW_PLANE
       thresholdSource = 'auto_short_cycle_pattern'
     }
