@@ -272,9 +272,21 @@ export function detectSTurns(samples, cfg = S_TURN_CFG) {
 
 const TAP_CFG = {
   minSignedTurnDeg: 360,
-  maxAltRangeFt: 200,
+  // ACS V.D nominal tolerance is ±100 ft (range 200 ft) but a
+  // sustained orbital trainer holds tighter. Gliders thermalling
+  // typically gain 150-300 ft over a 60-90s thermal — most fall
+  // outside 150 ft range. (150 was chosen empirically: 100
+  // rejected everything, 200 rejected almost nothing.)
+  maxAltRangeFt: 150,
   minDurationS: 30,
   maxCentreSpreadNm: 0.2,
+  // ACS V.D Turns Around a Point: "two 360° turns in one direction"
+  // — bounded duration and turn amount. Gliders thermalling do
+  // many 360°s continuously and CLIMB (200-500 fpm over the
+  // maneuver). Both maxDurationS and maxSignedTurnDeg reject
+  // thermalling without changing real V.D behavior.
+  maxDurationS: 150,
+  maxSignedTurnDeg: 900,
 }
 
 export function detectTurnAroundPoint(samples, cfg = TAP_CFG) {
@@ -294,7 +306,9 @@ export function detectTurnAroundPoint(samples, cfg = TAP_CFG) {
     if (j - i < 5) { i++; continue }
     const m = sliceMetrics(samples, i, j)
     if (m.durationS < cfg.minDurationS
+        || m.durationS > cfg.maxDurationS
         || Math.abs(m.signedTurnTotalDeg) < cfg.minSignedTurnDeg
+        || Math.abs(m.signedTurnTotalDeg) > cfg.maxSignedTurnDeg
         || m.altRange > cfg.maxAltRangeFt) {
       i = j + 1; continue
     }
@@ -468,11 +482,22 @@ const SLOW_FLIGHT_CFG = {
   maxAltRangeFt: 400,
   minDistFromRunwayNm: 2,
   minTurnRatePeakDps: 1,
+  // ACS VII.A Slow Flight is a DELIBERATE, BRIEF maneuver — pilot
+  // enters slow flight, holds it, then RECOVERS to cruise. Aircraft
+  // that fly slow perpetually (tow planes towing, helicopters in
+  // cruise, gliders thermalling) never recover — without this gate,
+  // they fire VII.A constantly. Require recovery to at least
+  // recoveryFractionOfCruise * cruise sustained for recoveryHoldS
+  // within recoveryWindowS of the slow segment end.
+  recoveryFractionOfCruise: 0.85,
+  recoveryHoldS: 30,
+  recoveryWindowS: 180,
 }
 
 export function detectSlowFlight(samples, typeCode = '', cfg = SLOW_FLIGHT_CFG) {
   const cruise = CRUISE_KTS_BY_TYPE[String(typeCode || '').toUpperCase()] || DEFAULT_CRUISE_KTS
   const threshold = cruise * cfg.fractionOfCruise
+  const recoveryThreshold = cruise * cfg.recoveryFractionOfCruise
   const n = samples.length
   const out = []
   let i = 0
@@ -487,14 +512,31 @@ export function detectSlowFlight(samples, typeCode = '', cfg = SLOW_FLIGHT_CFG) 
     const { airport, distanceNm } = nearestAirport(mid.lat, mid.lon)
     if (airport && distanceNm < cfg.minDistFromRunwayNm) { i = j + 1; continue }
     if (m.turnRateP90 < cfg.minTurnRatePeakDps) { i = j + 1; continue }
+
+    // Recovery gate: walk forward from j up to recoveryWindowS; the
+    // aircraft must reach recoveryThreshold and hold it for
+    // recoveryHoldS sustained. Without this, perpetually-slow
+    // aircraft fire VII.A every flight.
+    let recoveryStart = -1
+    let recoveryConfirmedIdx = -1
+    for (let k = j + 1; k < n; k++) {
+      if (samples[k].isSessionBreak) break
+      if (samples[k].point.tsUnix - samples[j].point.tsUnix > cfg.recoveryWindowS) break
+      if (samples[k].gsKts < recoveryThreshold) { recoveryStart = -1; continue }
+      if (recoveryStart < 0) recoveryStart = k
+      const heldS = samples[k].point.tsUnix - samples[recoveryStart].point.tsUnix
+      if (heldS >= cfg.recoveryHoldS) { recoveryConfirmedIdx = k; break }
+    }
+    if (recoveryConfirmedIdx < 0) { i = j + 1; continue }
+
     const conf = Math.min(1, 0.5
       + 0.20 * Math.min(1, m.durationS / 120)
       + 0.15 * (1 - Math.min(1, m.altRange / cfg.maxAltRangeFt))
       + 0.15 * Math.min(1, (threshold - m.gsMean) / threshold))
     out.push(makeDetection('slow_flight', samples, i, j, conf,
-      `GS ${m.gsMean.toFixed(0)} kt (cruise est ${cruise} kt), ${m.durationS.toFixed(0)}s, alt range ${m.altRange.toFixed(0)} ft`,
-      { ...m, cruiseKtsEst: cruise, thresholdKts: threshold, distFromNearestAirportNm: distanceNm }))
-    i = j + 1
+      `GS ${m.gsMean.toFixed(0)} kt (cruise est ${cruise} kt), ${m.durationS.toFixed(0)}s, alt range ${m.altRange.toFixed(0)} ft, recovered to ${samples[recoveryConfirmedIdx].gsKts.toFixed(0)} kt`,
+      { ...m, cruiseKtsEst: cruise, thresholdKts: threshold, distFromNearestAirportNm: distanceNm, recoveryGsKts: samples[recoveryConfirmedIdx].gsKts }))
+    i = recoveryConfirmedIdx
   }
   return mergeAdjacent(out)
 }
@@ -508,6 +550,14 @@ const STALL_CFG = {
   preWindowS: 12,
   breakWindowS: 8,
   recoveryWindowS: 15,
+  // ACS VII.B/C stall recovery is a TRAINING maneuver: setup from
+  // slow flight at LEVEL altitude (or in a climb for power-on), then
+  // break, then recovery. Gliders descending through turbulence can
+  // produce VS spikes that look like a stall break but they were
+  // already descending steadily before — not a stall setup. Require
+  // pre-break VS to be at-or-above maxPreBreakVsFpm (i.e., not
+  // already in significant descent).
+  maxPreBreakVsFpm: -300,
 }
 
 export function detectStallRecovery(samples, typeCode = '', cfg = STALL_CFG) {
@@ -522,6 +572,17 @@ export function detectStallRecovery(samples, typeCode = '', cfg = STALL_CFG) {
     let lowOk = true
     for (let k = preStart; k < i; k++) if (samples[k].gsKts >= lowThreshold) { lowOk = false; break }
     if (!lowOk) continue
+    // Setup check: average VS during the pre-window should be
+    // at-or-above maxPreBreakVsFpm. Real stalls set up from level
+    // or climbing flight; gliders descending in sink are already
+    // below this.
+    let preVsSum = 0, preVsN = 0
+    for (let k = preStart; k < i; k++) {
+      if (samples[k].isSessionBreak) continue
+      preVsSum += samples[k].vsFpm
+      preVsN++
+    }
+    if (preVsN > 0 && preVsSum / preVsN < cfg.maxPreBreakVsFpm) continue
     let breakEnd = i
     while (breakEnd + 1 < n && samples[breakEnd + 1].point.tsUnix - samples[i].point.tsUnix < cfg.breakWindowS) {
       if (samples[breakEnd + 1].vsFpm > cfg.minRecoveryFpm) break

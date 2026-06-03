@@ -128,8 +128,12 @@ const TASK_EXCLUSIONS = [
   // Gliders — engineless airframes don't fall under PP Airplane ACS.
   { task: 'V.A',   match: 'engineless', why: 'thermalling produces continuous tight banked turns; ACS V.A is one 360° (or 180°+180°)' },
   { task: 'V.C',   match: 'engineless', why: 'inter-thermal traverses LOOK like S-turns across a road but the task is for powered ground reference' },
-  { task: 'V.D',   match: 'engineless', why: 'thermalling = continuous orbit; not a ground-reference maneuver' },
-  { task: 'VII.A', match: 'engineless', why: 'glider normal cruise is 40-60 KTAS — perpetually below typical powered-plane cruise; not slow-flight task' },
+  // V.D engineless gate REMOVED — phaseML's tightened V.D detector
+  // (maxAltRangeFt=150 + maxDurationS=150 + maxSignedTurnDeg=900)
+  // eliminates glider thermals (rate 6.7 → 0 in audit).
+  // VII.A engineless gate REMOVED — phaseML's recovery-to-cruise
+  // requirement now eliminates glider perpetual-slow false positives
+  // (rate dropped from 26.7 to 0 on 2026-04-19 audit).
   { task: 'VII.B', match: 'engineless', why: 'engineless — no power-off vs power-on distinction' },
   { task: 'VII.C', match: 'engineless', why: 'engineless — no power to apply at stall break' },
   // IX.A engineless gate ALSO no longer needed — phaseML's IX.A
@@ -144,7 +148,8 @@ const TASK_EXCLUSIONS = [
   // tightened shape detector (start-AGL ≥ 4000 + recovery to
   // controlled flight) — REMOVED from exclusions because the
   // shape detector eliminated tow_plane rate to 0.
-  { task: 'V.D',   match: 'tow_plane',  why: 'post-release descent often spirals over the field; not a ground reference training maneuver' },
+  // V.D tow_plane gate REMOVED — same shape tightening + tow-plane
+  // post-release descents have alt range far exceeding 150 ft.
   { task: 'VII.B', match: 'tow_plane',  why: 'post-release dive at idle has stall-recovery-like signature but is intentional energy management' },
 ]
 
