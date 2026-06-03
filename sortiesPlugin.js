@@ -236,6 +236,34 @@ function slugifySchool(name) {
 // own sortie, even when the type code is null and the tail isn't in
 // the PA25/PA18/PIAT/PC6 regex. Operator brief 2026-06-03 —
 // "we should have the tow planes well identified."
+// Did the aircraft actually STOP during the ground gap between two
+// airborne sessions, or did it roll through (touch-and-go)? Operator
+// brief 2026-06-03: the discriminator between a tow rehook and a
+// trainer T&G is ground speed — a real stop drops below ~10 kt, a
+// T&G stays above ~50 kt through rollout. We sample consecutive
+// ground-state fixes in the gap and report the minimum gs.
+//
+// Returns the minimum gs in kt observed in the gap, or null when no
+// usable consecutive fix pair exists (ADS-B coverage loss). Callers
+// treat min_gs < 25 kt as a "real stop" hard boundary; null means
+// fall through to the existing threshold-based merge.
+function minGroundGapGsKts(sortieAllPts, sessionEndIdx, nextSessionStartIdx) {
+  if (nextSessionStartIdx - sessionEndIdx < 2) return null
+  let minGs = null
+  for (let k = sessionEndIdx + 1; k < nextSessionStartIdx; k++) {
+    const prev = sortieAllPts[k - 1]
+    const cur = sortieAllPts[k]
+    if (!prev || !cur) continue
+    if (prev[3] == null || cur[3] == null) continue
+    const dtS = (cur[3] - prev[3]) / 1000
+    if (dtS <= 0 || dtS > 30) continue
+    const nm = distFt(prev[0], prev[1], cur[0], cur[1]) / 6076.12
+    const gs = (nm / dtS) * 3600
+    if (minGs == null || gs < minGs) minGs = gs
+  }
+  return minGs
+}
+
 function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = SORTIE_GROUND_MS, hardBoundaries = []) {
   const sortieList = []
   if (!Array.isArray(sortieAllPts) || sortieAllPts.length < 2) return sortieList
@@ -334,6 +362,17 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
     }
     return null
   }
+  // Operator brief 2026-06-03: when the aircraft actually STOPPED
+  // during the gap (gs dropped < 25 kt), treat that as a hard sortie
+  // boundary regardless of the type-based ground threshold. A trainer
+  // T&G rolls through at 60+ kts so won't trigger; a tow plane's
+  // rehook stop or any aircraft's full-stop landing will. This catches
+  // N143J-style low-altitude tow patterns whose peak alt is too low
+  // for the auto-tow heuristic but whose ground samples show clear
+  // stops. When ADS-B has no ground samples in the gap, minGs is
+  // null and we fall through to the existing threshold + phaseML
+  // logic — no behaviour change on coverage-loss tracks.
+  const REAL_STOP_GS_KTS = 25
   let sortieCur = { ...sortieSessions[0], cycles: 1, ended_by: null }
   for (let i = 1; i < sortieSessions.length; i++) {
     const next = sortieSessions[i]
@@ -341,12 +380,16 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
     const gapEnd = sortieAllPts[next.s][3] || 0
     const sortieGroundGapMs = gapEnd - gapStart
     const cue = cueForGap(gapStart, gapEnd)
-    if (sortieGroundGapMs < effectiveGroundMs && !cue) {
+    const minGapGs = minGroundGapGsKts(sortieAllPts, sortieCur.e, next.s)
+    const realStop = minGapGs != null && minGapGs < REAL_STOP_GS_KTS
+    if (sortieGroundGapMs < effectiveGroundMs && !cue && !realStop) {
       sortieCur.e = next.e
       sortieCur.cycles += 1
       if (next.open) sortieCur.open = true
     } else {
-      sortieCur.ended_by = cue ? `phaseml_landed_full_stop:${cue}` : 'ground_threshold'
+      sortieCur.ended_by = cue ? `phaseml_landed_full_stop:${cue}`
+        : realStop ? `gs_stop:${Math.round(minGapGs)}kt`
+        : 'ground_threshold'
       sortieList.push(sortieCur)
       sortieCur = { ...next, cycles: 1, ended_by: null }
     }
@@ -1426,7 +1469,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_acs:             'computed from REAL-only points (purposeML uses the same filter). Null when acsML lib missing OR the sortie has < 30 real points after the quality filter. tasks_demonstrated lists every ACS code that fired; currency_events lists per-takeoff/per-landing 61.57(a)/(b) events tagged day vs night by airport lat/lon. scores covers V.A/V.B/V.C/V.D performance-standard verdicts. Mean throttle from sortie_path_throttle drives the VII.B/VII.C/IX.A/IX.B selectors — see kickoff_sorties_test.md round-4 notes.',
                 sortie_phases:          'phaseML segments clipped to the sortie\'s [takeoff_ts, landing_ts] window. Phase ∈ {on_ground, taxiing, pattern, practice_area, departing, inbound, en_route, nearby, landed_full_stop}. landed_full_stop fires only when a ground run is ≥ 30 s AND (dwell ≥ 5 min OR end-of-track) AND no takeoff occurred within 15 min — this is the load-bearing "crew over, flight logged" signal that breaks sorties even when the type-based ground threshold would have merged. Null when phaseML lib missing OR the track has < 5 real points.',
                 sortie_annotations:     'per-segment ACS task annotations derived from acsML\'s raw detection list (post-preempt). Indices reference sortie_path; ts_start/ts_end are derived from the REAL fix at those indices. source="auto" + verdict="not_evaluated" by construction — automated detection brackets a segment, human-grade verdicts come from a separate write path (Ask S-9c). Null when acsML lib missing OR the sortie had < 30 real points (same gate as sortie_acs).',
-                sortie_boundary_source: 'how this sortie was bounded from the next: "phaseml_landed_full_stop" (hard signal — preferred), "ground_threshold" (type-based merge fired), "track_end" (last sortie of the day, clean end), "track_edge" (last sortie of the day, still airborne).',
+                sortie_boundary_source: 'how this sortie was bounded from the next. Values: "phaseml_landed_full_stop:{no_new_takeoff|crew_swap_hour_marker|track_ended}" (phaseML hard signal — preferred), "gs_stop:{N}kt" (ground samples in the gap show the aircraft actually stopped at gs < 25 kt — catches tow rehooks and full-stop landings even when type-based threshold says merge), "ground_threshold" (type-based merge fired on gap duration alone), "track_end" (last sortie of the day, clean end), "track_edge" (last sortie of the day, still airborne).',
                 sortie_related_sorties: 'cross-sortie glider ↔ tow pairings. A pair fires when [takeoff_ts, landing_ts] windows overlap ≥ 30 s AND ≥ 50 % of the tow plane\'s real fixes during the overlap have a nearest-time glider fix within 900 ft lateral + 300 ft vertical. Entries are bidirectional — the tow row carries role="towed_glider" pointing at the glider sortie, the glider row carries role="tow_plane" pointing at the tow. mean_lateral_ft and mean_vertical_ft summarise the formation. Tow-side acceptance includes both type-flagged (PA25 etc.) AND auto-detected (auto_short_cycle_pattern) tracks so unknown-type tow planes still pair.',
                 sortie_landings:        'altitude-derived landing count via AGL hysteresis (low gate 300 ft, high gate 500 ft) walking REAL points only. touch_and_go = each high → low → high cycle; full_stop = sortie ended in the low state. total = touch_and_go + full_stop. Reads directly off the altitude track so it works on any sortie regardless of sortie_cycles (which counts airborne-session merges and can differ when ADS-B holds altitude through a brief dip).',
               },
