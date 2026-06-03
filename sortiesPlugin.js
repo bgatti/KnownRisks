@@ -77,13 +77,19 @@ async function getAcsMLIdentify() {
 }
 
 const SORTIE_GROUND_MS = 5 * 60_000
-// Gliders AND tow planes turn around faster than typical powered
-// aircraft: unhitch, pull back to launch position, hook the next
-// tow. 2-3 min is normal at busy glider ops (KBDU on a thermal day).
-// With the 5-min powered threshold, two adjacent tow sorties (or
-// glider sorties) get merged into one bogus "double tow." Operator
-// brief 2026-06-02.
+// Gliders turn around faster than typical powered aircraft. 2-3 min
+// is normal at busy glider ops (KBDU on a thermal day). With the
+// 5-min powered threshold, two adjacent glider sorties get merged
+// into one bogus "double flight." Operator brief 2026-06-02.
 const SORTIE_GROUND_MS_SHORT_TURN = 2 * 60_000
+// Tow planes — each climb tows a (potentially different) glider, so
+// every land+rehook cycle is a new sortie. Threshold is low enough
+// to split any actual stop on the runway / taxiway (typical re-hook
+// is 30-60 s) but tolerant of a brief touch-and-go-style ground
+// blip from a single ADS-B fix dipping below the ceiling. Operator
+// brief 2026-06-03: "3 passes over the runway calculated at 3 kts.
+// that is a stop, a connect, and a new sortie."
+const SORTIE_GROUND_MS_TOW_PLANE = 20_000
 // Tow-plane type codes — Pawnee / Super Cub / Pilatus Porter / PC-6.
 // Same set the server's `purposeOf` regex uses for `tow_plane`.
 const TOW_PLANE_TYPE_RE = /^(PA25|PA18|PIAT|PC6)$/
@@ -498,8 +504,14 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             // tow."
             const sortieIsGlider = isEnginelessType(sortieTrack.type || '')
             const sortieIsTowPlane = isTowPlaneType(sortieTrack.type || '')
-            const sortieShortTurn = sortieIsGlider || sortieIsTowPlane
-            const sortieGroundMsForType = sortieShortTurn ? SORTIE_GROUND_MS_SHORT_TURN : SORTIE_GROUND_MS
+            // Tow planes get the tightest threshold — every climb is a
+            // new sortie because each tow may pull a different glider.
+            // Gliders get the 2-min short-turn threshold. Default
+            // powered aircraft keep 5 min so a single T&G/full-stop-
+            // taxi-back doesn't fragment one flight into several.
+            const sortieGroundMsForType = sortieIsTowPlane ? SORTIE_GROUND_MS_TOW_PLANE
+              : sortieIsGlider ? SORTIE_GROUND_MS_SHORT_TURN
+              : SORTIE_GROUND_MS
             const sortieList = detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMsForType)
             for (const s of sortieList) {
               const sortieStartPt = sortieAllPts[s.s]
