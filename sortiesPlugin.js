@@ -1850,6 +1850,31 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                     }
                   }
                 }
+
+                // Smooth per-fix throttle with a rolling median to
+                // suppress jitter from mode-C 100 ft quantization and
+                // gs sample-rate variation, while preserving phase-
+                // scale structure (climbs ~ 30-90 s, descents similar).
+                // Operator directive 2026-06-03: pattern flights should
+                // show climb / cruise / descent regimes, not frenetic
+                // per-fix bouncing. Window = ±2 real fixes (≈ 25 s at
+                // typical 5 s ADS-B cadence). Nulls preserved per the
+                // sortie_evaluation_rules contract — only real-fix
+                // entries get smoothed, and only against other real-fix
+                // entries in the window.
+                const SORTIE_THROTTLE_SMOOTH_RADIUS = 2
+                const raw = sortiePathThrottle.slice()
+                for (let k = 0; k < sortiePathThrottle.length; k++) {
+                  if (raw[k] == null) continue
+                  const window = []
+                  const lo = Math.max(0, k - SORTIE_THROTTLE_SMOOTH_RADIUS)
+                  const hi = Math.min(raw.length - 1, k + SORTIE_THROTTLE_SMOOTH_RADIUS)
+                  for (let m = lo; m <= hi; m++) {
+                    if (raw[m] != null) window.push(raw[m])
+                  }
+                  window.sort((a, b) => a - b)
+                  sortiePathThrottle[k] = window[Math.floor(window.length / 2)]
+                }
               }
 
               // Metrics over the FINAL path (post-amendment).
