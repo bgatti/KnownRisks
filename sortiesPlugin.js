@@ -1862,18 +1862,18 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                 // sortie_evaluation_rules contract — only real-fix
                 // entries get smoothed, and only against other real-fix
                 // entries in the window.
-                const SORTIE_THROTTLE_SMOOTH_RADIUS = 2
-                const raw = sortiePathThrottle.slice()
+                const SORTIE_THROTTLE_SMOOTH_RADIUS = 4
+                const rawThr = sortiePathThrottle.slice()
                 for (let k = 0; k < sortiePathThrottle.length; k++) {
-                  if (raw[k] == null) continue
-                  const window = []
+                  if (rawThr[k] == null) continue
+                  const win = []
                   const lo = Math.max(0, k - SORTIE_THROTTLE_SMOOTH_RADIUS)
-                  const hi = Math.min(raw.length - 1, k + SORTIE_THROTTLE_SMOOTH_RADIUS)
+                  const hi = Math.min(rawThr.length - 1, k + SORTIE_THROTTLE_SMOOTH_RADIUS)
                   for (let m = lo; m <= hi; m++) {
-                    if (raw[m] != null) window.push(raw[m])
+                    if (rawThr[m] != null) win.push(rawThr[m])
                   }
-                  window.sort((a, b) => a - b)
-                  sortiePathThrottle[k] = window[Math.floor(window.length / 2)]
+                  win.sort((a, b) => a - b)
+                  sortiePathThrottle[k] = win[Math.floor(win.length / 2)]
                 }
               }
 
@@ -2593,6 +2593,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
             sortie_invariant: 'sortie_noise_segments[i].points === sortie_path.slice(point_index_start, point_index_end + 1) for every entry. Every point in a noise.type="pop" slice has quality="real" (pop is computed from real-only windows). Reports and vnap entries may include repaired points; their indices still walk through sortie_path[].',
             sortie_path_format: '[lat, lon, alt_msl_corrected_ft, ts_ms, quality] — quality ∈ {"real", "repaired"}. sortie_path_gaps lists "broken" coverage breaks; render those as hint lines, not solid path. sortie_path_throttle[i] is a parallel array of 0..1 throttle estimates aligned with sortie_path[i]; null entries mean either repaired/engineless or no prior real fix within 60 s.',
             sortie_throttle_model: 'climb_fraction + level_flight_fraction. climb_fraction = max(0, vs_fpm / vs_max_fpm); level_flight_fraction = (gs_kts / cruise_kts)^3 × cruise_throttle. Table-anchored (aircraftPerf.js) with sea-level vs_max + cruise derated ~3 %/1000 ft for non-turbocharged engines. Indicator-grade — wind, density altitude (without OAT), and turbo critical alts not modelled. See sortie_performance.throttle_at_takeoff as the per-sortie sanity check: ~1.0 means the table matches the airframe; << 0.9 means vs_max is over-reported in the table.',
+            sortie_throttle_smoothing: 'rolling median, radius=4 fixes (~45 s at 5 s ADS-B cadence). Suppresses per-fix mode-C 100 ft quantization jitter while preserving 30-90 s phase regimes (climb/cruise/descent). Nulls preserved.',
             sortie_evaluation_rules: {
               // Load-bearing operator contract 2026-06-02: the path
               // carries three categories of data with different
