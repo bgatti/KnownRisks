@@ -95,6 +95,62 @@ const TAILWHEEL_TYPES = new Set(
   (FAR_CURRENCY.rules.find(r => r.code === '61.57(a)(2)') || {}).type_codes_tailwheel_hint || [],
 )
 
+// ── Task applicability gates ───────────────────────────────────────────
+// Operator round-10 (2026-06-03): a curated review of detected
+// maneuvers surfaced cases where the maneuver shape was detected
+// correctly but the ACS task doesn't apply to that airframe role:
+//   - gliders thermalling LOOK like steep turns / S-turns / slow
+//     flight, but Private Pilot Airplane ACS (FAA-S-ACS-6B) is for
+//     POWERED aircraft only — gliders have their own ACS
+//   - tow planes after release DIVE aggressively (1500-2500 fpm in a
+//     descending turn) which mimics IX.A Emergency Descent and
+//     VII.B Power-Off Stalls. It's intentional descent, not training.
+//   - the post-release tow-plane spiral over the field looks like
+//     V.D Turns Around a Point because phaseML's TAP detector
+//     catches sustained orbital descent.
+//
+// Cleanest fix: skip task assignment for inapplicable type+task
+// combinations. The phaseML detection still fires (we don't lie
+// about what's happening kinematically) — we just don't promote
+// it to an ACS task that doesn't apply.
+// Schleicher gliders are AS20-AS39 (ASK-21/AS-26 etc.). Aerospatiale
+// helicopters are AS50 (AS-350), AS55 (AS-355), AS65 (AS-365). Use
+// AS[1-3]\d to match gliders without false-matching helicopters.
+// AS32 collides (Schleicher ASK-32 vs Aerospatiale AS-332 Super Puma);
+// we accept the false-positive for the rare AS-332 case in favor of
+// keeping the common ASK-32 gliders correctly tagged.
+const ENGINELESS_RE = /^(GLID|VENT|NIMB|DISC|SGS|ASTR|JS\d|LS\d|PIK|ASW|SZD|BALL)|^AS[1-3]\d|^DG\d/
+const TOW_PLANE_RE = /^(PA25|PA18|PIAT|PC6)$/
+
+// (taskCode, exclusion) — each row is one (code, type-bucket) pair to skip.
+// The 'why' string is for documentation; the code only uses task+match.
+const TASK_EXCLUSIONS = [
+  // Gliders — engineless airframes don't fall under PP Airplane ACS.
+  { task: 'V.A',   match: 'engineless', why: 'thermalling produces continuous tight banked turns; ACS V.A is one 360° (or 180°+180°)' },
+  { task: 'V.C',   match: 'engineless', why: 'inter-thermal traverses LOOK like S-turns across a road but the task is for powered ground reference' },
+  { task: 'V.D',   match: 'engineless', why: 'thermalling = continuous orbit; not a ground-reference maneuver' },
+  { task: 'VII.A', match: 'engineless', why: 'glider normal cruise is 40-60 KTAS — perpetually below typical powered-plane cruise; not slow-flight task' },
+  { task: 'VII.B', match: 'engineless', why: 'engineless — no power-off vs power-on distinction' },
+  { task: 'VII.C', match: 'engineless', why: 'engineless — no power to apply at stall break' },
+  { task: 'IX.A',  match: 'engineless', why: 'gliders descend by design — every flight is a descent, none is an emergency descent task' },
+  // Tow planes — post-release behaviour mimics several training maneuvers.
+  { task: 'V.D',   match: 'tow_plane',  why: 'post-release descent often spirals over the field; not a ground reference training maneuver' },
+  { task: 'VII.B', match: 'tow_plane',  why: 'post-release dive at idle has stall-recovery-like signature but is intentional energy management' },
+  { task: 'IX.A',  match: 'tow_plane',  why: 'post-release dive at 1500-2500 fpm with bank is intentional descent to re-position for next tow' },
+]
+
+function isTaskApplicable(taskCode, typeCode) {
+  const T = String(typeCode || '').toUpperCase()
+  const isEngineless = ENGINELESS_RE.test(T)
+  const isTowPlane = TOW_PLANE_RE.test(T)
+  for (const rule of TASK_EXCLUSIONS) {
+    if (rule.task !== taskCode) continue
+    if (rule.match === 'engineless' && isEngineless) return false
+    if (rule.match === 'tow_plane' && isTowPlane) return false
+  }
+  return true
+}
+
 /**
  * Identify ACS tasks demonstrated on this flight + emit FAR currency
  * events for each takeoff/landing.
@@ -185,12 +241,21 @@ export function identifyAcsSegments(points, { typeCode = '', tail = '' } = {}) {
   //
   // Task-map build happens AFTER takeoff events are computed below.
   const detTaskPairs = []        // { det, code, taskDef }
+  const excludedByType = new Map()    // taskCode → count
   for (const det of detections) {
     const hits = SIGNAL_INDEX.get(det.type) || []
     for (const h of hits) {
       if (!selectorMatches(h.task.selector, det)) continue
+      if (!isTaskApplicable(h.code, typeCode)) {
+        excludedByType.set(h.code, (excludedByType.get(h.code) || 0) + 1)
+        continue
+      }
       detTaskPairs.push({ det, code: h.code, taskDef: h.task })
     }
+  }
+  if (excludedByType.size > 0) {
+    const summary = [...excludedByType.entries()].map(([k, v]) => `${k}=${v}`).join(', ')
+    out.notes.push(`type-applicability: skipped ${summary} for type ${typeCode || '?'} (see TASK_EXCLUSIONS)`)
   }
 
   // Pattern-phase duration computed up-front; III.B Traffic Patterns
