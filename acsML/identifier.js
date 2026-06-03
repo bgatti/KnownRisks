@@ -17,6 +17,7 @@ import { extractAcsSignals } from './features.js'
 import { nearestAirport } from '../phaseML/airports.js'
 import { isFaaNight } from './suntimes.js'
 import { scoreFlight } from './scoring.js'
+import { computeClimbMetrics } from './climbMetrics.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -383,6 +384,12 @@ export function identifyAcsSegments(points, { typeCode = '', tail = '' } = {}) {
     const ph = phaseLabels[i]?.phase
     if (phaseSeconds[ph] !== undefined) phaseSeconds[ph] += dt
   }
+  // Climb / altitude metrics — initial climb rate (every aircraft) +
+  // sortie peak altitude + tow-cycle release points & avg climb rates
+  // (when the alt-curve has 2+ climb-then-descent peaks). All sourced
+  // from phaseML's enriched VS series.
+  const climb = computeClimbMetrics(samples, takeoffs)
+
   out.phase_summary = {
     total_active_s: Object.values(phaseSeconds).reduce((a, b) => a + b, 0),
     phase_seconds: phaseSeconds,
@@ -394,6 +401,14 @@ export function identifyAcsSegments(points, { typeCode = '', tail = '' } = {}) {
     n_night_landings: landings.filter(l => l.night).length,
     n_night_full_stop: landings.filter(l => l.night && l.type === 'landed_full_stop').length,
     n_night_touch_and_go: landings.filter(l => l.night && l.type === 'touch_and_go').length,
+    initial_climb: climb.initial_climb,    // one entry per takeoff: { mean_fpm, peak_fpm, duration_s, ... }
+    peak_alt: climb.peak_alt,              // { ts, msl_ft, agl_ft, nearest_airport, lat, lon } | null
+    // climb_cycles[]: any sustained climb-then-descent ≥ 1500 ft alt gain.
+    // Matches BOTH tow operations AND GA practice climbs (climb to
+    // practice area → maneuver → descend → repeat). Consumers wanting
+    // tow-only should filter by sortie_purpose === 'tow_plane' or
+    // type code (PA25/PA18/PIAT/PC6).
+    climb_cycles: climb.climb_cycles,
   }
 
   // Finalise tasks list.
