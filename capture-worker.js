@@ -18,7 +18,7 @@ import { NOISE_ZONES } from './src/noiseZones.js'
 // suggests further reduction.
 const CENTER = [40.0211, -105.0063]
 const RADIUS_NM = 25
-const POLL_MS = 5_000
+const POLL_MS = 15_000
 const ALT_MAX_FT = 11_000
 const SEVERITY = { yellow: 1, orange: 2, red: 3, purple: 4 }
 
