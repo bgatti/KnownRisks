@@ -65,10 +65,14 @@ export function trackPopImpact(points, popAt, distFn) {
 // without the segment-length term. Useful for per-point gradient coloring.
 // Same units as `pop × atten` inside impactSegments; scale is consistent
 // across points so clients can autoscale by percentile.
-export function pointImpact(lat, lon, alt, popAt) {
+// `opts.groundRefFt` overrides the default Front-Range constant for
+// per-airport ground reference (operator full-court press 2026-06-03
+// to use the queried airport's actual field elevation when known).
+export function pointImpact(lat, lon, alt, popAt, opts = {}) {
   if (!popAt) return 0
   const pop = popAt(lat, lon)
   if (!(pop > 0)) return 0
-  const agl = Math.max(POP_KERNEL.MIN_AGL_FT, (alt || 0) - POP_KERNEL.GROUND_REF_FT)
+  const ground = Number.isFinite(opts.groundRefFt) ? opts.groundRefFt : POP_KERNEL.GROUND_REF_FT
+  const agl = Math.max(POP_KERNEL.MIN_AGL_FT, (alt || 0) - ground)
   return pop * ((POP_KERNEL.REF_AGL_FT / agl) ** 2)
 }

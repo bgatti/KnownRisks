@@ -573,9 +573,74 @@ function countSortieLandings(sortiePath, fieldElevFt) {
   }
 }
 
-// ── Altitude calibration (self-only — no cross-flight smoothing in
-// this surface; sorties are short enough that one calibration per
-// sortie is fine for the operator's amended_msl check) ────────────
+// ── Altitude calibration ──────────────────────────────────────────
+// Operator brief 2026-06-03: "if we are hitting AGL < 0 we are doing
+// it wrong / full court press on that / we need high quality
+// altitudes." Two layers now:
+//
+//   1. Cross-flight airport baro consensus (buildAirportBaroOffsets
+//      below). Pre-pass over the FULL track set in the request:
+//      collect the lowest-N MSL fixes per track within 2.5 nm of
+//      each known airport, take the per-airport median, subtract
+//      the published field elev to get a single offset per airport
+//      for the request. Mirrors what a hangar-room "QNH-by-consensus"
+//      check does — many flights independently report pressure-alt,
+//      their median over a given hour is the true baro bias.
+//
+//   2. Per-sortie self-cal (existing computeSortieAltOffset). Used
+//      when the consensus cohort is too thin (< 3 tracks at the
+//      airport) — the fallback for first/last flight of the day or
+//      a quiet field.
+//
+// The consensus replaces the old self-cal as the PRIMARY source so a
+// sparse-data sortie (e.g. a cross-country leg with only a handful of
+// fixes near the queried airport) inherits the same correction the
+// busier tracks established.
+
+const SORTIE_BARO_RADIUS_NM = 2.5
+const SORTIE_BARO_SAMPLES_PER_TRACK = 5
+const SORTIE_BARO_MIN_TRACKS = 3
+const SORTIE_BARO_MAX_OFFSET_FT = 800  // a true baro bias is < 600 ft; > 800 is data quality, drop it
+const SORTIE_ALT_QUALITY_ALERT_AGL_FT = -50
+
+function buildAirportBaroOffsets(tracks, enrichAp) {
+  const out = new Map()  // code -> { offset_ft, cohort_size, observed_median_msl, field_elev_ft, source }
+  if (!Array.isArray(tracks) || !tracks.length || !Array.isArray(enrichAp)) return out
+  const perAp = new Map()  // code -> array of low-alt samples (one batch per qualifying track)
+  for (const ap of enrichAp) perAp.set(ap.code, [])
+  for (const t of tracks) {
+    const pts = (t.points || []).filter(p => Array.isArray(p) && p.length >= 4 && p[2] != null)
+    if (!pts.length) continue
+    for (const ap of enrichAp) {
+      const near = []
+      for (const p of pts) {
+        if (distNmAp(p[0], p[1], ap.lat, ap.lon) <= SORTIE_BARO_RADIUS_NM) near.push(p[2])
+      }
+      if (near.length < 2) continue
+      near.sort((a, b) => a - b)
+      const low = near.slice(0, SORTIE_BARO_SAMPLES_PER_TRACK)
+      perAp.get(ap.code).push(...low)
+    }
+  }
+  for (const ap of enrichAp) {
+    const samples = perAp.get(ap.code)
+    if (!samples || samples.length < SORTIE_BARO_MIN_TRACKS * 2) continue
+    samples.sort((a, b) => a - b)
+    const median = samples[Math.floor(samples.length / 2)]
+    const offset = Math.round(median - ap.elev)
+    if (Math.abs(offset) > SORTIE_BARO_MAX_OFFSET_FT) continue
+    out.set(ap.code, {
+      offset_ft: offset,
+      cohort_size: samples.length,
+      observed_median_msl: Math.round(median),
+      field_elev_ft: ap.elev,
+      source: 'airport_consensus',
+    })
+  }
+  return out
+}
+
+// Per-sortie fallback when cross-flight consensus is unavailable.
 function computeSortieAltOffset(rawPath, sortieAp) {
   if (!sortieAp || !Array.isArray(rawPath) || rawPath.length < SORTIE_ALT_CAL_MIN) {
     return { offset_ft: 0, source: 'none', cohort: 0 }
@@ -751,7 +816,11 @@ function findSortieMaxPopSegment(sortiePath, popAt, sortieFieldElevFt, opts = {}
       if (!(ft > 0)) continue
       const midAlt = ((a[2] || 0) + (b[2] || 0)) / 2
       const pop = popAt((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
-      const agl = Math.max(POP_KERNEL.MIN_AGL_FT, midAlt - POP_KERNEL.GROUND_REF_FT)
+      // Operator full-court press 2026-06-03: use the sortie's
+      // actual field elevation as the ground reference, NOT the
+      // global POP_KERNEL.GROUND_REF_FT (5300 ft constant — off
+      // by 600-900 ft at KAPA / KCOS / KEGE).
+      const agl = Math.max(POP_KERNEL.MIN_AGL_FT, midAlt - (sortieFieldElevFt || POP_KERNEL.GROUND_REF_FT))
       const atten = (POP_KERNEL.REF_AGL_FT / agl) ** 2
       const thrA = pathThrottle ? pathThrottle[k - 1] : null
       const thrB = pathThrottle ? pathThrottle[k] : null
@@ -1356,6 +1425,11 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
             } catch { sortieLive = { tracks: [] }; sortieSource = 'empty' }
           }
           const sortieTracks = sortieLive.tracks || []
+          // Cross-flight airport baro consensus — pre-pass over the
+          // full track set BEFORE per-sortie work. Operator full-court-
+          // press: high-quality altitudes are the load-bearing input
+          // to every downstream metric.
+          const sortieAirportBaroOffsets = buildAirportBaroOffsets(sortieTracks, ENRICH_AP)
 
           // Schools index for operator resolution.
           const schoolsIdx = loadSchoolsIndex()
@@ -1504,7 +1578,26 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
               }
 
               // Path quality passes: alt offset + bridge.
-              const altCal = computeSortieAltOffset(rawPath, sortieAp)
+              // Calibration order (operator full-court press 2026-06-03):
+              //   1. Airport consensus from the cross-flight pre-pass at
+              //      the QUERIED airport (where the sortie is being
+              //      anchored). Robust to sparse-data tracks.
+              //   2. Per-sortie self-cal fallback when consensus is
+              //      unavailable for the queried airport.
+              //   3. No-op (offset=0) when both are unavailable.
+              const consensus = sortieAirportBaroOffsets.get(sortieAirport)
+              let altCal
+              if (consensus) {
+                altCal = {
+                  offset_ft: consensus.offset_ft,
+                  source: 'airport_consensus',
+                  cohort: consensus.cohort_size,
+                  observed_median_msl: consensus.observed_median_msl,
+                  field_elev_ft: consensus.field_elev_ft,
+                }
+              } else {
+                altCal = computeSortieAltOffset(rawPath, sortieAp)
+              }
               const bridged = bridgeSortiePath(rawPath, altCal.offset_ft)
               const sortiePath = bridged.path
               if (sortiePath.length < 3) continue
@@ -1594,7 +1687,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                   const p = sortiePath[k]
                   if (p[4] !== 'real') continue
                   if (p[0] == null || p[1] == null) continue
-                  const v = pointImpact(p[0], p[1], p[2] || 0, sortiePopAt)
+                  const v = pointImpact(p[0], p[1], p[2] || 0, sortiePopAt, { groundRefFt: sortieFieldElev })
                   // Throttle-weight per fix so the heat overlay
                   // agrees with the segment chip (operator brief
                   // 2026-06-03). Idle fix at the same lat/lon as a
@@ -1920,6 +2013,30 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                   unbridged_gap_count: bridged.gaps.length,
                   unbridged_max_gap_s: bridged.gaps.reduce((m, g) => Math.max(m, g.gap_seconds), 0),
                 },
+                // Operator full-court press 2026-06-03 — surface
+                // altitude provenance + a min-AGL sanity check so
+                // downstream consumers can refuse to rely on bad
+                // calibration. alert=true means at least one real fix
+                // resolved to MSL < field_elev − 50 ft post-amendment
+                // (the bias correction did not converge).
+                sortie_alt_quality: (() => {
+                  let minMsl = Infinity
+                  for (const p of sortiePath) {
+                    if (p[4] !== 'real' || p[2] == null) continue
+                    if (p[2] < minMsl) minMsl = p[2]
+                  }
+                  const minAgl = Number.isFinite(minMsl) ? Math.round(minMsl - sortieFieldElev) : null
+                  return {
+                    source: altCal.source,
+                    offset_ft: altCal.offset_ft,
+                    cohort: altCal.cohort,
+                    observed_median_msl: altCal.observed_median_msl ?? null,
+                    field_elev_ft: sortieFieldElev,
+                    min_real_msl: Number.isFinite(minMsl) ? Math.round(minMsl) : null,
+                    min_real_agl: minAgl,
+                    alert: minAgl != null && minAgl < SORTIE_ALT_QUALITY_ALERT_AGL_FT,
+                  }
+                })(),
                 // Coverage breaks the bridger refused — the polyline
                 // must NOT be drawn through these or it becomes a
                 // misleading straight line. `before_index` is the
@@ -2193,6 +2310,39 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
             // 2026-06-03 operator brief: "I need to be able to request a
             // sample of flights that covers the maneuvers."
             sortie_acs_index: sortieAcsIndex,
+            // Operator full-court press 2026-06-03 — altitude
+            // calibration diagnostics surfaced at the top so a single
+            // look at the payload says whether altitudes are sane.
+            sortie_airport_baro_offsets: Object.fromEntries(
+              [...sortieAirportBaroOffsets.entries()].map(([code, v]) => [
+                code,
+                { offset_ft: v.offset_ft, cohort_size: v.cohort_size, observed_median_msl: v.observed_median_msl, field_elev_ft: v.field_elev_ft },
+              ])
+            ),
+            sortie_alt_quality_summary: (() => {
+              let ok = 0, alert = 0, no_cal = 0
+              let minAglObserved = Infinity
+              const alerts = []
+              for (const row of sortieResults) {
+                const q = row.sortie_alt_quality
+                if (!q) { no_cal++; continue }
+                if (q.alert) {
+                  alert++
+                  alerts.push({ sortie_id: row.sortie_id, tail: row.sortie_tail, min_real_agl: q.min_real_agl, alt_offset_source: q.source })
+                } else {
+                  ok++
+                }
+                if (q.min_real_agl != null && q.min_real_agl < minAglObserved) minAglObserved = q.min_real_agl
+              }
+              return {
+                ok,
+                alert,
+                no_cal,
+                min_real_agl_observed: Number.isFinite(minAglObserved) ? minAglObserved : null,
+                alert_threshold_ft: SORTIE_ALT_QUALITY_ALERT_AGL_FT,
+                alert_rows: alerts.slice(0, 10),
+              }
+            })(),
             // Ask #15c — pop_grade rule echoed so client fallbacks
             // agree on the score → letter mapping.
             sortie_pop_grade_rule: SORTIE_POP_GRADE_RULE,
