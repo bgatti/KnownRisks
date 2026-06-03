@@ -812,10 +812,28 @@ function findSortieMaxPopSegment(sortiePath, popAt, sortieFieldElevFt, opts = {}
       const w = throttleWeight(thr)
       const weightedPop = popv * w
       if (weightedPop > sortiePeakPop) sortiePeakPop = weightedPop
-      const agl = Math.max(100, (p[2] || 0) - (sortieFieldElevFt || 0))
-      const baseDba = 75
-      const atten = agl > 1000 ? 6 * Math.log2(agl / 1000) : 0
-      const dba = Math.max(0, baseDba - atten + throttleDbAdjust(thr))
+      // Literature-based dBA model (operator + research 2026-06-03):
+      //   - Source LAmax 76 dB(A) reference (FAR Part 36 App. G,
+      //     C-172 cert limit at 1000 ft slant).
+      //   - Phase-aware base: high-throttle ≈ source; idle/approach
+      //     drops to ~ 65 dB(A) — matches the ~ 10 dB takeoff vs
+      //     approach delta measured in JASA 2017 C-172 and NASA NTRS
+      //     19920005568. Stronger than the bare 10·log10(throttle)
+      //     weighting which only captures intensity scaling.
+      //   - Geometric spreading anchored at 200 ft AGL (SAE-AIR-1845,
+      //     ISO 9613-2): 6 dB per doubling above 200, not above 1000.
+      //   - Atmospheric absorption ~ 1 dB / 1000 ft for the
+      //     propeller spectrum (SAE ARP 866A approximated at
+      //     25 °C / 70 % RH).
+      //   - Validity floor 200 ft AGL (National Academies 2014:
+      //     INM NPDs unvalidated below 200 ft slant).
+      const agl = Math.max(200, (p[2] || 0) - (sortieFieldElevFt || 0))
+      const baseDba = thr != null && thr >= 0.6
+        ? 76 + 10 * Math.log10(w)            // high-throttle scales gently from 76
+        : 65                                  // hard cap for low-throttle / unknown-low
+      const geomAtten = 20 * Math.log10(agl / 200)   // 6 dB / doubling above 200 ft AGL
+      const atmAtten = agl / 1000                    // ~ 1 dB / 1000 ft
+      const dba = Math.max(0, baseDba - geomAtten - atmAtten)
       if (dba > sortiePeakDba) sortiePeakDba = dba
     }
     if (sortiePeakPop <= 0) continue
@@ -908,12 +926,75 @@ async function loadComplaintsForSorties(db) {
 // bookends + literal points slice (S-6 invariant) — and carries a
 // noise.type (pop | report | vnap) with type-specific properties.
 // Lets the test page render all three with a single halo path.
-function buildSortieNoiseSegments({ sortiePath, sortieMaxPop, sortieComplaints, sortieZones, sortieFieldElevFt, sortieTakeoffMs, sortieLandingMs }) {
+// N12JA prompt 2026-06-03 — operator: "could we allow any segment to
+// pop up with its noise impact?" Compute the same noise kernel
+// (throttle-weighted, AGL-attenuated, population-aware) for ANY
+// segment regardless of type, using the same constants the
+// max-pop scorer uses. Returns the impact summary or null when the
+// kernel isn't applicable (missing inputs / engineless).
+function computeSegmentImpact(segPath, popAt, pathThrottle, sortieFieldElevFt, segStartIdx) {
+  if (!Array.isArray(segPath) || segPath.length < 2 || !popAt) return null
+  let peakPop = 0, peakDba = 0
+  let totalImpact = 0, lenFt = 0
+  let throttleSum = 0, throttleN = 0
+  for (let k = 0; k < segPath.length; k++) {
+    const p = segPath[k]
+    if (p[4] !== 'real') continue
+    if (p[0] == null || p[1] == null || p[2] == null) continue
+    const popv = popAt(p[0], p[1]) || 0
+    const absIdx = (segStartIdx ?? 0) + k
+    const thr = pathThrottle ? pathThrottle[absIdx] : null
+    if (typeof thr === 'number') { throttleSum += thr; throttleN++ }
+    const w = throttleWeight(thr)
+    const weightedPop = popv * w
+    if (weightedPop > peakPop) peakPop = weightedPop
+    // Same literature-anchored dBA model as findSortieMaxPopSegment.
+    const agl = Math.max(200, p[2] - sortieFieldElevFt)
+    const baseDba = thr != null && thr >= 0.6
+      ? 76 + 10 * Math.log10(w)
+      : 65
+    const geomAtten = 20 * Math.log10(agl / 200)
+    const atmAtten = agl / 1000
+    const dba = Math.max(0, baseDba - geomAtten - atmAtten)
+    if (dba > peakDba) peakDba = dba
+  }
+  for (let k = 1; k < segPath.length; k++) {
+    const a = segPath[k - 1], b = segPath[k]
+    if (a[0] == null || a[1] == null || b[0] == null || b[1] == null) continue
+    const ft = distFt(a[0], a[1], b[0], b[1])
+    lenFt += ft
+    if (!(ft > 0)) continue
+    const midAlt = ((a[2] || 0) + (b[2] || 0)) / 2
+    const pop = popAt((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+    const agl = Math.max(POP_KERNEL.MIN_AGL_FT, midAlt - (sortieFieldElevFt || POP_KERNEL.GROUND_REF_FT))
+    const atten = (POP_KERNEL.REF_AGL_FT / agl) ** 2
+    const absA = (segStartIdx ?? 0) + (k - 1)
+    const absB = (segStartIdx ?? 0) + k
+    const thrA = pathThrottle ? pathThrottle[absA] : null
+    const thrB = pathThrottle ? pathThrottle[absB] : null
+    const wMid = (throttleWeight(thrA) + throttleWeight(thrB)) / 2
+    totalImpact += ft * pop * atten * wMid
+  }
+  const impactIndex = lenFt > 0 ? (totalImpact / lenFt) / POP_SCALE_LOCAL : 0
+  const score = Math.max(0, Math.min(100, Math.round(impactIndex * SORTIE_IMPACT_SCALE)))
+  return {
+    score,
+    dba_peak: Math.round(peakDba),
+    density_peak: Math.round(peakPop),
+    length_nm: Math.round((lenFt / 6076.12) * 100) / 100,
+    avg_throttle: throttleN > 0 ? Math.round((throttleSum / throttleN) * 100) / 100 : null,
+  }
+}
+
+function buildSortieNoiseSegments({ sortiePath, sortieMaxPop, sortieComplaints, sortieZones, sortieFieldElevFt, sortieTakeoffMs, sortieLandingMs, sortiePopAt, sortiePathThrottle }) {
   const out = []
   // ── pop: project from the existing max-pop window. Same literal-
   //    slice invariant as sortie_max_pop_segment.
   if (sortieMaxPop) {
     const pts = sortiePath.slice(sortieMaxPop.startIdx, sortieMaxPop.endIdx + 1)
+    const popImpact = sortiePopAt
+      ? computeSegmentImpact(pts, sortiePopAt, sortiePathThrottle, sortieFieldElevFt, sortieMaxPop.startIdx)
+      : null
     out.push({
       noise: {
         type: 'pop',
@@ -922,6 +1003,7 @@ function buildSortieNoiseSegments({ sortiePath, sortieMaxPop, sortieComplaints, 
           dba_peak: sortieMaxPop.dba_peak,
           density_peak: sortieMaxPop.density_peak,
           length_nm: sortieMaxPop.length_nm,
+          impact: popImpact,
         },
       },
       point_index_start: sortieMaxPop.startIdx,
@@ -956,6 +1038,7 @@ function buildSortieNoiseSegments({ sortiePath, sortieMaxPop, sortieComplaints, 
       e = sortiePath.length - 1
     }
     const pts = sortiePath.slice(s, e + 1)
+    const repImpact = sortiePopAt ? computeSegmentImpact(pts, sortiePopAt, sortiePathThrottle, sortieFieldElevFt, s) : null
     out.push({
       noise: {
         type: 'report',
@@ -968,6 +1051,7 @@ function buildSortieNoiseSegments({ sortiePath, sortieMaxPop, sortieComplaints, 
           observed_ts_start: c.startedAt || null,
           observed_ts_end: c.endedAt || c.startedAt || null,
           notes: c.notes || null,
+          impact: repImpact,
         },
       },
       point_index_start: s,
@@ -1005,6 +1089,7 @@ function buildSortieNoiseSegments({ sortiePath, sortieMaxPop, sortieComplaints, 
             const pts = sortiePath.slice(runStart, e + 1)
             const ceilingFt = zone.ceiling_ft || null
             const floorViolated = ceilingFt != null && (aglMin + sortieFieldElevFt) > ceilingFt
+            const vnapImpact = sortiePopAt ? computeSegmentImpact(pts, sortiePopAt, sortiePathThrottle, sortieFieldElevFt, runStart) : null
             out.push({
               noise: {
                 type: 'vnap',
@@ -1022,6 +1107,7 @@ function buildSortieNoiseSegments({ sortiePath, sortieMaxPop, sortieComplaints, 
                   // crossed.
                   severity: 'advisory',
                   floor_violated: floorViolated,
+                  impact: vnapImpact,
                 },
               },
               point_index_start: runStart,
@@ -1600,7 +1686,16 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
               //      anchored). Robust to sparse-data tracks.
               //   2. Per-sortie self-cal fallback when consensus is
               //      unavailable for the queried airport.
-              //   3. No-op (offset=0) when both are unavailable.
+              //   3. Per-sortie BUMP (added 2026-06-03 after the
+              //      operator flagged residual -225 AGL on busy tails):
+              //      if the consensus would still leave any real fix
+              //      below field_elev - 50 ft, bump the offset further
+              //      so the lowest real fix lands at exactly -50 ft AGL.
+              //      Guarantees no real point ever resolves below
+              //      −50 AGL post-correction — the only cost is a
+              //      systematic bias upward when individual tracks
+              //      have higher altimeter setting noise than the
+              //      consensus captured.
               const consensus = sortieAirportBaroOffsets.get(sortieAirport)
               let altCal
               if (consensus) {
@@ -1613,6 +1708,29 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                 }
               } else {
                 altCal = computeSortieAltOffset(rawPath, sortieAp)
+              }
+              // Per-sortie bump probe: walk raw points, find min, apply
+              // current offset, check if it lands below the alert
+              // threshold. If yes, make the offset more negative so the
+              // min lands exactly at -50 AGL.
+              const SORTIE_AGL_GUARANTEE_FT = -50
+              let probeMinMsl = Infinity
+              for (const p of rawPath) {
+                if (p[2] == null) continue
+                if (p[2] < probeMinMsl) probeMinMsl = p[2]
+              }
+              if (Number.isFinite(probeMinMsl)) {
+                const minMslAfter = probeMinMsl - altCal.offset_ft
+                const minAglAfter = minMslAfter - sortieFieldElev
+                if (minAglAfter < SORTIE_AGL_GUARANTEE_FT) {
+                  const bump = minAglAfter - SORTIE_AGL_GUARANTEE_FT  // negative
+                  altCal = {
+                    ...altCal,
+                    offset_ft: altCal.offset_ft + bump,
+                    source: altCal.source + '+per_sortie_bump',
+                    bump_ft: bump,
+                  }
+                }
               }
               const bridged = bridgeSortiePath(rawPath, altCal.offset_ft)
               const sortiePath = bridged.path
@@ -2101,6 +2219,8 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                 sortieFieldElevFt: sortieFieldElev,
                 sortieTakeoffMs: sortieStartPt[3] || 0,
                 sortieLandingMs: sortieEndPt[3] || 0,
+                sortiePopAt,
+                sortiePathThrottle,
               })
 
               sortieResults.push(sortieRow)
