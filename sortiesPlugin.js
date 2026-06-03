@@ -840,23 +840,30 @@ function findSortieMaxPopSegment(sortiePath, popAt, sortieFieldElevFt, opts = {}
   const pathThrottle = Array.isArray(opts.pathThrottle) ? opts.pathThrottle : null
   let sortieBest = null
   for (let i = 0; i < sortiePath.length; i++) {
-    // EVALUATION RULE — the max-pop window must contain ONLY real
-    // points. Repaired (synthesized) points are rendering aids and
-    // are not safe to score. Window starts must be on a real point;
-    // we skip any window that contains a repaired point.
+    // Window starts must be on a real point.
     if (sortiePath[i][4] !== 'real') continue
     let j = i
     while (j < sortiePath.length && (sortiePath[j][3] - sortiePath[i][3]) < SORTIE_MAX_POP_WINDOW_MS) j++
     const sortieEndIdx = j - 1
     if (sortieEndIdx - i < 2) continue
-    let allReal = true
+    // EVALUATION RULE (relaxed 2026-06-03): the all-real requirement
+    // dropped pop segments on sortie paths where the bridger inserts
+    // repaired fixes between every real pair (irregular ADS-B cadence
+    // > SORTIE_BRIDGE_GAP_MS produces this pattern). Now: require at
+    // least 2 real fixes in the window for peak detection, but allow
+    // repaired fixes inside. Peak pop / peak dBA are computed from
+    // REAL fixes only (repaired are still excluded from scoring); the
+    // integral runs across all points so the segment length matches
+    // sortie_path slicing.
+    let realInWindow = 0
     for (let k = i; k <= sortieEndIdx; k++) {
-      if (sortiePath[k][4] !== 'real') { allReal = false; break }
+      if (sortiePath[k][4] === 'real') realInWindow++
     }
-    if (!allReal) continue
+    if (realInWindow < 2) continue
     let sortiePeakPop = 0, sortiePeakDba = 0
     for (let k = i; k <= sortieEndIdx; k++) {
       const p = sortiePath[k]
+      if (p[4] !== 'real') continue   // peak detection: real fixes only
       const popv = popAt(p[0], p[1]) || 0
       const thr = pathThrottle ? pathThrottle[k] : null
       const w = throttleWeight(thr)
