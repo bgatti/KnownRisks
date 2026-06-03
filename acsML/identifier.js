@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 import { extractAcsSignals } from './features.js'
 import { nearestAirport } from '../phaseML/airports.js'
 import { isFaaNight } from './suntimes.js'
+import { scoreFlight } from './scoring.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -53,6 +54,12 @@ function selectorMatches(selector, det) {
     if (!m) return selector === 'pre_vs_negative'   // default to power-off when unknown
     const breakVs = parseInt(m[1], 10)
     return selector === 'pre_vs_negative' ? breakVs < 0 : breakVs > 0
+  }
+  // 'spiraling' — used by IX.A Emergency Descent. Routine airline /
+  // biz-jet step-down descents fire phaseML's emergency_descent
+  // without a turn; ACS IX.A requires the 30-45° bank.
+  if (selector === 'spiraling') {
+    return det.evidence && det.evidence.spiraling === true
   }
   return true
 }
@@ -210,6 +217,8 @@ export function identifyAcsSegments(points, { typeCode = '', tail = '' } = {}) {
     const apLat = ap.airport?.lat ?? to.lat
     const apLon = ap.airport?.lon ?? to.lon
     const night = isFaaNight(to.ts, apLat, apLon)
+    to.night = night
+    to.airport = apIcao
     out.currency_events.push({
       rule: '61.57(a)', kind: 'takeoff', ts: to.ts,
       airport: apIcao, lat: to.lat, lon: to.lon, night,
@@ -231,6 +240,9 @@ export function identifyAcsSegments(points, { typeCode = '', tail = '' } = {}) {
     const night = isFaaNight(ld.ts, apLat, apLon)
     const isFullStop = ld.type === 'landed_full_stop'
     const isTailwheel = TAILWHEEL_TYPES.has(String(typeCode || '').toUpperCase())
+    // Annotate the landing record for counts further down.
+    ld.night = night
+    ld.airport = apIcao
 
     // 61.57(a) — counts touch_and_go OR landed_full_stop (unless tailwheel).
     if (!isTailwheel || isFullStop) {
@@ -278,11 +290,20 @@ export function identifyAcsSegments(points, { typeCode = '', tail = '' } = {}) {
     n_landings: landings.length,
     n_touch_and_go: landings.filter(l => l.type === 'touch_and_go').length,
     n_full_stop: landings.filter(l => l.type === 'landed_full_stop').length,
+    n_night_takeoffs: takeoffs.filter(t => t.night).length,
+    n_night_landings: landings.filter(l => l.night).length,
+    n_night_full_stop: landings.filter(l => l.night && l.type === 'landed_full_stop').length,
+    n_night_touch_and_go: landings.filter(l => l.night && l.type === 'touch_and_go').length,
   }
 
   // Finalise tasks list.
   out.tasks_demonstrated = [...taskMap.values()]
     .sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true }))
+
+  // ACS performance-standard scoring for the maneuvers that have a
+  // scorer (V.A, V.B, V.C, V.D). Other tasks need pilot-input data
+  // we don't have from track alone.
+  out.scores = scoreFlight(detections, samples)
 
   return out
 }

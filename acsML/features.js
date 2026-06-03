@@ -34,60 +34,84 @@ function makeDetection(type, samples, lo, hi, confidence, explanation, evidence)
 
 // ── ACS V.B Rectangular Course ─────────────────────────────────────────
 //
-// Four ~90° turns at AGL 600–1000 ft, legs roughly orthogonal,
-// tracing a rectangle around a fixed ground reference.
+// A rectangular course around a fixed ground reference. Per ACS:
+// four ~90° turns, legs of roughly equal length, AGL 600-1000 ft.
 //
-// Detection heuristic:
-//   - Look for runs of 4 consecutive turns each in [60°, 120°] in the
-//     SAME direction (all left or all right)
-//   - Total cumulative turn close to 360°
-//   - AGL stays in [400, 1500] (relaxed from ACS 600-1000)
-//   - Total span < 10 min
+// Detection: walk the samples, alternating between TURNING and
+// STRAIGHT-AND-LEVEL episodes. A turning episode accumulates signed
+// heading change; a straight episode resets it. The output is a
+// sequence of "turn events" each with the total signed deg.
+//
+// A rectangular course is 4 consecutive turn events same-direction
+// each in [60°, 120°] totaling ~360°, separated by straight legs of
+// 5-60s.
 export function detectRectangularCourse(samples) {
   const out = []
-  if (samples.length < 5) return out
-  const turns = []   // { startIdx, endIdx, deltaDeg }
-  let runStart = 0
-  let runDir = 0
-  let runSum = 0
+  if (samples.length < 10) return out
+
+  // Build per-sample instantaneous turn rate, then segment.
+  // A sample is "turning" if its absolute turn-rate exceeds ~1°/s
+  // OR the cumulative heading change in the last 4 s exceeds 10°.
+  const turning = new Array(samples.length).fill(false)
   for (let i = 1; i < samples.length; i++) {
-    if (samples[i].isSessionBreak) {
-      runStart = i; runDir = 0; runSum = 0; continue
-    }
-    const delta = signedHeadingChange(samples[i - 1].trackDeg, samples[i].trackDeg)
-    if (Math.abs(delta) < 5) continue
-    const sign = Math.sign(delta)
-    if (runDir === 0) { runDir = sign; runStart = i - 1; runSum = delta; continue }
-    if (sign !== runDir || Math.abs(runSum + delta) > 130) {
-      // End of run.
-      if (Math.abs(runSum) >= 60 && Math.abs(runSum) <= 120) {
-        turns.push({ startIdx: runStart, endIdx: i, deltaDeg: runSum })
-      }
-      runStart = i - 1; runDir = sign; runSum = delta
-    } else {
-      runSum += delta
-    }
+    if (samples[i].isSessionBreak) continue
+    if (Math.abs(samples[i].turnRateDps) > 1.5) turning[i] = true
   }
-  // Now scan turns for groups of 4 same-direction.
-  for (let i = 0; i + 3 < turns.length; i++) {
-    const grp = turns.slice(i, i + 4)
+
+  // Build turn events: runs of consecutive turning=true samples.
+  const turnEvents = []
+  let i = 0
+  while (i < samples.length) {
+    if (!turning[i]) { i++; continue }
+    let j = i
+    let signed = 0
+    while (j < samples.length && (turning[j] || (j > i && turning[j - 1] && Math.abs(samples[j].turnRateDps) > 0.5))) {
+      if (j > i) signed += signedHeadingChange(samples[j - 1].trackDeg, samples[j].trackDeg)
+      j++
+    }
+    const durS = samples[j - 1].point.tsUnix - samples[i].point.tsUnix
+    if (durS >= 3 && Math.abs(signed) >= 45 && Math.abs(signed) <= 135) {
+      turnEvents.push({ startIdx: i, endIdx: j - 1, deltaDeg: signed, durS })
+    }
+    i = j
+  }
+
+  // Scan groups of 4 consecutive same-direction turn events with
+  // small straight legs between them.
+  for (let k = 0; k + 3 < turnEvents.length; k++) {
+    const grp = turnEvents.slice(k, k + 4)
+    const dir = Math.sign(grp[0].deltaDeg)
+    if (!grp.every(t => Math.sign(t.deltaDeg) === dir)) continue
     const total = grp.reduce((s, t) => s + t.deltaDeg, 0)
-    if (Math.abs(Math.abs(total) - 360) > 30) continue
+    if (Math.abs(Math.abs(total) - 360) > 40) continue
+    // Straight legs between turns must be 5-60 s each.
+    let okLegs = true
+    for (let m = 0; m < 3; m++) {
+      const legS = samples[grp[m + 1].startIdx].point.tsUnix - samples[grp[m].endIdx].point.tsUnix
+      if (legS < 5 || legS > 90) { okLegs = false; break }
+    }
+    if (!okLegs) continue
+
     const lo = grp[0].startIdx
     const hi = grp[3].endIdx
-    const durS = samples[hi].point.tsUnix - samples[lo].point.tsUnix
-    if (durS < 60 || durS > 600) continue
+    const totalDurS = samples[hi].point.tsUnix - samples[lo].point.tsUnix
+    if (totalDurS > 600) continue
+
+    // AGL: median over the maneuver.
     const agls = []
-    for (let k = lo; k <= hi; k++) {
-      const { airport } = nearestAirport(samples[k].point.lat, samples[k].point.lon, { maxNm: 50 })
-      const a = airport ? samples[k].point.altMslFt - airport.fieldElevFt : samples[k].point.altMslFt
+    for (let m = lo; m <= hi; m++) {
+      const { airport } = nearestAirport(samples[m].point.lat, samples[m].point.lon, { maxNm: 50 })
+      const a = airport ? samples[m].point.altMslFt - airport.fieldElevFt : samples[m].point.altMslFt
       agls.push(a)
     }
     const aglMed = agls.sort((a, b) => a - b)[Math.floor(agls.length / 2)]
     if (aglMed < 400 || aglMed > 1500) continue
-    out.push(makeDetection('rectangular_course', samples, lo, hi, 0.8,
-      `4 same-direction turns averaging ${Math.abs(total) / 4 | 0}° each, AGL ${aglMed | 0} ft`,
-      { totalTurnDeg: total, aglFt: aglMed }))
+
+    out.push(makeDetection('rectangular_course', samples, lo, hi, 0.75,
+      `4 ${dir > 0 ? 'right' : 'left'}-hand ~${Math.abs(total / 4) | 0}° turns totaling ${Math.abs(total) | 0}°, AGL ${aglMed | 0} ft, ${(totalDurS / 60).toFixed(1)} min`,
+      { totalTurnDeg: total, aglFt: aglMed, direction: dir > 0 ? 'right' : 'left',
+        turnDeltas: grp.map(t => t.deltaDeg | 0) }))
+    k += 3   // don't double-count overlapping
   }
   return out
 }
@@ -176,6 +200,99 @@ export function detectUnusualAttitudeRecovery(samples) {
   return out
 }
 
+// ── ACS IX.B Emergency Approach and Landing (simulated) ──────────────────
+//
+// Per FAA ACS IX.B: pilot establishes best-glide speed, looks for a
+// suitable off-airport field, and flies a simulated power-off approach
+// (does not actually land).
+//
+// Track signature:
+//   - Sustained descent (VS < -300 fpm) starting from MODERATE AGL
+//     (typically 1500-4000 ft AGL — training is done above safe
+//     glide altitude)
+//   - Descent terminates AWAY from any airport (> 3 nm from any
+//     known field) below ~800 ft AGL, then power is restored and
+//     the aircraft climbs back out.
+//   - Energy signature: speed roughly stable (or trending toward
+//     ~65 kts for a piston single = best glide), VS strongly
+//     negative. Total mechanical energy
+//       E = 0.5 * V² + g * h
+//     decays at a rate consistent with drag-only descent
+//     (~3-5 kts equivalent altitude per second).
+//
+// We approximate "found a field" by: the lowest AGL fix during the
+// descent occurred MORE than 3 nm from any known airport AND was
+// followed by a sustained climb (VS > +300 fpm for 30+ s).
+//
+// Cannot perfectly distinguish a TRUE emergency from an INTENTIONAL
+// simulation. Both look the same from track. We label the detection
+// as a CANDIDATE for IX.B with low-to-medium confidence; the operator
+// can correlate with no_emergency_radio_call / no_actual_landing.
+export function detectEmergencyApproach(samples) {
+  const out = []
+  if (samples.length < 30) return out
+
+  for (let i = 0; i < samples.length; i++) {
+    // Find start of a sustained descent.
+    if (samples[i].isSessionBreak) continue
+    if (samples[i].vsFpm > -300) continue
+    let j = i
+    while (j + 1 < samples.length
+        && !samples[j + 1].isSessionBreak
+        && samples[j + 1].vsFpm <= -100) j++
+    const durS = samples[j].point.tsUnix - samples[i].point.tsUnix
+    if (durS < 60) { i = j + 1; continue }
+
+    // Endpoint AGL — must be < 800 AND > 3 nm from any airport.
+    const endPoint = samples[j].point
+    const apEnd = nearestAirport(endPoint.lat, endPoint.lon, { maxNm: 50 })
+    if (!apEnd.airport) { i = j + 1; continue }
+    const aglEnd = endPoint.altMslFt - apEnd.airport.fieldElevFt
+    if (aglEnd > 800 || apEnd.distanceNm < 3) { i = j + 1; continue }
+
+    // Recovery: VS > +300 fpm sustained 30+ s within the next 90 s.
+    let k = j + 1
+    let recoveryStart = -1
+    while (k < samples.length && samples[k].point.tsUnix - samples[j].point.tsUnix < 90) {
+      if (!samples[k].isSessionBreak && samples[k].vsFpm > 300) {
+        // Check sustained.
+        let m = k
+        while (m + 1 < samples.length
+            && !samples[m + 1].isSessionBreak
+            && samples[m + 1].vsFpm > 100
+            && samples[m + 1].point.tsUnix - samples[k].point.tsUnix < 60) m++
+        if (samples[m].point.tsUnix - samples[k].point.tsUnix >= 30) {
+          recoveryStart = k
+          break
+        }
+      }
+      k++
+    }
+    if (recoveryStart < 0) { i = j + 1; continue }
+
+    // Energy-loss sanity check: speed stable within ±20 kts (no rapid
+    // deceleration that would indicate a different maneuver).
+    const gsList = []
+    for (let m = i; m <= j; m++) gsList.push(samples[m].gsKts)
+    const gsRange = Math.max(...gsList) - Math.min(...gsList)
+    if (gsRange > 50) { i = j + 1; continue }
+
+    const altLost = samples[i].point.altMslFt - samples[j].point.altMslFt
+    const meanVs = (samples[j].point.altMslFt - samples[i].point.altMslFt) / durS * 60
+    const conf = Math.min(0.85,
+      0.4
+      + 0.2 * Math.min(1, altLost / 2000)
+      + 0.15 * (apEnd.distanceNm > 5 ? 1 : 0)
+      + 0.10 * (gsRange < 25 ? 1 : 0))
+    out.push(makeDetection('emergency_approach_landing', samples, i, j, conf,
+      `descent ${meanVs.toFixed(0)} fpm to ${aglEnd | 0} ft AGL, ${apEnd.distanceNm.toFixed(1)} nm from ${apEnd.airport.icao}, gs range ${gsRange | 0} kts, recovered to climb`,
+      { altLostFt: altLost, endAglFt: aglEnd, distFromAirportNm: apEnd.distanceNm,
+        gsRangeKts: gsRange, recoveryStartIdx: recoveryStart }))
+    i = recoveryStart
+  }
+  return out
+}
+
 // ── ACS-level extraction wrapper ────────────────────────────────────────
 //
 // Runs phaseML's detectors and the acsML-specific detectors over one
@@ -195,6 +312,7 @@ export function extractAcsSignals(points, { typeCode = '' } = {}) {
   acsDetections.push(...detectShortFieldLanding(samples, phaseLabels,
     phaseDetections.filter(d => d.type === 'landed_full_stop' || d.type === 'touch_and_go')))
   acsDetections.push(...detectUnusualAttitudeRecovery(samples))
+  acsDetections.push(...detectEmergencyApproach(samples))
 
   const merged = [...phaseDetections, ...acsDetections].sort((a, b) => a.startTs - b.startTs)
   return { samples, phaseLabels, detections: merged }

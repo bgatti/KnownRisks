@@ -298,14 +298,21 @@
             "bank": "30°–45° initial",
             "airspeed": "specified by AFM",
             "altitude_loss": "≥ 1000 ft if practicing to recovery"
-          }
+          },
+          "selector": "spiraling",
+          "notes": "Routine airline / biz-jet step-down descents trip the underlying phaseML emergency_descent detector (1200+ fpm sustained 30+ s) without bank. ACS IX.A requires the turn — selector='spiraling' filters to evidence.spiraling===true so only practice descents (which always include a 30-45° bank) count."
         },
         {
           "code": "IX.B",
           "name": "Emergency Approach and Landing (Simulated)",
           "detect": "partial",
-          "track_rule": "Power-off shallow circling descent toward a field, terminating at low AGL before climb-out (don't actually land).",
-          "notes": "From track alone, looks like a high tortuosity descent toward an off-airport landmark."
+          "phaseml_signals": ["emergency_approach_landing"],
+          "track_rule": "acsML emergency_approach_landing detector: sustained descent (VS < -300 fpm, 60+ s) terminating < 800 AGL more than 3 nm from any airport, followed by a sustained climb (recovery). Speed must stay within 50 kts range (no rapid deceleration).",
+          "performance_standard": {
+            "best_glide_speed": "1.3 VSO ±10 kts (≈ 65 KIAS for C172)",
+            "field_selection": "based on wind, suitable surface, obstacle clearance"
+          },
+          "notes": "Operator feedback (2026-06-01): proper IX.B looks like a power-off descent toward a chosen field with stable best-glide speed. From track, indistinguishable from a real emergency that recovered. Energy heuristic: total mechanical energy (KE + PE) decays at drag-only rate (~3-5 kts equivalent altitude per second) — to be added in v0.3."
         }
       ]
     },
