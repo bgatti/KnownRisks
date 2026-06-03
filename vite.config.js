@@ -3,6 +3,25 @@ import react from '@vitejs/plugin-react'
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
+
+// Process-level safety net for unhandled promise rejections. The DB
+// pool intermittently emits "Connection terminated due to connection
+// timeout" / "Connection terminated unexpectedly" from background
+// loadLiveFromDbByDateRange paths in other plugins (recent-landings,
+// leaderboards, etc.) when Railway's Postgres is under load. Without
+// this handler Node treats them as fatal and the whole process exits,
+// taking the sortie API and every other endpoint down with it. Log
+// loudly, then keep the process alive — every downstream surface
+// already has its own per-request try/catch + timeout.
+process.on('unhandledRejection', (reason) => {
+  const msg = reason && (reason.stack || reason.message || String(reason))
+  console.warn('[unhandledRejection] suppressed to keep service up:', msg)
+})
+process.on('uncaughtException', (err) => {
+  const msg = err && (err.stack || err.message || String(err))
+  console.warn('[uncaughtException] suppressed to keep service up:', msg)
+})
+
 import { loadPopGrid, impactSegments, pointImpact, POP_KERNEL } from './src/popGrid.js'
 import { distFt, classifyPoint, isEnginelessType } from './src/geo.js'
 import {
@@ -995,11 +1014,33 @@ function excursionsApiPlugin() {
           // "Cessna 172P (1981)").
           const schoolMap = new Map()
           const schoolAcDesc = new Map()
+          // Regex-based fallback rules. Each entry's regex matches a tail
+          // pattern (e.g. McAir's `^N\d+(SF|FF)$`) scoped to one airport,
+          // applied after the literal lookup misses. Sourced from each
+          // school's `tail_regexes` array.
+          const schoolRegexes = []
           for (const s of schoolsData.schools || []) {
             for (const ac of s.aircraft || []) {
               schoolMap.set(ac.tail, s.name)
               if (ac.type) schoolAcDesc.set(ac.tail, ac.type)
             }
+            const apCode = ((s.airport || '').split(/[\s/]/, 1)[0] || '').trim().toUpperCase()
+            for (const rx of (s.tail_regexes || [])) {
+              try { schoolRegexes.push({ regex: new RegExp(rx), name: s.name, airport: apCode }) }
+              catch (e) { console.error('[flights/current] bad tail_regex', s.name, rx, e.message) }
+            }
+          }
+          const resolveSchool = (tail, apCode) => {
+            if (!tail) return null
+            const key = String(tail).toUpperCase()
+            const hit = schoolMap.get(key)
+            if (hit) return hit
+            const ap = String(apCode || '').toUpperCase()
+            for (const r of schoolRegexes) {
+              if (r.airport && r.airport !== ap) continue
+              if (r.regex.test(key)) return r.name
+            }
+            return null
           }
           // Special-use registry — overrides type-code purpose for known
           // medivac, firefighting, law enforcement, military, etc. tails.
@@ -1071,12 +1112,14 @@ function excursionsApiPlugin() {
             if (pts.length < 5) continue
             const tail = t.call || t.reg || t.hex || '?'
             const type = t.type || ''
-            const school = schoolMap.get(tail) || null
+            const lastPt = pts[pts.length - 1]
+            const ap = nearAp(lastPt[0], lastPt[1])
+            // School lookup uses the nearest-airport code so regex rules
+            // (e.g. McAir's `^N\d+(SF|FF)$` scoped to KBJC) can fire.
+            const school = resolveSchool(tail, ap?.code)
             const specialUseRec = specialUseMap.get(tail)
             const purpose = purposeOf(type, tail, !!school, specialUseRec?.use)
             const description = descOf(type, tail)
-            const lastPt = pts[pts.length - 1]
-            const ap = nearAp(lastPt[0], lastPt[1])
 
             // ─── 3-min window (last 90 pts at 2s, or whatever we have) ───
             const WINDOW = 90
@@ -7238,12 +7281,13 @@ function adsbApiPlugin() {
           // school aircraft (e.g. N75FF / N53FF) don't have base_airport
           // set in the tracks DB but ARE listed in a school's aircraft[].
           // Cached per process; the file is static config.
-          if (!global.__SCHOOL_TAIL_AIRPORT) {
+          if (!global.__SCHOOL_TAIL_AIRPORT_DATA) {
             try {
               const { default: fs } = await import('fs/promises')
               const raw = await fs.readFile('public/flight_schools_fleets.json', 'utf8')
               const sf = JSON.parse(raw)
               const m = new Map()
+              const regexes = []
               for (const s of sf.schools || []) {
                 const sAp = (s.airport || '').split(/\s+/)[0].trim().toUpperCase() // "KBJC area" → "KBJC"
                 if (!sAp) continue
@@ -7251,11 +7295,31 @@ function adsbApiPlugin() {
                   const t = (ac.tail || '').trim().toUpperCase()
                   if (t && !m.has(t)) m.set(t, { airport: sAp, school: s.name || null })
                 }
+                for (const rx of (s.tail_regexes || [])) {
+                  try { regexes.push({ regex: new RegExp(rx), airport: sAp, school: s.name || null }) }
+                  catch { /* swallow malformed regex */ }
+                }
               }
-              global.__SCHOOL_TAIL_AIRPORT = m
-            } catch { global.__SCHOOL_TAIL_AIRPORT = new Map() }
+              global.__SCHOOL_TAIL_AIRPORT_DATA = { literal: m, regexes }
+            } catch { global.__SCHOOL_TAIL_AIRPORT_DATA = { literal: new Map(), regexes: [] } }
           }
-          const schoolMap = global.__SCHOOL_TAIL_AIRPORT
+          // Per-request wrapper. Regex rules only fire when the query
+          // airport matches the school's airport — keeps an SF-suffix
+          // tail at KBDU from being mis-attributed to McAir at KBJC.
+          const { literal: __schoolLiteral, regexes: __schoolRegexes } = global.__SCHOOL_TAIL_AIRPORT_DATA
+          const __apQ = String(airport || '').toUpperCase()
+          const schoolMap = {
+            get(key) {
+              const hit = __schoolLiteral.get(key)
+              if (hit) return hit
+              for (const r of __schoolRegexes) {
+                if (r.airport && r.airport !== __apQ) continue
+                if (r.regex.test(key)) return { airport: r.airport, school: r.school }
+              }
+              return undefined
+            },
+            has(key) { return this.get(key) !== undefined },
+          }
           const fleet = await adsb.loadFleet() // hex → { tail, operator, role } — currently only KBDU tow planes
 
           // Phase classifier — phaseML/oracle.js + maneuvers.js (the JS
@@ -8820,6 +8884,7 @@ function noiseExposurePlugin() {
       const raw = await fs.promises.readFile('public/flight_schools_fleets.json', 'utf8')
       const sf = JSON.parse(raw)
       const m = new Map()
+      const regexes = []
       for (const s of sf.schools || []) {
         const sAp = (s.airport || '').split(/\s+/)[0].trim().toUpperCase()
         if (!sAp) continue
@@ -8827,9 +8892,32 @@ function noiseExposurePlugin() {
           const t = (ac.tail || '').trim().toUpperCase()
           if (t && !m.has(t)) m.set(t, { airport: sAp, school: s.name || null })
         }
+        for (const rx of (s.tail_regexes || [])) {
+          try { regexes.push({ regex: new RegExp(rx), airport: sAp, school: s.name || null }) }
+          catch { /* skip malformed */ }
+        }
       }
-      global.__SCHOOL_TAIL_AIRPORT = m
-      return m
+      // Map-shaped wrapper: .get(tail) only — regex fallback applied
+      // ONLY if the tail's airport (from `baseInfo`/`inf.base` upstream)
+      // matches the school's airport. Callers without airport context
+      // pass undefined and miss regex hits — keeps cross-airport
+      // collisions safe.
+      const mapLike = {
+        get(tail, apForRegex) {
+          const hit = m.get(tail)
+          if (hit) return hit
+          const ap = String(apForRegex || '').toUpperCase()
+          if (!ap) return undefined
+          for (const r of regexes) {
+            if (r.airport && r.airport !== ap) continue
+            if (r.regex.test(tail)) return { airport: r.airport, school: r.school }
+          }
+          return undefined
+        },
+        has(tail, apForRegex) { return this.get(tail, apForRegex) !== undefined },
+      }
+      global.__SCHOOL_TAIL_AIRPORT = mapLike
+      return mapLike
     } catch { return new Map() }
   }
 
@@ -9048,7 +9136,7 @@ function noiseExposurePlugin() {
             const passes = segmentPasses(inRad)
             const tailU = (row.tail || '').toUpperCase()
             const inf = baseInfo.get(row.tail || '') || {}
-            const schoolEntry = schoolMap.get(tailU)
+            const schoolEntry = schoolMap.get(tailU, inf.base)
             const fleetEntry = fleet[row.hex]
             const operator =
               fleetEntry?.operator ||
