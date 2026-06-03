@@ -167,6 +167,26 @@ const SORTIE_ACS_TAXONOMY_FILTER = {
   tow_plane: { deny: ['IX.A', 'VII.B'] },
 }
 const SORTIE_ACS_CLASSIFIER_TYPE = 'private_pilot_airplane'
+
+// Ask S-16a — detector gates surface from acsML/climbMetrics.js
+// (climbCycleMetrics). Echoed at the top of every response so the
+// operator can audit gates without diving into source.
+const SORTIE_TOW_DETECTOR = 'climb_gain ≥ 1500 ft · climb_wallclock ≥ 180 s · mean_VS_active > 300 fpm · descent_after_peak ≥ 1500 ft · local-max detection allows session-break samples'
+
+// Locate the sortie_path index whose timestamp is closest to tsMs.
+// Used to translate acsML's per-cycle release_ts into a path-index
+// the test page can mark directly without re-walking the path.
+function findSortiePathIndexByTs(sortiePath, tsMs) {
+  if (!Array.isArray(sortiePath) || !sortiePath.length) return null
+  let lo = 0, hi = sortiePath.length - 1
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (sortiePath[mid][3] < tsMs) lo = mid + 1
+    else hi = mid
+  }
+  if (lo > 0 && Math.abs(sortiePath[lo - 1][3] - tsMs) < Math.abs(sortiePath[lo][3] - tsMs)) lo -= 1
+  return lo
+}
 const POP_SCALE_LOCAL = 100_000
 const SORTIE_PURPOSE_XC_NM = 15        // max-excursion threshold for cross_country
 const SORTIE_BRIDGE_GAP_MS = 15_000    // gap above this triggers bridge eval
@@ -1122,6 +1142,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
               // filtered to quality==='real' above; reuse it).
               let sortieAcs = null
               let sortieAcsAnnotations = null
+              let sortieTowReleases = null
               if (acsMLIdentifyFn) {
                 // Rebuild the real-points array in case the purposeML
                 // block was skipped (fn null path). acsRealToPathIdx[i]
@@ -1204,6 +1225,49 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                           evidence_type: seg.type,
                         })
                       }
+                      // Ask S-16a — project acsML's climb_cycles[]
+                      // (computed by climbMetrics.js with the operator's
+                      // detector gates) into the per-sortie wire shape.
+                      // Each cycle is a tow-release event (or a GA
+                      // practice climb-to-altitude — the detector is
+                      // shape-based, not type-based, so consumers wanting
+                      // tow-only should also gate on sortie_is_tow_plane
+                      // or sortie_purpose === 'tow_plane'). tow_ref is
+                      // wired in the cross-sortie pairing pass below.
+                      const climbCycles = a.phase_summary
+                        && Array.isArray(a.phase_summary.climb_cycles)
+                        ? a.phase_summary.climb_cycles : []
+                      if (climbCycles.length) {
+                        sortieTowReleases = []
+                        for (let ci = 0; ci < climbCycles.length; ci++) {
+                          const c = climbCycles[ci]
+                          const releaseTsMs = c.release_ts * 1000
+                          const climbStartTsMs = c.cycle_start_ts * 1000
+                          const releaseIdx = findSortiePathIndexByTs(sortiePath, releaseTsMs)
+                          const avgWallclockFpm = c.climb_duration_s > 0
+                            ? Math.round((c.climb_alt_gain_ft / c.climb_duration_s) * 60)
+                            : null
+                          sortieTowReleases.push({
+                            cycle_index: ci + 1,
+                            release_ts: new Date(releaseTsMs).toISOString(),
+                            release_lat: c.release_lat,
+                            release_lon: c.release_lon,
+                            release_alt_msl_ft: c.release_msl_ft,
+                            release_alt_agl_ft: c.release_agl_ft,
+                            release_nearest_airport: c.nearest_airport || null,
+                            climb_start_ts: new Date(climbStartTsMs).toISOString(),
+                            climb_origin_alt_msl_ft: c.climb_origin_msl_ft,
+                            climb_gain_ft: c.climb_alt_gain_ft,
+                            climb_wallclock_s: c.climb_duration_s,
+                            climb_active_s: c.climb_active_s,
+                            avg_climb_rate_fpm: c.avg_climb_rate_fpm,
+                            avg_climb_rate_wallclock_fpm: avgWallclockFpm,
+                            release_path_index: releaseIdx,
+                            detector_confidence: 0.9,
+                            tow_ref: null,
+                          })
+                        }
+                      }
                     }
                   } catch (err) {
                     console.warn('[sorties] acsML identify error for', sortieTail, err && err.message)
@@ -1282,6 +1346,14 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 // resolve through sortie_path so the halo-renderer can
                 // bracket the segment without index gymnastics.
                 sortie_annotations: sortieAcsAnnotations,
+                // Per-cycle tow release blob — see Ask S-16a. Each
+                // entry projects from acsML's climb_cycles[] and adds
+                // release_path_index (resolved against sortie_path)
+                // plus avg_climb_rate_wallclock_fpm and cycle_index.
+                // tow_ref is populated in the cross-sortie pairing
+                // pass below the sortie loop. null on sorties whose
+                // climb shape didn't pass the detector gates.
+                sortie_tow_release: sortieTowReleases,
                 sortie_performance: sortiePerf && sortiePerf.vs_max_fpm > 0 ? {
                   perf_source: sortiePerf.source,
                   vy_kts: sortiePerf.vy_kts,
@@ -1437,6 +1509,23 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 mean_lateral_ft: meanLatFt,
                 mean_vertical_ft: meanAltFt,
               })
+              // Ask S-16a — back-fill tow_ref on the per-cycle release
+              // blob. Match each cycle whose release_ts falls inside the
+              // overlap window to the paired glider; the glider's
+              // single release entry gets the tow plane's sortie_id.
+              if (Array.isArray(tow.sortie_tow_release)) {
+                for (const rel of tow.sortie_tow_release) {
+                  const tsMs = Date.parse(rel.release_ts)
+                  if (tsMs >= overlapStart && tsMs <= overlapEnd && !rel.tow_ref) {
+                    rel.tow_ref = glider.sortie_id
+                  }
+                }
+              }
+              if (Array.isArray(glider.sortie_tow_release)) {
+                for (const rel of glider.sortie_tow_release) {
+                  if (!rel.tow_ref) rel.tow_ref = tow.sortie_id
+                }
+              }
             }
           }
 
@@ -1500,6 +1589,8 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             // sortie_acs_taxonomy_filter below.
             sortie_acs_classifier_type_assumed: SORTIE_ACS_CLASSIFIER_TYPE,
             sortie_acs_taxonomy_filter: SORTIE_ACS_TAXONOMY_FILTER,
+            // Ask S-16c — tow release detector gates surfaced for audit.
+            sortie_tow_detector: SORTIE_TOW_DETECTOR,
             sortie_phase_classifier: 'phaseML.classifyTrack — labels every fix; landed_full_stop is used as a hard sortie boundary (overrides ground-threshold merge). Per-sortie segments echoed as sortie_phases. sortieCue (no_new_takeoff / crew_swap_hour_marker / track_ended) is carried on landed_full_stop segments per phaseML\'s post-hoc overlay.',
             // ACS code → array of {sortie_id, tail, type, peak_confidence, ...}
             // sorted by peak confidence descending. Lets operators pick a
@@ -1532,6 +1623,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_annotations:     'per-segment ACS task annotations derived from acsML\'s raw detection list (post-preempt). Indices reference sortie_path; ts_start/ts_end are derived from the REAL fix at those indices. source="auto" + verdict="not_evaluated" by construction — automated detection brackets a segment, human-grade verdicts come from a separate write path (Ask S-9c). Null when acsML lib missing OR the sortie had < 30 real points (same gate as sortie_acs).',
                 sortie_boundary_source: 'how this sortie was bounded from the next. Values: "phaseml_landed_full_stop:{no_new_takeoff|crew_swap_hour_marker|track_ended}" (phaseML hard signal — preferred), "gs_stop:{N}kt" (ground samples in the gap show the aircraft actually stopped at gs < 25 kt — catches tow rehooks and full-stop landings even when type-based threshold says merge), "ground_threshold" (type-based merge fired on gap duration alone), "track_end" (last sortie of the day, clean end), "track_edge" (last sortie of the day, still airborne).',
                 sortie_related_sorties: 'cross-sortie glider ↔ tow pairings. A pair fires when [takeoff_ts, landing_ts] windows overlap ≥ 30 s AND ≥ 50 % of the tow plane\'s real fixes during the overlap have a nearest-time glider fix within 900 ft lateral + 300 ft vertical. Entries are bidirectional — the tow row carries role="towed_glider" pointing at the glider sortie, the glider row carries role="tow_plane" pointing at the tow. mean_lateral_ft and mean_vertical_ft summarise the formation. Tow-side acceptance includes both type-flagged (PA25 etc.) AND auto-detected (auto_short_cycle_pattern) tracks so unknown-type tow planes still pair.',
+                sortie_tow_release:     'per-cycle tow release blob projected from acsML.phase_summary.climb_cycles[]. Detector gates echoed at sortie_tow_detector. Each entry: cycle_index (1-based), release_ts, release_lat/lon, release_alt_msl_ft / release_alt_agl_ft, climb_start_ts, climb_origin_alt_msl_ft, climb_gain_ft, climb_wallclock_s, climb_active_s (active climb only; excludes cruise plateaus + ADS-B coverage gaps), avg_climb_rate_fpm (over active), avg_climb_rate_wallclock_fpm (over wall-clock for comparison), release_path_index (resolved against sortie_path), detector_confidence, tow_ref (paired glider sortie_id for tow planes, tow-plane sortie_id for gliders, null when no pair found). Null on sorties whose climb shape did not pass the detector gates.',
                 sortie_landings:        'altitude-derived landing count via AGL hysteresis (low gate 300 ft, high gate 500 ft) walking REAL points only. touch_and_go = each high → low → high cycle; full_stop = sortie ended in the low state. total = touch_and_go + full_stop. Reads directly off the altitude track so it works on any sortie regardless of sortie_cycles (which counts airborne-session merges and can differ when ADS-B holds altitude through a brief dip).',
               },
             },
