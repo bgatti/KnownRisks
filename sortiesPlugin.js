@@ -899,17 +899,26 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
               // points array used for purposeML (we'd already
               // filtered to quality==='real' above; reuse it).
               let sortieAcs = null
+              let sortieAcsAnnotations = null
               if (acsMLIdentifyFn) {
                 // Rebuild the real-points array in case the purposeML
-                // block was skipped (fn null path).
+                // block was skipped (fn null path). acsRealToPathIdx[i]
+                // remembers which sortie_path index acsRealPts[i] came
+                // from — used below to remap acsML's per-detection
+                // startIdx/endIdx (which index acsRealPts) back to
+                // sortie_path indices for the sortie_annotations[]
+                // halo-render shape.
                 const acsRealPts = []
-                for (const p of sortiePath) {
+                const acsRealToPathIdx = []
+                for (let k = 0; k < sortiePath.length; k++) {
+                  const p = sortiePath[k]
                   if (p[4] !== 'real') continue
                   if (p[0] == null || p[1] == null || p[2] == null || p[3] == null) continue
                   acsRealPts.push({
                     lat: p[0], lon: p[1], altMslFt: p[2],
                     tsUnix: Math.floor(p[3] / 1000),
                   })
+                  acsRealToPathIdx.push(k)
                 }
                 if (acsRealPts.length >= 30) {
                   try {
@@ -924,6 +933,36 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                         currency_events: a.currency_events || [],
                         phase_summary: a.phase_summary || {},
                         notes: a.notes || [],
+                      }
+                      // Build sortie_annotations[] per Ask S-9 shape from
+                      // the new task_segments[] array acsML now emits.
+                      // Indices in task_segments reference acsRealPts;
+                      // remap to sortie_path indices via
+                      // acsRealToPathIdx. Verdict is "not_evaluated" for
+                      // every auto-detected annotation per S-9c —
+                      // automated detection should never grade pilot
+                      // performance.
+                      const segs = a.task_segments || []
+                      sortieAcsAnnotations = []
+                      for (const seg of segs) {
+                        if (!Number.isFinite(seg.startIdx) || !Number.isFinite(seg.endIdx)) continue
+                        const pStart = acsRealToPathIdx[Math.max(0, Math.min(seg.startIdx, acsRealToPathIdx.length - 1))]
+                        const pEnd = acsRealToPathIdx[Math.max(0, Math.min(seg.endIdx, acsRealToPathIdx.length - 1))]
+                        if (pStart == null || pEnd == null) continue
+                        sortieAcsAnnotations.push({
+                          kind: 'acs',
+                          acs_code: seg.code,
+                          acs_title: seg.name,
+                          point_index_start: pStart,
+                          point_index_end: pEnd,
+                          ts_start: new Date(seg.startTs * 1000).toISOString(),
+                          ts_end: new Date(seg.endTs * 1000).toISOString(),
+                          verdict: 'not_evaluated',
+                          source: 'auto',
+                          notes: seg.explanation || null,
+                          confidence: seg.confidence,
+                          evidence_type: seg.type,
+                        })
                       }
                     }
                   } catch (err) {
@@ -984,6 +1023,12 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 // Null when acsML is unavailable or the sortie has <
                 // 30 real points. See acsML/README.md.
                 sortie_acs: sortieAcs,
+                // Per-segment ACS annotations with sortie_path-indexed
+                // brackets — see Ask S-9 in kickoff_sorties_test.md.
+                // Each entry's point_index_start / point_index_end
+                // resolve through sortie_path so the halo-renderer can
+                // bracket the segment without index gymnastics.
+                sortie_annotations: sortieAcsAnnotations,
                 sortie_performance: sortiePerf && sortiePerf.vs_max_fpm > 0 ? {
                   perf_source: sortiePerf.source,
                   vy_kts: sortiePerf.vy_kts,
@@ -1065,6 +1110,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_path_throttle:   'non-null entries only at indices where sortie_path[i].quality === "real" AND a prior real fix exists within 60 s. Repaired/synthesized points always carry null. Engineless types (gliders, balloons) return all-null arrays and sortie_performance.perf_source="engineless".',
                 sortie_acs:             'computed from REAL-only points (purposeML uses the same filter). Null when acsML lib missing OR the sortie has < 30 real points after the quality filter. tasks_demonstrated lists every ACS code that fired; currency_events lists per-takeoff/per-landing 61.57(a)/(b) events tagged day vs night by airport lat/lon. scores covers V.A/V.B/V.C/V.D performance-standard verdicts. Mean throttle from sortie_path_throttle drives the VII.B/VII.C/IX.A/IX.B selectors — see kickoff_sorties_test.md round-4 notes.',
                 sortie_phases:          'phaseML segments clipped to the sortie\'s [takeoff_ts, landing_ts] window. Phase ∈ {on_ground, taxiing, pattern, practice_area, departing, inbound, en_route, nearby, landed_full_stop}. landed_full_stop fires only when a ground run is ≥ 30 s AND (dwell ≥ 5 min OR end-of-track) AND no takeoff occurred within 15 min — this is the load-bearing "crew over, flight logged" signal that breaks sorties even when the type-based ground threshold would have merged. Null when phaseML lib missing OR the track has < 5 real points.',
+                sortie_annotations:     'per-segment ACS task annotations derived from acsML\'s raw detection list (post-preempt). Indices reference sortie_path; ts_start/ts_end are derived from the REAL fix at those indices. source="auto" + verdict="not_evaluated" by construction — automated detection brackets a segment, human-grade verdicts come from a separate write path (Ask S-9c). Null when acsML lib missing OR the sortie had < 30 real points (same gate as sortie_acs).',
                 sortie_boundary_source: 'how this sortie was bounded from the next: "phaseml_landed_full_stop" (hard signal — preferred), "ground_threshold" (type-based merge fired), "track_end" (last sortie of the day, clean end), "track_edge" (last sortie of the day, still airborne).',
               },
             },

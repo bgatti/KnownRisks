@@ -294,6 +294,14 @@ export function identifyAcsSegments(points, { typeCode = '', tail = '' } = {}) {
   }
 
   const taskMap = new Map()
+  // task_segments[] — flat list of post-preempt detection segments,
+  // each annotated with the ACS code it satisfied. Unlike tasks_demonstrated
+  // (which collapses by code and strips per-detection indices), this
+  // preserves startIdx/endIdx/startTs/endTs/evidence per occurrence so
+  // downstream consumers can attach annotations to specific track
+  // segments. Indices refer to the `samples`/`points` array passed
+  // into identifyAcsSegments (the canonical input).
+  out.task_segments = []
   for (let i = 0; i < detTaskPairs.length; i++) {
     if (removed.has(i)) continue
     const { det, code, taskDef } = detTaskPairs[i]
@@ -304,12 +312,44 @@ export function identifyAcsSegments(points, { typeCode = '', tail = '' } = {}) {
       type: det.type, ts: det.startTs, duration_s: det.durationS,
       confidence: det.confidence, explanation: det.explanation,
     })
+    out.task_segments.push({
+      code, name: taskDef.name,
+      type: det.type,
+      startIdx: det.startIdx, endIdx: det.endIdx,
+      startTs: det.startTs, endTs: det.endTs,
+      durationS: det.durationS, confidence: det.confidence,
+      explanation: det.explanation,
+      evidence: det.evidence || null,
+    })
   }
   if (patternS >= 60) {
     taskMap.set('III.B', {
       code: 'III.B', name: 'Traffic Patterns', instances: 1,
       evidence: [{ type: 'phase:pattern', duration_s: Math.round(patternS), confidence: 0.9 }],
     })
+    // Pattern is accumulated across non-contiguous samples; emit one
+    // segment spanning first-pattern-sample → last-pattern-sample
+    // so the client at least gets a bracket.
+    let firstP = -1, lastP = -1
+    for (let i = 0; i < phaseLabels.length; i++) {
+      if (phaseLabels[i] && phaseLabels[i].phase === 'pattern') {
+        if (firstP < 0) firstP = i
+        lastP = i
+      }
+    }
+    if (firstP >= 0 && lastP > firstP) {
+      out.task_segments.push({
+        code: 'III.B', name: 'Traffic Patterns',
+        type: 'phase:pattern',
+        startIdx: firstP, endIdx: lastP,
+        startTs: samples[firstP].point.tsUnix,
+        endTs: samples[lastP].point.tsUnix,
+        durationS: Math.round(patternS),
+        confidence: 0.9,
+        explanation: 'aggregate pattern time (first → last pattern fix)',
+        evidence: null,
+      })
+    }
   }
 
   for (const to of takeoffs) {
