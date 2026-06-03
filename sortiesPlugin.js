@@ -375,16 +375,61 @@ function minGroundGapGsKts(sortieAllPts, sessionEndIdx, nextSessionStartIdx) {
   return minGs
 }
 
-function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = SORTIE_GROUND_MS, hardBoundaries = []) {
+// Operator round-13 (2026-06-03 N52993 case): when the aircraft has
+// ZERO samples for an extended period (transponder off on the
+// ground, ADS-B coverage hole), the alt-based session detector
+// never sees a transition and merges what should be two sorties.
+// The fix uses BOUNDARY CONDITIONS — when consecutive accepted
+// points have dt > SORTIE_LONG_GAP_BREAK_MS AND both are within
+// SORTIE_BOUNDARY_NEAR_AIRPORT_NM of the home field at AGL <
+// SORTIE_BOUNDARY_MAX_AGL_FT, we treat the gap itself as evidence
+// that the aircraft landed + later took off again.
+const SORTIE_LONG_GAP_BREAK_MS = 10 * 60_000     // 10 min — well above the 1:45-2:15 real quick-turn ceiling
+const SORTIE_BOUNDARY_NEAR_AIRPORT_NM = 3        // within pattern area of home field
+const SORTIE_BOUNDARY_MAX_AGL_FT = 1500          // pattern altitude + margin
+
+function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = SORTIE_GROUND_MS, hardBoundaries = [], homeAp = null) {
   const sortieList = []
   if (!Array.isArray(sortieAllPts) || sortieAllPts.length < 2) return sortieList
   const sortieSessions = []
+  // homeAp = { lat, lon, fieldElevFt } — when provided, enables the
+  // boundary-conditions split for long unbridged gaps within an
+  // airborne session.
+  const homeFieldElev = homeAp ? homeAp.fieldElevFt : (sortieGroundCeil - SORTIE_GROUND_AGL_FT)
+  function nearHomeAtPatternAlt(p) {
+    if (!homeAp) return false
+    if (p[2] == null) return false
+    const aglFt = p[2] - homeFieldElev
+    if (aglFt > SORTIE_BOUNDARY_MAX_AGL_FT || aglFt < -200) return false
+    const distNm = distNmAp(p[0], p[1], homeAp.lat, homeAp.lon)
+    return distNm <= SORTIE_BOUNDARY_NEAR_AIRPORT_NM
+  }
   let sortieInAir = false
   let sortieSessionStart = -1
   let sortieSessionPeakAlt = 0
+  let sortieBoundarySplits = 0
+  let prevAccepted = -1
   for (let i = 0; i < sortieAllPts.length; i++) {
     const p = sortieAllPts[i]
     if (p[2] == null || p[3] == null) continue
+    // Boundary-conditions break: an extended-duration coverage gap
+    // whose bracketing fixes are both at low AGL near the home
+    // airport is evidence of a landed-then-took-off cycle the
+    // alt-state walk cannot detect. Close the current airborne
+    // session at the previous accepted fix; the current fix will
+    // open a new session below.
+    if (sortieInAir && prevAccepted >= 0) {
+      const dtMs = (p[3] || 0) - (sortieAllPts[prevAccepted][3] || 0)
+      if (dtMs > SORTIE_LONG_GAP_BREAK_MS
+          && nearHomeAtPatternAlt(sortieAllPts[prevAccepted])
+          && nearHomeAtPatternAlt(p)) {
+        sortieSessions.push({ s: sortieSessionStart, e: prevAccepted, open: false, peakAlt: sortieSessionPeakAlt, boundary_split: true })
+        sortieBoundarySplits++
+        sortieInAir = false
+        sortieSessionStart = -1
+        sortieSessionPeakAlt = 0
+      }
+    }
     const isAir = p[2] > sortieGroundCeil
     if (!sortieInAir && isAir) {
       sortieInAir = true
@@ -398,6 +443,7 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
       sortieSessionStart = -1
       sortieSessionPeakAlt = 0
     }
+    prevAccepted = i
   }
   if (sortieInAir && sortieSessionStart >= 0) {
     sortieSessions.push({ s: sortieSessionStart, e: sortieAllPts.length - 1, open: true, peakAlt: sortieSessionPeakAlt })
@@ -498,7 +544,11 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
       sortieCur.cycles += 1
       if (next.open) sortieCur.open = true
     } else {
-      sortieCur.ended_by = cue ? `phaseml_landed_full_stop:${cue}`
+      // sortieCur.boundary_split was set in the first loop when the
+      // session was closed by the long-gap boundary-conditions check.
+      // Surface that as the ended_by reason so callers can audit.
+      sortieCur.ended_by = sortieCur.boundary_split ? 'boundary_long_gap'
+        : cue ? `phaseml_landed_full_stop:${cue}`
         : realStop ? `gs_stop:${Math.round(minGapGs)}kt`
         : 'ground_threshold'
       sortieList.push(sortieCur)
@@ -1390,7 +1440,8 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                 const baseGroundMs = sortieIsTowPlane ? SORTIE_GROUND_MS_TOW_PLANE
                   : sortieIsGlider ? SORTIE_GROUND_MS_SHORT_TURN
                   : SORTIE_GROUND_MS
-                const sList = detectSortiesInTrack(pts, groundCeil, baseGroundMs, [])
+                const sList = detectSortiesInTrack(pts, groundCeil, baseGroundMs, [],
+                  { lat: ap.lat, lon: ap.lon, fieldElevFt: ap.elev })
                 for (const s of sList) {
                   const endP = pts[s.e]
                   if (!endP) continue
@@ -1619,7 +1670,8 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                 }
               }
             }
-            const sortieList = detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMsForType, sortieHardBoundaries)
+            const sortieList = detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMsForType, sortieHardBoundaries,
+              { lat: sortieAp.lat, lon: sortieAp.lon, fieldElevFt: sortieFieldElev })
             for (const s of sortieList) {
               const sortieStartPt = sortieAllPts[s.s]
               const sortieEndPt = sortieAllPts[s.e]
