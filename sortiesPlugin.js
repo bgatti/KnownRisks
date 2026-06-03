@@ -1764,8 +1764,9 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
               // Per-sortie bump probe: walk raw points, find min, apply
               // current offset, check if it lands below the alert
               // threshold. If yes, make the offset more negative so the
-              // min lands exactly at -50 AGL.
-              const SORTIE_AGL_GUARANTEE_FT = -50
+              // min lands exactly at 0 AGL (operator directive 2026-06-03:
+              // "keep working until 0% < 0" — no negative AGL anywhere).
+              const SORTIE_AGL_GUARANTEE_FT = 0
               let probeMinMsl = Infinity
               for (const p of rawPath) {
                 if (p[2] == null) continue
