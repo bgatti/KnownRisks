@@ -537,17 +537,38 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
           // day rows + retention going back as far as the DB keeps
           // them). Deep-historical (months+) over the `tracks` table
           // is the next iteration when the test page asks for it.
+          //
+          // Bounded wait: when pg-pool is saturated by other endpoints
+          // a cold-cache hit can stall 30-50 s. Cap at 4 s and return
+          // an empty payload with sortie_source="db_timeout" so the
+          // client can render a transient banner instead of the request
+          // hanging or failing outright. (Subsequent requests usually
+          // succeed once loadLiveFromDb's own 30 s cache warms.)
+          const LOAD_TIMEOUT_MS = 4000
+          const timeoutErr = () => new Promise((_, rej) => setTimeout(() => rej(new Error('load_timeout')), LOAD_TIMEOUT_MS))
           let sortieLive
           let sortieSource
           if (db && db.useDb) {
             if (sortieDayParam || sortieDaysParam) {
               const fromDate = new Date(sortieCutoffStartMs).toISOString().slice(0, 10)
               const toDate   = new Date(sortieCutoffEndMs - 1).toISOString().slice(0, 10)
-              sortieLive = await db.loadLiveFromDbByDateRange(fromDate, toDate)
-              sortieSource = `historical:live_tracks ${fromDate}..${toDate}`
+              try {
+                sortieLive = await Promise.race([db.loadLiveFromDbByDateRange(fromDate, toDate), timeoutErr()])
+                sortieSource = `historical:live_tracks ${fromDate}..${toDate}`
+              } catch (err) {
+                console.warn('[sorties] historical load degraded:', err && err.message)
+                sortieLive = { tracks: [] }
+                sortieSource = `db_timeout:historical ${fromDate}..${toDate}`
+              }
             } else {
-              sortieLive = await db.loadLiveFromDb(sortieHours)
-              sortieSource = 'live'
+              try {
+                sortieLive = await Promise.race([db.loadLiveFromDb(sortieHours), timeoutErr()])
+                sortieSource = 'live'
+              } catch (err) {
+                console.warn('[sorties] live load degraded:', err && err.message)
+                sortieLive = { tracks: [] }
+                sortieSource = `db_timeout:live ${sortieHours}h`
+              }
             }
           } else {
             try {
