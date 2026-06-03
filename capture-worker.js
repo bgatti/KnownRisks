@@ -22,6 +22,32 @@ const POLL_MS = 5_000
 const ALT_MAX_FT = 11_000
 const SEVERITY = { yellow: 1, orange: 2, red: 3, purple: 4 }
 
+// Field elevations (MSL ft) for the airports we cover. Used to coerce
+// `alt_baro: "ground"` to a sensible MSL altitude — 0 MSL is physically
+// impossible at Front Range elevations and breaks every downstream AGL
+// calculation. Mirrors ENRICH_AP in vite.config.js.
+const GROUND_APTS = [
+  { code: 'KBDU', lat: 40.0394, lon: -105.2258, elev: 5288 },
+  { code: 'KBJC', lat: 39.9088, lon: -105.1172, elev: 5673 },
+  { code: 'KEIK', lat: 40.0098, lon: -105.0488, elev: 5130 },
+  { code: 'KLMO', lat: 40.1636, lon: -105.1636, elev: 5055 },
+  { code: 'KAPA', lat: 39.5701, lon: -104.8493, elev: 5885 },
+  { code: 'KGXY', lat: 40.4348, lon: -104.6331, elev: 4697 },
+  { code: 'KFNL', lat: 40.4518, lon: -105.0166, elev: 5016 },
+  { code: 'KDEN', lat: 39.8617, lon: -104.6731, elev: 5434 },
+]
+const GROUND_MATCH_NM = 3
+function groundElevAt(lat, lon) {
+  let bestD = Infinity, bestElev = null
+  for (const ap of GROUND_APTS) {
+    const dLat = (lat - ap.lat) * 60
+    const dLon = (lon - ap.lon) * 60 * Math.cos((lat + ap.lat) / 2 * Math.PI / 180)
+    const d = Math.hypot(dLat, dLon)
+    if (d < bestD) { bestD = d; bestElev = ap.elev }
+  }
+  return bestD <= GROUND_MATCH_NM ? bestElev : null
+}
+
 // Build bands + stats from a track's points
 function classifyTrackLive(points) {
   const bands = []
@@ -200,13 +226,17 @@ async function poll() {
 
     for (const ac of byHexThisPoll.values()) {
       if (ac.lat == null || ac.lon == null) continue
-      // Coerce "ground" → 0 MSL so taxi / ramp points enter the pipeline;
-      // downstream phase detection treats anything below the field's ground
-      // ceiling (field_elev + 150) as on-ground regardless.
+      // Coerce "ground" → nearest-airport field elevation (MSL) so taxi / ramp
+      // points enter the pipeline at a physically plausible altitude. Front
+      // Range fields sit at ~4700–5900 ft MSL; storing 0 here would break
+      // every downstream AGL calc. Aircraft tagged "ground" but >3 nm from
+      // any known airport are skipped — we can't safely guess local terrain.
       let alt
       if (typeof ac.alt_baro === 'number') alt = ac.alt_baro
-      else if (ac.alt_baro === 'ground') alt = 0
-      else continue
+      else if (ac.alt_baro === 'ground') {
+        alt = groundElevAt(ac.lat, ac.lon)
+        if (alt == null) continue
+      } else continue
       if (alt < 0 || alt >= ALT_MAX_FT) continue
       const hex = ac.hex
       if (!hex) continue
