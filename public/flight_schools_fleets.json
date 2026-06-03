@@ -53,6 +53,7 @@
       "email": "info@mcairaviation.com",
       "email_source": "mcairaviation.com/contact-us/ (general inquiries)",
       "fleet_source": "FAA registry name lookup: Spartan Education LLC; mcairaviation.com fleet description",
+      "tail_regexes": ["^N\\d+(SF|FF)$"],
       "aircraft": [
         {"tail": "N522ND", "type": "Cessna 172S (2009)", "registered_owner": "Spartan Education LLC"},
         {"tail": "N537ND", "type": "Cessna 172S (2009)", "registered_owner": "Spartan Education LLC"},
@@ -450,6 +451,19 @@
       "fleet_source": "http://www.songbirdltf.com/",
       "aircraft": [],
       "notes": "Flying club / flight instruction at Greeley. Site TLS error during fetch. No tail numbers captured."
+    },
+    {
+      "name": "Think Aerospace",
+      "airport": "KBDU",
+      "website": null,
+      "email": "",
+      "email_source": "user-provided 2026-06-03",
+      "fleet_source": "user-provided 2026-06-03",
+      "aircraft": [
+        {"tail": "N94AM", "type": "Diamond DA40"},
+        {"tail": "N42VJ", "type": "Diamond DA42"}
+      ],
+      "notes": "Operator added per user 2026-06-03. Two-aircraft training fleet: DA40 single + DA42 light twin. Based at KBDU (Boulder Municipal)."
     }
   ]
 }

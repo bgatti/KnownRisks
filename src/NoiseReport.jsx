@@ -116,6 +116,8 @@ const AIRCRAFT_TYPE_HINTS = {
   PA25: 'Piper PA-25 Pawnee',
   PA18: 'Piper PA-18 Super Cub',
   HUSK: 'Aviat Husky',
+  PIAT: 'Pilatus PC-6 Porter',
+  PC6:  'Pilatus PC-6 Porter',
   C172: 'Cessna 172',
   C152: 'Cessna 152',
   C182: 'Cessna 182',

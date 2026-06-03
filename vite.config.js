@@ -104,6 +104,7 @@ const TYPE_DESC = {
   P28R: 'Piper Arrow PA-28R', PA46: 'Piper Malibu/Mirage', PA44: 'Piper Seminole',
   PA25: 'Piper Pawnee (tow plane)', PA18: 'Piper Super Cub (tow plane)',
   HUSK: 'Aviat Husky (tow plane)',
+  PIAT: 'Pilatus PC-6 Porter (tow plane)', PC6: 'Pilatus PC-6 Porter',
   DV20: 'Diamond Katana DV20', DA20: 'Diamond Katana DA20', DA40: 'Diamond Diamond Star',
   DA42: 'Diamond Twin Star',
   SR20: 'Cirrus SR20', SR22: 'Cirrus SR22', S22T: 'Cirrus SR22T',
