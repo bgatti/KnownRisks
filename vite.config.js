@@ -366,7 +366,7 @@ async function resolveAircraftPhoto(type) {
   if (c && Date.now() - c.ts < (c.url ? PHOTO_TTL : PHOTO_NEG_TTL)) return c.url
   let url = null
   try {
-    const q = `${expandType(key) || key} aircraft`
+    const q = `${(expandType(key) || key).replace(/\s*\([^)]*\)\s*/g, ' ').trim()} aircraft`
     const api = 'https://en.wikipedia.org/w/api.php?action=query&format=json&prop=pageimages' +
       '&piprop=thumbnail&pithumbsize=200&generator=search&gsrlimit=1&gsrsearch=' + encodeURIComponent(q)
     const ctrl = new AbortController()
