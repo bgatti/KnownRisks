@@ -365,6 +365,60 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
   return sortieList
 }
 
+// Landing count from the altitude track. Operator brief 2026-06-03:
+// "maybe sorties could count landings by looking at the altitude
+// track. it's pretty obvious: try a technique." Hysteresis on AGL:
+//
+//   AGL < LOW_AGL_FT  → state "low" (effectively on the runway)
+//   AGL > HIGH_AGL_FT → state "high" (climbed back out)
+//
+// Each high → low → high cycle is a touch-and-go; ending the sortie
+// in the "low" state is a full-stop. The two thresholds straddle a
+// dead-band so single noisy fixes can't toggle state.
+//
+// REAL points only — repaired points are interpolated and would smear
+// the dip a landing produces. Returns null on engineless / unknown
+// elev tracks where the AGL reference isn't trustworthy.
+const SORTIE_LANDING_LOW_AGL_FT = 300
+const SORTIE_LANDING_HIGH_AGL_FT = 500
+function countSortieLandings(sortiePath, fieldElevFt) {
+  if (!Array.isArray(sortiePath) || sortiePath.length < 3) return null
+  if (!Number.isFinite(fieldElevFt)) return null
+  let touchAndGo = 0
+  let fullStop = 0
+  let state = null  // null until first real fix
+  let lastLowTs = null
+  let firstLowTs = null
+  for (const p of sortiePath) {
+    if (p[4] !== 'real') continue
+    if (p[2] == null) continue
+    const agl = p[2] - fieldElevFt
+    if (state == null) {
+      state = agl < SORTIE_LANDING_LOW_AGL_FT ? 'low' : 'high'
+      if (state === 'low') { lastLowTs = p[3]; firstLowTs = p[3] }
+      continue
+    }
+    if (state === 'high' && agl < SORTIE_LANDING_LOW_AGL_FT) {
+      state = 'low'
+      firstLowTs = p[3]
+      lastLowTs = p[3]
+    } else if (state === 'low' && agl > SORTIE_LANDING_HIGH_AGL_FT) {
+      touchAndGo += 1
+      state = 'high'
+      firstLowTs = null
+    } else if (state === 'low') {
+      lastLowTs = p[3]
+    }
+  }
+  if (state === 'low') fullStop = 1
+  return {
+    total: touchAndGo + fullStop,
+    touch_and_go: touchAndGo,
+    full_stop: fullStop,
+    last_low_ts: lastLowTs ? new Date(lastLowTs).toISOString() : null,
+  }
+}
+
 // ── Altitude calibration (self-only — no cross-flight smoothing in
 // this surface; sorties are short enough that one calibration per
 // sortie is fine for the operator's amended_msl check) ────────────
@@ -1108,6 +1162,12 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_path_length_nm: Math.round(pathLenNm * 100) / 100,
                 sortie_max_excursion_nm: Math.round(maxExcNm * 100) / 100,
                 sortie_cycles: s.cycles,
+                // Landing count derived from the altitude track: each
+                // dip below field+300 ft AGL followed by climbout
+                // above field+500 ft is a touch_and_go; ending the
+                // sortie below the low threshold is a full_stop. See
+                // countSortieLandings() for the hysteresis logic.
+                sortie_landings: countSortieLandings(sortiePath, sortieFieldElev),
                 sortie_is_open: !!s.open,
                 sortie_path_point_count: sortiePath.length,
                 sortie_path: sortiePath,
@@ -1368,6 +1428,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_annotations:     'per-segment ACS task annotations derived from acsML\'s raw detection list (post-preempt). Indices reference sortie_path; ts_start/ts_end are derived from the REAL fix at those indices. source="auto" + verdict="not_evaluated" by construction — automated detection brackets a segment, human-grade verdicts come from a separate write path (Ask S-9c). Null when acsML lib missing OR the sortie had < 30 real points (same gate as sortie_acs).',
                 sortie_boundary_source: 'how this sortie was bounded from the next: "phaseml_landed_full_stop" (hard signal — preferred), "ground_threshold" (type-based merge fired), "track_end" (last sortie of the day, clean end), "track_edge" (last sortie of the day, still airborne).',
                 sortie_related_sorties: 'cross-sortie glider ↔ tow pairings. A pair fires when [takeoff_ts, landing_ts] windows overlap ≥ 30 s AND ≥ 50 % of the tow plane\'s real fixes during the overlap have a nearest-time glider fix within 900 ft lateral + 300 ft vertical. Entries are bidirectional — the tow row carries role="towed_glider" pointing at the glider sortie, the glider row carries role="tow_plane" pointing at the tow. mean_lateral_ft and mean_vertical_ft summarise the formation. Tow-side acceptance includes both type-flagged (PA25 etc.) AND auto-detected (auto_short_cycle_pattern) tracks so unknown-type tow planes still pair.',
+                sortie_landings:        'altitude-derived landing count via AGL hysteresis (low gate 300 ft, high gate 500 ft) walking REAL points only. touch_and_go = each high → low → high cycle; full_stop = sortie ended in the low state. total = touch_and_go + full_stop. Reads directly off the altitude track so it works on any sortie regardless of sortie_cycles (which counts airborne-session merges and can differ when ADS-B holds altitude through a brief dip).',
               },
             },
             sorties: sortieResults,
