@@ -597,34 +597,50 @@ function countSortieLandings(sortiePath, fieldElevFt) {
 // fixes near the queried airport) inherits the same correction the
 // busier tracks established.
 
-const SORTIE_BARO_RADIUS_NM = 2.5
-const SORTIE_BARO_SAMPLES_PER_TRACK = 5
-const SORTIE_BARO_MIN_TRACKS = 3
-const SORTIE_BARO_MAX_OFFSET_FT = 800  // a true baro bias is < 600 ft; > 800 is data quality, drop it
+// Calibration strategy — find genuine touchdowns, not pattern-altitude
+// flyovers. The first iteration averaged the lowest 5 fixes per track
+// within 2.5 nm of the field; that grabbed mid-pattern fixes (~500 ft
+// AGL) instead of real touchdowns, and over-corrected by ~+500 ft on
+// KBDU. Rebuilt to:
+//
+//   1. Tight radius (1.0 nm — over the field, not just nearby)
+//   2. Per-track MINIMUM MSL (most likely to be a touchdown moment)
+//   3. Filter out tracks whose minimum is > field_elev + 400 ft
+//      (anything higher is an overflight, not a landing)
+//   4. Need >= SORTIE_BARO_MIN_TRACKS tracks contributing
+//   5. Cap offset at ±200 ft — real baro bias is small; anything
+//      larger is data-quality noise that shouldn't override per-sortie
+//      self-cal
+const SORTIE_BARO_RADIUS_NM = 1.0
+const SORTIE_BARO_MIN_TRACKS = 5
+const SORTIE_BARO_MAX_OFFSET_FT = 200
+const SORTIE_BARO_OVERFLIGHT_AGL_FT = 400   // min-of-track this high above field = overflight, skip
 const SORTIE_ALT_QUALITY_ALERT_AGL_FT = -50
 
 function buildAirportBaroOffsets(tracks, enrichAp) {
   const out = new Map()  // code -> { offset_ft, cohort_size, observed_median_msl, field_elev_ft, source }
   if (!Array.isArray(tracks) || !tracks.length || !Array.isArray(enrichAp)) return out
-  const perAp = new Map()  // code -> array of low-alt samples (one batch per qualifying track)
+  const perAp = new Map()  // code -> array of per-track min MSL
   for (const ap of enrichAp) perAp.set(ap.code, [])
   for (const t of tracks) {
     const pts = (t.points || []).filter(p => Array.isArray(p) && p.length >= 4 && p[2] != null)
     if (!pts.length) continue
     for (const ap of enrichAp) {
-      const near = []
+      let trackMinMsl = Infinity
       for (const p of pts) {
-        if (distNmAp(p[0], p[1], ap.lat, ap.lon) <= SORTIE_BARO_RADIUS_NM) near.push(p[2])
+        if (distNmAp(p[0], p[1], ap.lat, ap.lon) > SORTIE_BARO_RADIUS_NM) continue
+        if (p[2] < trackMinMsl) trackMinMsl = p[2]
       }
-      if (near.length < 2) continue
-      near.sort((a, b) => a - b)
-      const low = near.slice(0, SORTIE_BARO_SAMPLES_PER_TRACK)
-      perAp.get(ap.code).push(...low)
+      if (!Number.isFinite(trackMinMsl)) continue
+      // Overflight filter — a track whose minimum near the field is
+      // 400 ft AGL or higher never actually touched down here.
+      if (trackMinMsl > ap.elev + SORTIE_BARO_OVERFLIGHT_AGL_FT) continue
+      perAp.get(ap.code).push(trackMinMsl)
     }
   }
   for (const ap of enrichAp) {
     const samples = perAp.get(ap.code)
-    if (!samples || samples.length < SORTIE_BARO_MIN_TRACKS * 2) continue
+    if (!samples || samples.length < SORTIE_BARO_MIN_TRACKS) continue
     samples.sort((a, b) => a - b)
     const median = samples[Math.floor(samples.length / 2)]
     const offset = Math.round(median - ap.elev)
