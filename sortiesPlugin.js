@@ -197,21 +197,41 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
   // beyond) the requested default — so a glider/tow-typed caller that
   // already asked for SORTIE_GROUND_MS_TOW_PLANE / SORTIE_GROUND_MS_
   // SHORT_TURN keeps that. The override only fires for tracks that
-  // asked for the long 5-min default but display a short-cycle shape.
+  // asked for the long 5-min default AND display a tow-like shape:
+  //
+  //   • ≥ 3 airborne sessions
+  //   • median session DURATION < 5 min (climb-only profile, not a
+  //     pattern T&G or training session)
+  //   • median inter-session ground gap < 3 min (continuous re-hook
+  //     cadence, not a re-brief / re-board)
+  //
+  // Early auto-detection over-fired on trainers (C172/RV10) doing
+  // 30-min pattern work between full-stop breaks — they have multiple
+  // sessions with short gaps too, but their session DURATIONS are
+  // ~ 7-30 min (full pattern lap or actual flight), while a tow plane
+  // session is ~ 2-4 min (climb + steep descent).
   let effectiveGroundMs = sortieGroundMs
   let thresholdSource = sortieGroundMs === SORTIE_GROUND_MS ? 'type_default'
     : sortieGroundMs === SORTIE_GROUND_MS_TOW_PLANE ? 'type_tow_plane'
     : sortieGroundMs === SORTIE_GROUND_MS_SHORT_TURN ? 'type_glider' : 'caller_supplied'
   if (sortieGroundMs > SORTIE_GROUND_MS_TOW_PLANE && sortieSessions.length >= 3) {
     const sortieGaps = []
-    for (let i = 1; i < sortieSessions.length; i++) {
-      const gapMs = (sortieAllPts[sortieSessions[i].s][3] || 0)
-                  - (sortieAllPts[sortieSessions[i - 1].e][3] || 0)
-      sortieGaps.push(gapMs)
+    const sortieDurs = []
+    for (let i = 0; i < sortieSessions.length; i++) {
+      const dMs = (sortieAllPts[sortieSessions[i].e][3] || 0)
+                - (sortieAllPts[sortieSessions[i].s][3] || 0)
+      sortieDurs.push(dMs)
+      if (i > 0) {
+        const gapMs = (sortieAllPts[sortieSessions[i].s][3] || 0)
+                    - (sortieAllPts[sortieSessions[i - 1].e][3] || 0)
+        sortieGaps.push(gapMs)
+      }
     }
     sortieGaps.sort((a, b) => a - b)
+    sortieDurs.sort((a, b) => a - b)
     const sortieMedianGapMs = sortieGaps[Math.floor(sortieGaps.length / 2)]
-    if (sortieMedianGapMs < 5 * 60_000) {
+    const sortieMedianDurMs = sortieDurs[Math.floor(sortieDurs.length / 2)]
+    if (sortieMedianGapMs < 3 * 60_000 && sortieMedianDurMs < 5 * 60_000) {
       effectiveGroundMs = SORTIE_GROUND_MS_TOW_PLANE
       thresholdSource = 'auto_short_cycle_pattern'
     }
