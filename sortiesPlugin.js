@@ -132,7 +132,12 @@ function phaseLabelsToSegments(labels, canonicalPts) {
   return segs
 }
 
-const SORTIE_GROUND_MS = 5 * 60_000
+// 2026-06-03 operator: 5 min was too tight — N547ND was splitting one
+// flight into two when a 6-min taxi-back hit the threshold. "would be a
+// work record for preflight, runup, and even a single pattern" in
+// under 10 min. Bumped to 10 min so a normal ground hold (refuel break,
+// pax swap, brief discussion) doesn't fragment one crew's flight.
+const SORTIE_GROUND_MS = 10 * 60_000
 // Gliders turn around faster than typical powered aircraft. 2-3 min
 // is normal at busy glider ops (KBDU on a thermal day). With the
 // 5-min powered threshold, two adjacent glider sorties get merged
