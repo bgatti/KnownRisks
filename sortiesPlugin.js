@@ -32,7 +32,7 @@
 // ignoring the 5th tuple slot keep working.
 
 import fs from 'fs'
-import { impactSegments } from './src/popGrid.js'
+import { impactSegments, pointImpact } from './src/popGrid.js'
 import { distFt, isEnginelessType } from './src/geo.js'
 import { perfForType } from './aircraftPerf.js'
 import { estimateThrottle } from './throttleEstimate.js'
@@ -903,6 +903,32 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 }
               }
 
+              // Per-fix noise impact — operator brief 2026-06-03:
+              // "sortie flight paths need to include noise impact
+              // based on the existing noise model." Uses pointImpact
+              // from popGrid.js, the same kernel impactSegments() and
+              // findSortieMaxPopSegment() rely on. Output is
+              // people/km² × (REF_AGL / AGL)² — louder beneath more
+              // people, attenuating with altitude. Scale is consistent
+              // across sorties, so clients can autoscale by
+              // percentile.
+              //
+              // Repaired points get null per the
+              // sortie_evaluation_rules.repaired contract — bridged
+              // lat/lon/alt are interpolated and not safe to evaluate.
+              // When POPGRID is unavailable, all entries are null.
+              const sortiePathPopImpact = new Array(sortiePath.length).fill(null)
+              const sortiePopAt = POPGRID && POPGRID.popAt
+              if (sortiePopAt) {
+                for (let k = 0; k < sortiePath.length; k++) {
+                  const p = sortiePath[k]
+                  if (p[4] !== 'real') continue
+                  if (p[0] == null || p[1] == null) continue
+                  const v = pointImpact(p[0], p[1], p[2] || 0, sortiePopAt)
+                  sortiePathPopImpact[k] = Number.isFinite(v) ? Math.round(v * 100) / 100 : null
+                }
+              }
+
               const sortieTakeoffTs = new Date(sortieStartPt[3]).toISOString()
               const sortieLandingTs = new Date(sortieEndPt[3]).toISOString()
               const sortieDurationMin = Math.round((sortieEndPt[3] - sortieStartPt[3]) / 60_000 * 10) / 10
@@ -1086,6 +1112,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_path_point_count: sortiePath.length,
                 sortie_path: sortiePath,
                 sortie_path_throttle: sortiePathThrottle,
+                sortie_path_pop_impact: sortiePathPopImpact,
                 // Per ACS Areas of Operation (Private Pilot ACS) +
                 // FAR 61.57 currency. Computed from REAL-only points.
                 // Null when acsML is unavailable or the sortie has <
@@ -1228,6 +1255,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_max_pop_segment: 'computed from real-only windows (no repaired point ever lands inside the window); literal-slice invariant preserved',
                 sortie_purpose:         'computed from real-only points when sortie_purpose_source="shape"; geometry classifier falls through when no shape verdict ≥ 0.7 confidence',
                 sortie_path_throttle:   'non-null entries only at indices where sortie_path[i].quality === "real" AND a prior real fix exists within 60 s. Repaired/synthesized points always carry null. Engineless types (gliders, balloons) return all-null arrays and sortie_performance.perf_source="engineless".',
+                sortie_path_pop_impact: 'people/km² × (REF_AGL / AGL)² evaluated at each fix (popGrid.js pointImpact kernel — same one impactSegments and findSortieMaxPopSegment use). Non-null only at indices where sortie_path[i].quality === "real". Repaired points carry null per the evaluation rule. Scale is consistent across sorties so clients can autoscale by percentile. When POPGRID is unavailable on the server, the array is all-null.',
                 sortie_acs:             'computed from REAL-only points (purposeML uses the same filter). Null when acsML lib missing OR the sortie has < 30 real points after the quality filter. tasks_demonstrated lists every ACS code that fired; currency_events lists per-takeoff/per-landing 61.57(a)/(b) events tagged day vs night by airport lat/lon. scores covers V.A/V.B/V.C/V.D performance-standard verdicts. Mean throttle from sortie_path_throttle drives the VII.B/VII.C/IX.A/IX.B selectors — see kickoff_sorties_test.md round-4 notes.',
                 sortie_phases:          'phaseML segments clipped to the sortie\'s [takeoff_ts, landing_ts] window. Phase ∈ {on_ground, taxiing, pattern, practice_area, departing, inbound, en_route, nearby, landed_full_stop}. landed_full_stop fires only when a ground run is ≥ 30 s AND (dwell ≥ 5 min OR end-of-track) AND no takeoff occurred within 15 min — this is the load-bearing "crew over, flight logged" signal that breaks sorties even when the type-based ground threshold would have merged. Null when phaseML lib missing OR the track has < 5 real points.',
                 sortie_annotations:     'per-segment ACS task annotations derived from acsML\'s raw detection list (post-preempt). Indices reference sortie_path; ts_start/ts_end are derived from the REAL fix at those indices. source="auto" + verdict="not_evaluated" by construction — automated detection brackets a segment, human-grade verdicts come from a separate write path (Ask S-9c). Null when acsML lib missing OR the sortie had < 30 real points (same gate as sortie_acs).',
