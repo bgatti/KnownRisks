@@ -1551,20 +1551,15 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                 }
               }
 
-              // Ask #15c — sortie-wide impact_index + pop_grade letter.
-              // Same scale as the kiosk's /api/flights/current pop_grade
-              // (POP_SCALE=1000, A/B/C/D/F thresholds 0.3/0.6/1.2/2.0).
-              // Real-points-only path is sufficient: impactSegments
-              // skips zero-length / null-pop segments naturally.
-              let sortiePopImpactIndex = null
+              // Ask #15c (revised 2026-06-03 per kiosk operator
+              // directive): sortie_pop_grade is now derived from the
+              // MAX-POP SEGMENT'S impact_index, not from a path-wide
+              // calculation. Removes the path-of-misuse where consumers
+              // were reading sortie_pop_impact_index × 50 to render the
+              // chip, conflating path-wide grade input with the segment
+              // score. The chip and the map polyline now agree.
+              // Computed below after findSortieMaxPopSegment runs.
               let sortiePopGrade = null
-              if (sortiePopAt && sortiePath.length >= 2) {
-                const { total, lenFt } = impactSegments(sortiePath, sortiePopAt, distFt)
-                if (lenFt > 0) {
-                  sortiePopImpactIndex = Math.round(((total / lenFt) / SORTIE_POP_SCALE_GRADE) * 1000) / 1000
-                  sortiePopGrade = gradeForImpactIndex(sortiePopImpactIndex)
-                }
-              }
 
               const sortieTakeoffTs = new Date(sortieStartPt[3]).toISOString()
               const sortieLandingTs = new Date(sortieEndPt[3]).toISOString()
@@ -1826,9 +1821,11 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                 sortie_path: sortiePath,
                 sortie_path_throttle: sortiePathThrottle,
                 sortie_path_pop_impact: sortiePathPopImpact,
-                // Ask #15c (kiosk) — sortie-wide pop_impact + letter
-                // grade. Same rule as /api/flights/current's pop_grade.
-                sortie_pop_impact_index: sortiePopImpactIndex,
+                // Ask #15c (kiosk) — letter grade derived from the
+                // MAX-POP SEGMENT'S impact_index, computed below
+                // after findSortieMaxPopSegment runs. The chip and
+                // the map polyline now agree because both read from
+                // the segment.
                 sortie_pop_grade: sortiePopGrade,
                 // Per ACS Areas of Operation (Private Pilot ACS) +
                 // FAR 61.57 currency. Computed from REAL-only points.
@@ -1879,6 +1876,19 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
               }
 
               const sortieMaxPop = findSortieMaxPopSegment(sortiePath, POPGRID?.popAt, sortieFieldElev)
+              // Ask #15c revised — derive sortie_pop_grade from the
+              // SEGMENT'S impact_index (kiosk operator directive). Same
+              // POP_SCALE=1000 + impactGrade rule as
+              // /api/flights/current.pop_grade so the letter agrees
+              // across endpoints.
+              if (sortieMaxPop && sortiePopAt) {
+                const segPts = sortiePath.slice(sortieMaxPop.startIdx, sortieMaxPop.endIdx + 1)
+                const { total, lenFt } = impactSegments(segPts, sortiePopAt, distFt)
+                if (lenFt > 0) {
+                  const segIndex = (total / lenFt) / SORTIE_POP_SCALE_GRADE
+                  sortieRow.sortie_pop_grade = gradeForImpactIndex(segIndex)
+                }
+              }
               if (sortieMaxPop) {
                 const sortieMaxPopPoints = sortiePath.slice(sortieMaxPop.startIdx, sortieMaxPop.endIdx + 1)
                 sortieRow.sortie_max_pop_segment = {
