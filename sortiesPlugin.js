@@ -704,20 +704,35 @@ function classifySortiePurpose({ cycles, maxExcursionNm, landedAirport, baseAirp
 }
 
 // Complaints loader — cached so each sortie request doesn't re-read
-// the file. Mirrors loadComplaintsCached() in vite.config.js but
-// kept local so the sorties plugin doesn't depend on that surface.
+// the file. Prefers DB (db.getComplaints) when available; falls back
+// to data/complaints.json. Mirrors loadComplaintsCached() in
+// vite.config.js. 1.5 s timeout on the DB hop so a stuck pg-pool
+// can't block the sortie endpoint — if DB times out we use whatever
+// the file path gives us.
 const COMPLAINT_CACHE_TTL_MS = 30_000
 let _complaintCache = { ts: 0, list: [] }
-async function loadComplaintsForSorties() {
+async function loadComplaintsForSorties(db) {
   const now = Date.now()
   if (now - _complaintCache.ts < COMPLAINT_CACHE_TTL_MS) return _complaintCache.list
   let list = []
-  try {
-    const fs2 = await import('fs/promises')
-    const path = await import('path')
-    const buf = await fs2.default.readFile(path.default.resolve('data/complaints.json'), 'utf8')
-    list = JSON.parse(buf).complaints || []
-  } catch { list = [] }
+  if (db && db.useDb && typeof db.getComplaints === 'function') {
+    try {
+      const q = db.getComplaints(null)
+      const t = new Promise((_, rej) => setTimeout(() => rej(new Error('complaint_timeout')), 1500))
+      list = await Promise.race([q, t])
+    } catch (err) {
+      console.warn('[sorties] complaints DB lookup degraded:', err && err.message)
+      list = []
+    }
+  }
+  if (!list || !list.length) {
+    try {
+      const fs2 = await import('fs/promises')
+      const path = await import('path')
+      const buf = await fs2.default.readFile(path.default.resolve('data/complaints.json'), 'utf8')
+      list = JSON.parse(buf).complaints || []
+    } catch { list = list || [] }
+  }
   _complaintCache = { ts: now, list }
   return list
 }
@@ -1027,7 +1042,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
           // and expose the segment list per sortie as sortie_phases.
           const phaseMLClassifyFn = await getPhaseMLClassify()
           // Complaints (cached) for unified noise-segment matching.
-          const sortieComplaintsAll = await loadComplaintsForSorties()
+          const sortieComplaintsAll = await loadComplaintsForSorties(db)
 
           // Pre-pass to collect tails so we can batch the base lookup.
           const tailsSeen = new Set()
