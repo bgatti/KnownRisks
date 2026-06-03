@@ -9244,7 +9244,7 @@ export default defineConfig({
     noiseReportsApiPlugin(),
     pilotApiPlugin(),
     flightsApiPlugin(),
-    sortiesApiPlugin({ db, ENRICH_AP, POPGRID }), // GET /api/sorties
+    sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }), // GET /api/sorties
     !db.useDb && liveCapturePlugin(),
     livePositionsPlugin(),
     adsbApiPlugin(),

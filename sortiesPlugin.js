@@ -914,7 +914,7 @@ function buildSortieNoiseSegments({ sortiePath, sortieMaxPop, sortieComplaints, 
 const TAIL_BASE_CACHE = new Map()     // tail → { base: string|null, ts: number }
 const TAIL_BASE_TTL_MS = 60 * 60_000  // 1 h — bases rarely change
 
-export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
+export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
   // Per-tail base lookup. Hits the module-scope cache first, queries
   // `tracks` ONLY for tails we don't have a fresh entry for, and
   // bounds the DB call so a stuck pg-pool can't take the whole sortie
@@ -1779,6 +1779,14 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_id: sortieId,
                 sortie_tail: sortieTail,
                 sortie_type: sortieTrack.type || null,
+                // Ask #16 — same icon resolution rule as
+                // /api/flights/current.icon_url: tail override →
+                // type override → /aircraft-icons/<TYPE> fallback.
+                // Null when aircraftIconUrl isn't wired (degrades to
+                // the kiosk's local silhouette).
+                sortie_icon_url: typeof aircraftIconUrl === 'function'
+                  ? aircraftIconUrl(sortieTrack.type || '', sortieTail)
+                  : null,
                 sortie_is_glider: sortieIsGlider,
                 sortie_is_tow_plane: sortieIsTowPlane,
                 sortie_ground_threshold_min: (s.effective_ground_ms || sortieGroundMsForType) / 60_000,
