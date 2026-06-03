@@ -8,8 +8,15 @@ import pg from 'pg'
 import { classifyPoint, distFt } from './src/geo.js'
 import { NOISE_ZONES } from './src/noiseZones.js'
 
-const CENTER = [40.0394, -105.2258]
-const RADIUS_NM = 15
+// Ask #19 — was [KBDU, 15 nm]. Every track was getting truncated
+// before it reached live_tracks, so /api/sorties at KBJC showed
+// flight paths clipped where they crossed 15 nm of KBDU. Aligned
+// with the dev liveCapturePlugin in vite.config.js: geographic
+// centroid of the 6 Front Range fields + 36 nm radius covers
+// KBDU + KBJC + KLMO + KEIK + KAPA + KGXY with headroom for the
+// practice areas east of DIA.
+const CENTER = [40.0211, -105.0063]
+const RADIUS_NM = 36
 const POLL_MS = 5_000
 const ALT_MAX_FT = 10_000
 const SEVERITY = { yellow: 1, orange: 2, red: 3, purple: 4 }
