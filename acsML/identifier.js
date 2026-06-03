@@ -190,12 +190,17 @@ export function identifyAcsSegments(points, { typeCode = '', tail = '' } = {}) {
   // within DEDUP_WINDOW_S of a kept event. Higher-confidence events
   // take precedence when they collide (literal > implied), which
   // we approximate by sorting same-ts ties so explicit beats implied.
-  // Real C172 pattern circuits at busy fields can be as tight as ~60 s
-  // (KLMO has a low TPA + short legs). Same-touchdown re-detections
-  // (literal + implied paths firing for the same event, or implied
-  // detector retriggering on the same coverage gap) are typically < 60 s
-  // apart. 60 s keeps real circuits and squashes re-detections.
-  const LANDING_DEDUP_WINDOW_S = 60
+  // Operator round-9 follow-up: 60 s was too tight. A standard C172
+  // pattern is physically bounded by climb-out (~90 s to TPA at 700
+  // fpm), crosswind/downwind/base/final (~90-180 s combined) → 3-5
+  // min minimum per circuit at non-towered fields. Sub-2-min gaps
+  // are SAME touchdown re-detected — typically the AGL value
+  // differs by 100-200 ft between the two events (alt-correction
+  // sampling jitter on the same touchdown).
+  //
+  // 120 s window cuts the clear re-detections at 60-100 s without
+  // touching real circuits (which are 130 s+).
+  const LANDING_DEDUP_WINDOW_S = 120
   const LANDING_DEDUP_TYPES = new Set(['touch_and_go', 'landed_full_stop'])
   let dedupSuppressed = 0
   const lastKeptAtAirport = new Map()   // key: type + '|' + icao → endTs of last kept
