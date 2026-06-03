@@ -4,7 +4,7 @@
 // build). See ADOPTING_PURPOSE_ML_API.md for full endpoint contract.
 
 import { extractFeatures } from './features.js'
-import { classifyOneTrack, inputToPoints } from './service.js'
+import { classifyOneTrack, inputToPoints, inputToPointsWithStats } from './service.js'
 
 const VERSION = '0.2.0'
 
@@ -60,31 +60,35 @@ export function purposeMLApiPlugin() {
           }
           if (req.url === '/api/purpose-ml/classify' && req.method === 'POST') {
             const body = await readJson(req)
-            const points = inputToPoints(body.points, { archive: false })
-            if (!points || points.length < 2) {
-              return send(res, 400, { error: 'need at least 2 points' })
+            const stats = inputToPointsWithStats(body.points, { archive: false })
+            if (stats.points.length < 2) {
+              return send(res, 400, { error: 'need at least 2 points after quality/sanity filtering', input_filter: stats.dropped })
             }
-            return send(res, 200, classifyOneTrack(points, {
+            const result = classifyOneTrack(stats.points, {
               typeCode: body.typeCode || '',
               tail: body.tail || '',
               isSchoolFleet: !!body.isSchoolFleet,
               includeFeatures: !!body.includeFeatures,
-            }))
+            })
+            result.input_filter = { kept: stats.points.length, dropped: stats.dropped }
+            return send(res, 200, result)
           }
           if (req.url === '/api/purpose-ml/classify-archive' && req.method === 'POST') {
             const body = await readJson(req)
             const t0 = Number(body.t0Seconds)
             if (!Number.isFinite(t0)) return send(res, 400, { error: 'need t0Seconds (epoch seconds)' })
-            const points = inputToPoints(body.points, { archive: true, t0Seconds: t0 })
-            if (!points || points.length < 2) {
-              return send(res, 400, { error: 'need at least 2 points' })
+            const stats = inputToPointsWithStats(body.points, { archive: true, t0Seconds: t0 })
+            if (stats.points.length < 2) {
+              return send(res, 400, { error: 'need at least 2 points after quality/sanity filtering', input_filter: stats.dropped })
             }
-            return send(res, 200, classifyOneTrack(points, {
+            const result = classifyOneTrack(stats.points, {
               typeCode: body.typeCode || '',
               tail: body.tail || '',
               isSchoolFleet: !!body.isSchoolFleet,
               includeFeatures: !!body.includeFeatures,
-            }))
+            })
+            result.input_filter = { kept: stats.points.length, dropped: stats.dropped }
+            return send(res, 200, result)
           }
           if (req.url === '/api/purpose-ml/extract' && req.method === 'POST') {
             const body = await readJson(req)

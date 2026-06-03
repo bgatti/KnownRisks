@@ -20,7 +20,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { identifyOneTrack, inputToPoints } from './service.js'
+import { identifyOneTrack, inputToPoints, inputToPointsWithStats } from './service.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const VERSION = '0.1.0'
@@ -70,21 +70,29 @@ export function acsMLApiPlugin() {
           }
           if (req.url === '/api/acs-ml/identify' && req.method === 'POST') {
             const body = await readJson(req)
-            const points = inputToPoints(body.points, { archive: false })
-            if (points.length < 2) return send(res, 400, { error: 'need at least 2 points' })
-            return send(res, 200, identifyOneTrack(points, {
+            const stats = inputToPointsWithStats(body.points, { archive: false })
+            if (stats.points.length < 2) {
+              return send(res, 400, { error: 'need at least 2 points after quality/sanity filtering', input_filter: stats.dropped })
+            }
+            const result = identifyOneTrack(stats.points, {
               typeCode: body.typeCode || '', tail: body.tail || '',
-            }))
+            })
+            result.input_filter = { kept: stats.points.length, dropped: stats.dropped }
+            return send(res, 200, result)
           }
           if (req.url === '/api/acs-ml/identify-archive' && req.method === 'POST') {
             const body = await readJson(req)
             const t0 = Number(body.t0Seconds)
             if (!Number.isFinite(t0)) return send(res, 400, { error: 'need t0Seconds' })
-            const points = inputToPoints(body.points, { archive: true, t0Seconds: t0 })
-            if (points.length < 2) return send(res, 400, { error: 'need at least 2 points' })
-            return send(res, 200, identifyOneTrack(points, {
+            const stats = inputToPointsWithStats(body.points, { archive: true, t0Seconds: t0 })
+            if (stats.points.length < 2) {
+              return send(res, 400, { error: 'need at least 2 points after quality/sanity filtering', input_filter: stats.dropped })
+            }
+            const result = identifyOneTrack(stats.points, {
               typeCode: body.typeCode || '', tail: body.tail || '',
-            }))
+            })
+            result.input_filter = { kept: stats.points.length, dropped: stats.dropped }
+            return send(res, 200, result)
           }
           return next()
         } catch (err) {

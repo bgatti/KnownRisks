@@ -180,19 +180,39 @@ try {
 function pointsToPurposeMLShape(points) {
   if (!Array.isArray(points)) return []
   const out = []
+  // Defensive quality + sanity gates. Mirror purposeML/service.js's
+  // inputToPointsWithStats — when a caller passes the sortie_path
+  // 5-tuple shape, the 5th slot is the quality flag and only "real"
+  // points are safe for classification. Bridged/repaired/synthesized
+  // fixes are dropped silently. Sanity-reject obviously-bad
+  // lat/lon/alt/ts.
+  const NOW_S = Math.floor(Date.now() / 1000)
+  const SANE_FUTURE_S = 86400
+  const qualityOk = (q) => q === undefined || q === null || q === 'real' || q === 'observed'
+  const sanityOk = (lat, lon, alt, tsSec) =>
+    Number.isFinite(lat) && lat >= -90 && lat <= 90
+    && Number.isFinite(lon) && lon >= -180 && lon <= 180
+    && Number.isFinite(alt) && alt > -1000 && alt < 65000
+    && Number.isFinite(tsSec) && tsSec > 0 && tsSec < NOW_S + SANE_FUTURE_S
   for (const p of points) {
     if (!p) continue
     if (Array.isArray(p)) {
+      if (p.length >= 5 && !qualityOk(p[4])) continue
       const [lat, lon, alt, ts] = p
       if (lat == null || lon == null || alt == null || ts == null) continue
-      out.push({ lat, lon, altMslFt: alt, tsUnix: ts / 1000 })
+      const tsSec = ts > 1e10 ? ts / 1000 : ts   // sortie tuples are ms
+      if (!sanityOk(lat, lon, alt, tsSec)) continue
+      out.push({ lat, lon, altMslFt: alt, tsUnix: tsSec })
     } else if (typeof p === 'object') {
+      if (p.quality !== undefined && !qualityOk(p.quality)) continue
       const lat = p.lat
       const lon = p.lon
       const alt = p.altMslFt ?? p.alt_ft ?? p.alt
       const tsMs = p.tsUnix != null ? p.tsUnix * 1000 : (p.ts_ms ?? p.ts)
       if (lat == null || lon == null || alt == null || tsMs == null) continue
-      out.push({ lat, lon, altMslFt: alt, tsUnix: tsMs / 1000 })
+      const tsSec = tsMs / 1000
+      if (!sanityOk(lat, lon, alt, tsSec)) continue
+      out.push({ lat, lon, altMslFt: alt, tsUnix: tsSec })
     }
   }
   return out
