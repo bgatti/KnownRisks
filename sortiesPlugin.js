@@ -110,12 +110,18 @@ function phaseLabelsToSegments(labels, canonicalPts) {
   const segs = []
   let cur = null
   for (let i = 0; i < labels.length && i < canonicalPts.length; i++) {
-    const ph = labels[i] && labels[i].phase
+    const lab = labels[i]
+    const ph = lab && lab.phase
     if (!ph) continue
     const tsMs = canonicalPts[i].tsUnix * 1000
-    if (!cur || cur.phase !== ph) {
+    // sortieCue (no_new_takeoff / track_ended / crew_swap_hour_marker)
+    // is carried on landed_full_stop labels by phaseML's post-hoc
+    // overlay. Preserve it so downstream consumers can see WHY a
+    // boundary fired without re-running the oracle.
+    const cue = lab && lab.sortieCue ? lab.sortieCue : null
+    if (!cur || cur.phase !== ph || cur.cue !== cue) {
       if (cur) cur.ts_end_ms = tsMs
-      cur = { phase: ph, ts_start_ms: tsMs, ts_end_ms: tsMs }
+      cur = { phase: ph, ts_start_ms: tsMs, ts_end_ms: tsMs, cue }
       segs.push(cur)
     } else {
       cur.ts_end_ms = tsMs
@@ -158,6 +164,19 @@ const SORTIE_ALT_CAL_RADIUS_NM = 2.0
 const SORTIE_ALT_CAL_FRACTION = 0.25
 const SORTIE_ALT_CAL_MIN = 3
 const SORTIE_ALT_CAL_MAX_AGL = 500
+
+// Find nearest entry in the ENRICH_AP catalog within `maxNm`. Returns
+// the airport object (with .code, .lat, .lon, .elev) or null. Used to
+// resolve sortie_dep_airport / sortie_landed_at_airport from the
+// path's first/last fix — Ask S-14 + Ask S-13.
+function nearestEnrichApWithin(lat, lon, enrichAp, maxNm) {
+  let best = null, bestD = Infinity
+  for (const ap of (enrichAp || [])) {
+    const d = distNmAp(lat, lon, ap.lat, ap.lon)
+    if (d < bestD) { bestD = d; best = ap }
+  }
+  return (best && bestD <= maxNm) ? best : null
+}
 
 function distNmAp(la1, lo1, la2, lo2) {
   const R = 3440.065
@@ -301,16 +320,19 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
     }
   }
 
-  // Helper: does any hardBoundary segment overlap the [a, b] time gap?
-  // hardBoundaries[i] = { ts_start_ms, ts_end_ms } from phaseML's
-  // landed_full_stop labelling. When yes, the merge MUST split — the
-  // crew is logged as ended; the next airborne session is a new sortie
-  // regardless of the type-based ground threshold.
-  const hasHardBoundaryInGap = (a, b) => {
+  // Helper: returns the cue of the first hardBoundary segment whose
+  // time range overlaps the [a, b] gap, or null if none. Each entry in
+  // hardBoundaries[] is { ts_start_ms, ts_end_ms, cue } from phaseML's
+  // landed_full_stop labelling. When a cue is returned, the merge MUST
+  // split — the crew is logged as ended; the next airborne session is
+  // a new sortie regardless of the type-based ground threshold. The
+  // cue identifies WHY phaseML decided this is a boundary
+  // (no_new_takeoff / crew_swap_hour_marker / track_ended).
+  const cueForGap = (a, b) => {
     for (const hb of hardBoundaries) {
-      if (hb.ts_end_ms >= a && hb.ts_start_ms <= b) return true
+      if (hb.ts_end_ms >= a && hb.ts_start_ms <= b) return hb.cue || 'unknown'
     }
-    return false
+    return null
   }
   let sortieCur = { ...sortieSessions[0], cycles: 1, ended_by: null }
   for (let i = 1; i < sortieSessions.length; i++) {
@@ -318,13 +340,13 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
     const gapStart = sortieAllPts[sortieCur.e][3] || 0
     const gapEnd = sortieAllPts[next.s][3] || 0
     const sortieGroundGapMs = gapEnd - gapStart
-    const hardBoundary = hasHardBoundaryInGap(gapStart, gapEnd)
-    if (sortieGroundGapMs < effectiveGroundMs && !hardBoundary) {
+    const cue = cueForGap(gapStart, gapEnd)
+    if (sortieGroundGapMs < effectiveGroundMs && !cue) {
       sortieCur.e = next.e
       sortieCur.cycles += 1
       if (next.open) sortieCur.open = true
     } else {
-      sortieCur.ended_by = hardBoundary ? 'phaseml_landed_full_stop' : 'ground_threshold'
+      sortieCur.ended_by = cue ? `phaseml_landed_full_stop:${cue}` : 'ground_threshold'
       sortieList.push(sortieCur)
       sortieCur = { ...next, cycles: 1, ended_by: null }
     }
@@ -778,7 +800,38 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
               const sortieOperator = schoolEntry ? schoolEntry.slug : null
               const sortieOperatorName = schoolEntry ? schoolEntry.name : null
               if (sortieSchoolFilter && sortieOperator !== sortieSchoolFilter) continue
-              const sortieBase = tailBaseMap.get(sortieTail) || (schoolEntry ? schoolEntry.airport : null) || null
+              // Departure / arrival airport resolution — done on the raw
+              // path's first / last fix (before alt amendment, which
+              // doesn't move lat/lon anyway). Each looks up the nearest
+              // known airport within SORTIE_AIRPORT_NEAR_NM. dep_ap is
+              // load-bearing for sortie_dep_airport (Ask S-14) and for
+              // the sortie_base implied-fallback (also S-14). arr_ap is
+              // null when the aircraft is still in flight at window
+              // edge — answers Ask S-13's "landed-at-airport but still
+              // 2000 ft AGL" bug.
+              const sortieDepAp = nearestEnrichApWithin(rawPath[0][0], rawPath[0][1], ENRICH_AP, SORTIE_AIRPORT_NEAR_NM)
+              const sortieArrAp = !s.open
+                ? nearestEnrichApWithin(rawPath[rawPath.length - 1][0], rawPath[rawPath.length - 1][1], ENRICH_AP, SORTIE_AIRPORT_NEAR_NM)
+                : null
+              const sortieDepAirport = sortieDepAp ? sortieDepAp.code : null
+              const sortieLandedAtAirport = sortieArrAp ? sortieArrAp.code : null
+              // Base resolution chain (S-14):
+              //   1. DB per-tail history (most-recent-non-null base_airport)
+              //   2. School index home airport
+              //   3. Implied — when dep == arr at the SAME airport for a
+              //      closed sortie, the aircraft is operating from there
+              // sortie_base_source carries the provenance so consumers
+              // know how confident they should be.
+              let sortieBase = tailBaseMap.get(sortieTail) || null
+              let sortieBaseSource = sortieBase ? 'tracks_db' : null
+              if (!sortieBase && schoolEntry) {
+                sortieBase = schoolEntry.airport || null
+                if (sortieBase) sortieBaseSource = 'schools_index'
+              }
+              if (!sortieBase && sortieDepAp && sortieArrAp && sortieDepAp.code === sortieArrAp.code) {
+                sortieBase = sortieDepAp.code
+                sortieBaseSource = 'implied'
+              }
 
               // Path quality passes: alt offset + bridge.
               const altCal = computeSortieAltOffset(rawPath, sortieAp)
@@ -829,11 +882,20 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
               }
 
               // Metrics over the FINAL path (post-amendment).
+              // S-13 fix: measure max excursion from the path's FIRST
+              // fix (takeoff point), not from the queried airport
+              // centre. The previous airport-centre version produced
+              // sortie_max_excursion_nm > sortie_path_length_nm, which
+              // is geometrically impossible — a path can't reach a
+              // point further from its start than the path is long.
+              // First-fix anchoring makes the two metrics commensurate
+              // and matches what the operator intuited.
               let pathLenNm = 0, maxExcNm = 0
-              const apCenterLat = sortieAp.lat, apCenterLon = sortieAp.lon
+              const sortieStartLat = sortiePath[0][0]
+              const sortieStartLon = sortiePath[0][1]
               for (let k = 0; k < sortiePath.length; k++) {
                 const p = sortiePath[k]
-                const d = distNmAp(p[0], p[1], apCenterLat, apCenterLon)
+                const d = distNmAp(p[0], p[1], sortieStartLat, sortieStartLon)
                 if (d > maxExcNm) maxExcNm = d
                 if (k > 0) {
                   const a = sortiePath[k - 1]
@@ -1001,6 +1063,8 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_operator: sortieOperator,
                 sortie_operator_name: sortieOperatorName,
                 sortie_base: sortieBase,
+                sortie_base_source: sortieBaseSource,
+                sortie_dep_airport: sortieDepAirport,
                 sortie_purpose: sortiePurpose,
                 sortie_purpose_source: sortiePurposeSource,
                 sortie_purpose_confidence: sortiePurposeConfidence,
@@ -1008,7 +1072,11 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_takeoff_ts: sortieTakeoffTs,
                 sortie_takeoff_day: sortieTakeoffTs.slice(0, 10),
                 sortie_landing_ts: sortieLandingTs,
-                sortie_landed_at_airport: sortieAirport,
+                // S-13 fix: only stamp landed_at_airport when the
+                // aircraft is no longer airborne. Open sorties (still
+                // in flight at window edge) get null so a 2000 ft AGL
+                // fix doesn't get labelled as "landed at KBDU".
+                sortie_landed_at_airport: sortieLandedAtAirport,
                 sortie_landing_dist_nm: Math.round(sortieLandingDistNm * 10) / 10,
                 sortie_duration_min: sortieDurationMin,
                 sortie_path_length_nm: Math.round(pathLenNm * 100) / 100,
@@ -1080,6 +1148,51 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
 
           sortieResults.sort((a, b) => b.sortie_landing_ts.localeCompare(a.sortie_landing_ts))
 
+          // ACS maneuver index — operator brief 2026-06-03: "I need a
+          // way to see all identified maneuvers of ACS / so I need to
+          // be able to request a sample of flights that covers the
+          // maneuvers." Map of ACS code → array of sortie objects
+          // demonstrating it, sorted by best-evidence confidence
+          // descending so the first entry is the highest-confidence
+          // sample. Each entry carries the sortie_id, tail, type, the
+          // task's instance count, and the peak evidence confidence
+          // for that code on that sortie — enough for a drill-down
+          // picker without re-walking the whole response.
+          const sortieAcsIndex = {}
+          for (const row of sortieResults) {
+            const tasks = row.sortie_acs && Array.isArray(row.sortie_acs.tasks_demonstrated)
+              ? row.sortie_acs.tasks_demonstrated : []
+            const seen = new Set()
+            for (const t of tasks) {
+              if (!t || !t.code) continue
+              if (seen.has(t.code)) continue
+              seen.add(t.code)
+              const peakConf = (t.evidence || []).reduce((m, e) => Math.max(m, e?.confidence || 0), 0)
+              if (!sortieAcsIndex[t.code]) sortieAcsIndex[t.code] = {
+                code: t.code, name: t.name || null, sample_count: 0, samples: [],
+              }
+              sortieAcsIndex[t.code].sample_count++
+              sortieAcsIndex[t.code].samples.push({
+                sortie_id: row.sortie_id,
+                tail: row.sortie_tail,
+                type: row.sortie_type,
+                purpose: row.sortie_purpose,
+                takeoff_ts: row.sortie_takeoff_ts,
+                landing_ts: row.sortie_landing_ts,
+                duration_min: row.sortie_duration_min,
+                instances: t.instances,
+                peak_confidence: peakConf,
+              })
+            }
+            // Denormalized code list for fast row-level filtering on
+            // the test page — saves walking tasks_demonstrated to
+            // ask "does this sortie include IX.A?".
+            row.sortie_acs_codes = [...seen].sort()
+          }
+          for (const key of Object.keys(sortieAcsIndex)) {
+            sortieAcsIndex[key].samples.sort((a, b) => b.peak_confidence - a.peak_confidence)
+          }
+
           res.end(JSON.stringify({
             sortie_airport: sortieAirport,
             sortie_window_hours: sortieHours,
@@ -1089,7 +1202,14 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             sortie_source: sortieSource,
             sortie_purpose_classifier: purposeMLClassifyFn ? 'purposeML (real-points only, confidence ≥ 0.7) → geometry fallback' : 'geometry only (purposeML unavailable)',
             sortie_acs_classifier: acsMLIdentifyFn ? 'acsML (real-points only, ≥ 30 pts) — Private Pilot ACS Areas of Operation + FAR 61.57 currency. See acsML/README.md and kickoff_sorties_test.md.' : 'unavailable',
-            sortie_phase_classifier: 'phaseML.classifyTrack — labels every fix; landed_full_stop is used as a hard sortie boundary (overrides ground-threshold merge). Per-sortie segments echoed as sortie_phases.',
+            sortie_phase_classifier: 'phaseML.classifyTrack — labels every fix; landed_full_stop is used as a hard sortie boundary (overrides ground-threshold merge). Per-sortie segments echoed as sortie_phases. sortieCue (no_new_takeoff / crew_swap_hour_marker / track_ended) is carried on landed_full_stop segments per phaseML\'s post-hoc overlay.',
+            // ACS code → array of {sortie_id, tail, type, peak_confidence, ...}
+            // sorted by peak confidence descending. Lets operators pick a
+            // representative sortie per maneuver code in one lookup
+            // instead of walking tasks_demonstrated across every row.
+            // 2026-06-03 operator brief: "I need to be able to request a
+            // sample of flights that covers the maneuvers."
+            sortie_acs_index: sortieAcsIndex,
             sortie_count: sortieResults.length,
             sortie_invariant: 'sortie_max_pop_segment.sortie_max_pop_points === sortie_path.slice(sortie_max_pop_index_start, sortie_max_pop_index_end + 1). Every point in the slice has quality="real".',
             sortie_path_format: '[lat, lon, alt_msl_corrected_ft, ts_ms, quality] — quality ∈ {"real", "repaired"}. sortie_path_gaps lists "broken" coverage breaks; render those as hint lines, not solid path. sortie_path_throttle[i] is a parallel array of 0..1 throttle estimates aligned with sortie_path[i]; null entries mean either repaired/engineless or no prior real fix within 60 s.',
