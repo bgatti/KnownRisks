@@ -132,11 +132,20 @@ const TASK_EXCLUSIONS = [
   { task: 'VII.A', match: 'engineless', why: 'glider normal cruise is 40-60 KTAS — perpetually below typical powered-plane cruise; not slow-flight task' },
   { task: 'VII.B', match: 'engineless', why: 'engineless — no power-off vs power-on distinction' },
   { task: 'VII.C', match: 'engineless', why: 'engineless — no power to apply at stall break' },
-  { task: 'IX.A',  match: 'engineless', why: 'gliders descend by design — every flight is a descent, none is an emergency descent task' },
-  // Tow planes — post-release behaviour mimics several training maneuvers.
+  // IX.A engineless gate ALSO no longer needed — phaseML's IX.A
+  // detector now requires recovery to controlled flight and AGL
+  // gating; gliders descending to land never satisfy the recovery
+  // condition. Kept in 2026-06-03 round-12 audit's "still elevated"
+  // bucket as a safety belt; remove when IX.A glider rate is 0 on
+  // a multi-day sample.
+  { task: 'IX.A',  match: 'engineless', why: 'gliders descend by design — kept until glider rate==0 on multi-day audit' },
+  // Tow planes — post-release behaviour mimics several training
+  // maneuvers. ROUND-12 (2026-06-03): IX.A is now caught by the
+  // tightened shape detector (start-AGL ≥ 4000 + recovery to
+  // controlled flight) — REMOVED from exclusions because the
+  // shape detector eliminated tow_plane rate to 0.
   { task: 'V.D',   match: 'tow_plane',  why: 'post-release descent often spirals over the field; not a ground reference training maneuver' },
   { task: 'VII.B', match: 'tow_plane',  why: 'post-release dive at idle has stall-recovery-like signature but is intentional energy management' },
-  { task: 'IX.A',  match: 'tow_plane',  why: 'post-release dive at 1500-2500 fpm with bank is intentional descent to re-position for next tow' },
 ]
 
 function isTaskApplicable(taskCode, typeCode) {

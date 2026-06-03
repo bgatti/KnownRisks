@@ -85,6 +85,52 @@ const STEEP_TURN_CFG = {
   minSignedTurnDeg: 270,
   maxAltRangeFt: 200,
   minDurationS: 15,
+  // ACS V.A Steep Turns is a deliberate ONE-OFF maneuver exited
+  // to wings-level cruise. Thermalling gliders do continuous
+  // same-direction 360°s — without this gate, every thermal lap
+  // fires steep_turn.
+  //
+  // Discriminating check: by the END of the post-maneuver window,
+  // is the aircraft actually rolled out? Give the pilot up to
+  // rolloutTransitionS seconds to recover from steep bank to
+  // level. Then over the next rolloutCheckWindowS seconds, the
+  // bank must stay below rolloutMaxBankDeg. Thermalling never
+  // satisfies this — it stays at 30-45° bank continuously.
+  //
+  // Pre-rollin check intentionally omitted: a pilot's clearing
+  // turn before a V.A demo can leave moderate residual bank and
+  // we don't want to reject those.
+  rolloutTransitionS: 5,       // allow this much "rolling out" time
+  rolloutCheckWindowS: 10,     // then bank must stay low for this long
+  rolloutMaxBankDeg: 20,
+  rolloutMinDataS: 8,          // need at least this much post-window data total
+}
+
+// Helper: max implied bank over a sample range.
+function maxBankOverRange(samples, lo, hi) {
+  let mx = 0
+  for (let k = lo; k <= hi && k < samples.length; k++) {
+    if (k < 0) continue
+    if (samples[k].isSessionBreak) continue
+    const b = bankAngleDegFromTurnRate(samples[k].turnRateDps, samples[k].gsKts)
+    if (b > mx) mx = b
+  }
+  return mx
+}
+
+// Helper: collect the index range [windowStart..windowEnd] inclusive
+// covering `targetS` seconds before `idx` (`dir=-1`) or after
+// (`dir=+1`), capped at the captured-slice edges.
+function rangeAround(samples, idx, targetS, dir) {
+  let k = idx
+  while (k + dir >= 0 && k + dir < samples.length) {
+    const next = samples[k + dir]
+    if (next.isSessionBreak) break
+    const dt = Math.abs(next.point.tsUnix - samples[idx].point.tsUnix)
+    if (dt > targetS) break
+    k += dir
+  }
+  return dir < 0 ? [k, idx - 1] : [idx + 1, k]
 }
 
 export function detectSteepTurn(samples, cfg = STEEP_TURN_CFG) {
@@ -109,6 +155,44 @@ export function detectSteepTurn(samples, cfg = STEEP_TURN_CFG) {
     if (m.durationS >= cfg.minDurationS
         && Math.abs(m.signedTurnTotalDeg) >= cfg.minSignedTurnDeg
         && m.altRange <= cfg.maxAltRangeFt) {
+      // Post-rollout level-flight check. Skip the first
+      // rolloutTransitionS seconds (pilot rolling out from steep
+      // bank) and require the bank to stay low for the next
+      // rolloutCheckWindowS seconds. Thermalling never satisfies
+      // this — it stays at 30-45° bank continuously.
+      //
+      // When there isn't enough post-window data (turn at end of
+      // captured slice), we conservatively SKIP the check rather
+      // than reject — better to admit a maybe-V.A than drop a real
+      // one because the track happened to end mid-rollout.
+      let postOk = true
+      let postBankAfterRollout = 0
+      // Find the first sample whose ts is ≥ samples[j].ts + transition.
+      let checkStart = -1
+      for (let k = j + 1; k < n; k++) {
+        if (samples[k].isSessionBreak) break
+        if (samples[k].point.tsUnix - samples[j].point.tsUnix >= cfg.rolloutTransitionS) {
+          checkStart = k; break
+        }
+      }
+      if (checkStart >= 0) {
+        // Find the last sample within rolloutCheckWindowS of checkStart.
+        let checkEnd = checkStart
+        while (checkEnd + 1 < n
+            && !samples[checkEnd + 1].isSessionBreak
+            && samples[checkEnd + 1].point.tsUnix - samples[checkStart].point.tsUnix < cfg.rolloutCheckWindowS) {
+          checkEnd++
+        }
+        const haveS = samples[checkEnd].point.tsUnix - samples[j].point.tsUnix
+        if (haveS >= cfg.rolloutMinDataS) {
+          postBankAfterRollout = maxBankOverRange(samples, checkStart, checkEnd)
+          postOk = postBankAfterRollout <= cfg.rolloutMaxBankDeg
+        }
+        // Else: not enough data after rollout transition to enforce;
+        // skip the check (give benefit of the doubt).
+      }
+      if (!postOk) { i = j + 1; continue }
+
       const conf = Math.min(1, 0.55
         + 0.15 * Math.min(1, Math.abs(m.signedTurnTotalDeg) / 540)
         + 0.15 * (1 - Math.min(1, m.altRange / cfg.maxAltRangeFt))
@@ -119,8 +203,8 @@ export function detectSteepTurn(samples, cfg = STEEP_TURN_CFG) {
         maxBank = Math.max(maxBank, bankAngleDegFromTurnRate(samples[k].turnRateDps, samples[k].gsKts))
       }
       out.push(makeDetection('steep_turn', samples, i, j, conf,
-        `sustained ${direction} turn, ~${Math.abs(m.signedTurnTotalDeg).toFixed(0)}° in ${m.durationS.toFixed(0)}s, alt range ${m.altRange.toFixed(0)} ft`,
-        { ...m, direction, maxBankImpliedDeg: maxBank }))
+        `sustained ${direction} turn, ~${Math.abs(m.signedTurnTotalDeg).toFixed(0)}° in ${m.durationS.toFixed(0)}s, alt range ${m.altRange.toFixed(0)} ft, post-rollout bank ${postBankAfterRollout | 0}°`,
+        { ...m, direction, maxBankImpliedDeg: maxBank, postRolloutBankDeg: postBankAfterRollout }))
     }
     i = j + 1
   }
@@ -467,6 +551,24 @@ const ED_CFG = {
   maxVsFpm: -1200,
   minAltLostFt: 1200,
   minDurationS: 30,
+  // ACS IX.A Emergency Descent is a TRAINING maneuver: enter from
+  // cruise altitude, lose altitude rapidly, then RECOVER to
+  // controlled flight (not continue to landing). Three discriminators
+  // to separate it from the false positives that previously dominated:
+  //
+  //   1. minStartAglFt — must START from cruise altitude. Tow planes
+  //      release at 2000-3000 AGL then dive; that's not IX.A.
+  //   2. recovery requirement — after the descent, VS must recover
+  //      to > recoveryVsFpm sustained for recoveryHoldS seconds.
+  //      Airlines/jets descending into KDEN never recover — they
+  //      keep descending all the way to the runway.
+  //   3. maxEndAglFt — end of the descent should still be above the
+  //      ground (training recovery happens above traffic pattern).
+  minStartAglFt: 4000,
+  recoveryVsFpm: -500,
+  recoveryHoldS: 30,
+  recoveryWindowS: 120,        // look this far past end of descent
+  maxEndAglFt: 5000,           // recovery alt should be reasonable
 }
 
 export function detectEmergencyDescent(samples, cfg = ED_CFG) {
@@ -481,16 +583,57 @@ export function detectEmergencyDescent(samples, cfg = ED_CFG) {
     const m = sliceMetrics(samples, i, j)
     const altLost = m.altStart - m.altEnd
     if (m.durationS < cfg.minDurationS || altLost < cfg.minAltLostFt) { i = j + 1; continue }
+
+    // Start-from-cruise gate. Use nearest airport at the START of
+    // the descent to compute AGL. If no airport within 50 nm we
+    // skip the check (rare for our coverage area).
+    const startPt = samples[i].point
+    const apStart = nearestAirport(startPt.lat, startPt.lon, { maxNm: 50 })
+    let startAglFt = null
+    if (apStart.airport) {
+      startAglFt = startPt.altMslFt - apStart.airport.fieldElevFt
+      if (startAglFt < cfg.minStartAglFt) { i = j + 1; continue }
+    }
+
+    // Recovery gate. After the descent ends at index j, search up to
+    // recoveryWindowS for a sustained run where VS > recoveryVsFpm
+    // for at least recoveryHoldS. If no recovery is observed, this
+    // is a continued descent (airliner approach, tow descent) — not
+    // an emergency descent.
+    let recoveryStart = -1
+    let recoveryEnd = -1
+    for (let k = j + 1; k < n; k++) {
+      if (samples[k].isSessionBreak) break
+      if (samples[k].point.tsUnix - samples[j].point.tsUnix > cfg.recoveryWindowS) break
+      if (samples[k].vsFpm <= cfg.recoveryVsFpm) { recoveryStart = -1; continue }
+      if (recoveryStart < 0) recoveryStart = k
+      const heldS = samples[k].point.tsUnix - samples[recoveryStart].point.tsUnix
+      if (heldS >= cfg.recoveryHoldS) { recoveryEnd = k; break }
+    }
+    if (recoveryEnd < 0) { i = j + 1; continue }
+
+    // End-of-descent AGL gate. The recovery point should still be
+    // above some reasonable altitude (training recovery happens
+    // above traffic pattern altitude, ~1000 AGL minimum).
+    const endPt = samples[j].point
+    const apEnd = nearestAirport(endPt.lat, endPt.lon, { maxNm: 50 })
+    if (apEnd.airport) {
+      const endAglFt = endPt.altMslFt - apEnd.airport.fieldElevFt
+      if (endAglFt > cfg.maxEndAglFt || endAglFt < 500) { i = j + 1; continue }
+    }
+
     const spiraling = Math.abs(m.signedTurnTotalDeg) > 120
     const conf = Math.min(1, 0.50
       + 0.20 * Math.min(1, altLost / 4000)
       + 0.15 * (spiraling ? 1 : 0)
       + 0.15 * Math.min(1, m.durationS / 90))
     const expl = `vs ${m.vsMean.toFixed(0)} fpm avg, lost ${altLost.toFixed(0)} ft in ${m.durationS.toFixed(0)}s`
+      + (startAglFt != null ? `, from ${startAglFt | 0} AGL` : '')
+      + `, recovered to ${samples[recoveryEnd].vsFpm.toFixed(0)} fpm`
       + (spiraling ? `, spiraled ${m.signedTurnTotalDeg >= 0 ? '+' : ''}${m.signedTurnTotalDeg.toFixed(0)}°` : '')
     out.push(makeDetection('emergency_descent', samples, i, j, conf, expl,
-      { ...m, altLostFt: altLost, spiraling }))
-    i = j + 1
+      { ...m, altLostFt: altLost, spiraling, startAglFt }))
+    i = recoveryEnd
   }
   return mergeAdjacent(out)
 }

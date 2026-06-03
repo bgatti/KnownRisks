@@ -30,6 +30,9 @@ import {
   predictIntent,
   summarise,
   xyNmToLatLon,
+  classifyTrack,
+  secondsToNearestHourMarker,
+  SORTIE_PROFILES,
 } from './phaseML/index.js'
 
 // ─── Synthetic trajectory generators ────────────────────────────────────
@@ -128,6 +131,9 @@ function emergencyDescentTrack({
   lat0 = 40, lon0 = -105, altStartFt = 12000,
   speedKt = 130, vsFpm = -2500, durationS = 90, spiral = true,
   bankDeg = 40, sampleS = 2, t0 = 0,
+  // ACS IX.A requires recovery — pilot levels off after the rapid
+  // descent. Append a level-flight tail so the detector sees it.
+  recoveryS = 60,
 } = {}) {
   const vFps = speedKt * KT_TO_FPS
   const omegaRadS = spiral ? (32.174 * Math.tan(bankDeg * DEG_TO_RAD) / vFps) : 0
@@ -149,6 +155,17 @@ function emergencyDescentTrack({
     }
     const { lat, lon } = xyNmToLatLon(x, y, lat0, lon0)
     out.push({ lat, lon, altMslFt: alt, tsUnix: t0 + t })
+  }
+  // Recovery tail: level cruise at the post-descent altitude.
+  const endAlt = altStartFt + vsFpm * (durationS / 60)
+  const endLast = out[out.length - 1]
+  const recN = Math.floor(recoveryS / sampleS)
+  for (let i = 1; i <= recN; i++) {
+    const t = durationS + i * sampleS
+    const x = 0    // continue level-flight heading
+    const y = -(speedKt / 3600) * (i * sampleS)
+    const { lat, lon } = xyNmToLatLon(x, y, endLast.lat, endLast.lon)
+    out.push({ lat, lon, altMslFt: endAlt, tsUnix: t0 + t })
   }
   return out
 }
@@ -377,6 +394,138 @@ describe('intent', () => {
     const sum = summarise(samples)
     // Either flat-out transit, or some airport with very low confidence.
     expect(sum.confidenceGap < 0.6 || sum.top.airport === null).toBe(true)
+  })
+})
+
+// ─── Sortie (landed_full_stop) overlay ──────────────────────────────────
+
+function tsAt(hh, mm = 0, ss = 0) {
+  return Date.UTC(2026, 5, 1, hh, mm, ss) / 1000   // June 1, 2026 UTC
+}
+
+function buildSortieFlight({
+  airport, takeoffTs, landTs, dwellEndTs,
+  secondTakeoffTs = null, secondLandTs = null,
+}) {
+  const SAMPLE_S = 2.0
+  const pts = []
+  const latField = airport.lat, lonField = airport.lon
+  const cruise = xyNmToLatLon(3.0, 0.0, latField, lonField)
+  const addRun = (startTs, endTs, lat, lon, alt) => {
+    for (let t = startTs; t <= endTs; t += SAMPLE_S) {
+      pts.push({ lat, lon, altMslFt: alt, tsUnix: t })
+    }
+  }
+  addRun(takeoffTs, takeoffTs + 30, latField, lonField, airport.fieldElevFt + 20)
+  addRun(takeoffTs + 60, landTs - 10, cruise.lat, cruise.lon, airport.fieldElevFt + 2000)
+  addRun(landTs, dwellEndTs, latField, lonField, airport.fieldElevFt + 20)
+  if (secondTakeoffTs != null && secondLandTs != null) {
+    addRun(secondTakeoffTs, secondLandTs, cruise.lat, cruise.lon, airport.fieldElevFt + 2000)
+  }
+  return pts
+}
+
+function sortieCues(labels) {
+  const out = []
+  for (const L of labels) {
+    if (L.phase === 'landed_full_stop' && L.sortieCue && !out.includes(L.sortieCue)) {
+      out.push(L.sortieCue)
+    }
+  }
+  return out
+}
+
+describe('sortie / landed_full_stop overlay', () => {
+  it('hour marker helper returns 0 at :00 and :30', () => {
+    expect(secondsToNearestHourMarker(tsAt(10, 0))).toBe(0)
+    expect(secondsToNearestHourMarker(tsAt(10, 30))).toBe(0)
+    expect(secondsToNearestHourMarker(tsAt(10, 32))).toBe(120)
+  })
+
+  it('KBDU: 6-min dwell with no takeoff in window → no_new_takeoff', () => {
+    const ap = getAirport('KBDU')
+    const pts = buildSortieFlight({
+      airport: ap,
+      takeoffTs: tsAt(14, 0), landTs: tsAt(14, 30),
+      dwellEndTs: tsAt(14, 36),
+      secondTakeoffTs: tsAt(14, 38), secondLandTs: tsAt(15, 0),
+    })
+    expect(sortieCues(classifyTrack(pts, ap))).toEqual(['no_new_takeoff'])
+  })
+
+  it('KBDU: 5-min dwell + takeoff at :30 → crew_swap_hour_marker', () => {
+    const ap = getAirport('KBDU')
+    const pts = buildSortieFlight({
+      airport: ap,
+      takeoffTs: tsAt(14, 0), landTs: tsAt(14, 25),
+      dwellEndTs: tsAt(14, 29, 58),
+      secondTakeoffTs: tsAt(14, 30), secondLandTs: tsAt(15, 0),
+    })
+    expect(sortieCues(classifyTrack(pts, ap))).toEqual(['crew_swap_hour_marker'])
+  })
+
+  it('KBDU: real taxi-back at :17 → no fire', () => {
+    const ap = getAirport('KBDU')
+    const pts = buildSortieFlight({
+      airport: ap,
+      takeoffTs: tsAt(14, 0), landTs: tsAt(14, 14),
+      dwellEndTs: tsAt(14, 16, 58),
+      secondTakeoffTs: tsAt(14, 17), secondLandTs: tsAt(14, 40),
+    })
+    expect(sortieCues(classifyTrack(pts, ap))).toEqual([])
+  })
+
+  it('KDEN slow profile rejects what KBDU would accept', () => {
+    const ap = getAirport('KDEN')
+    const pts = buildSortieFlight({
+      airport: ap,
+      takeoffTs: tsAt(14, 0), landTs: tsAt(14, 7),
+      dwellEndTs: tsAt(14, 13),
+      secondTakeoffTs: tsAt(14, 13, 30), secondLandTs: tsAt(14, 40),
+    })
+    expect(sortieCues(classifyTrack(pts, ap))).toEqual([])
+  })
+
+  it('track ending on the ground fires track_ended', () => {
+    const ap = getAirport('KBDU')
+    const pts = buildSortieFlight({
+      airport: ap,
+      takeoffTs: tsAt(14, 0), landTs: tsAt(14, 30),
+      dwellEndTs: tsAt(14, 31, 30),
+    })
+    expect(sortieCues(classifyTrack(pts, ap))).toEqual(['track_ended'])
+  })
+
+  it('sortieProfileOverrides via cfg swaps thresholds', () => {
+    const ap = getAirport('KBDU')
+    const pts = buildSortieFlight({
+      airport: ap,
+      takeoffTs: tsAt(14, 0), landTs: tsAt(14, 30),
+      dwellEndTs: tsAt(14, 36),
+      secondTakeoffTs: tsAt(14, 38), secondLandTs: tsAt(15, 0),
+    })
+    // Default KBDU profile → fires no_new_takeoff
+    expect(sortieCues(classifyTrack(pts, ap))).toEqual(['no_new_takeoff'])
+    // Override to a 10-min profile → takeoff is now inside the window and not
+    // near a marker, so nothing fires.
+    const cfg = {
+      onGroundAglFt: 200, taxiAglFt: 150, patternDistNm: 2.5,
+      patternMinAgl: 100, patternMaxAgl: 1500,
+      practiceDistNm: [2, 8], practiceAgl: [200, 3000],
+      departTrackOffsetDeg: 60, inboundTrackOffsetDeg: 40,
+      inboundRangeNm: [1.5, 50], enRouteDistNm: 8,
+      sortieProfileOverrides: {
+        KBDU: { minGroundS: 30, minDwellS: 10 * 60, noNewTakeoffS: 10 * 60,
+                hourMarkerToleranceS: 240, hourMarkerMinDwellS: 240 },
+      },
+    }
+    expect(sortieCues(classifyTrack(pts, ap, cfg))).toEqual([])
+  })
+
+  it('built-in profiles cover the Front Range fields', () => {
+    for (const icao of ['KBDU', 'KBJC', 'KEIK', 'KLMO', 'KGXY', 'KFNL', 'KAPA', 'KDEN']) {
+      expect(SORTIE_PROFILES[icao]).toBeDefined()
+    }
   })
 })
 
