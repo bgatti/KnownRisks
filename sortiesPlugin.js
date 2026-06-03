@@ -154,6 +154,19 @@ const SORTIE_GROUND_AGL_FT = 200
 const SORTIE_AIRPORT_NEAR_NM = 4
 const SORTIE_MAX_POP_WINDOW_MS = 30_000
 const SORTIE_IMPACT_SCALE = 40
+// Ask S-17 — type-gated acsML taxonomy filter. acsML's standards
+// vocabulary is Private Pilot AIRPLANE ACS; applying it to gliders
+// and tow planes produces nonsense labels (a glider can't do a
+// power-on stall; a tow plane's standard post-release dive isn't an
+// emergency descent). Deny-lists drop those codes from tasks_demonstrated,
+// sortie_annotations[], and the sortie_acs_index for matching sorties.
+// `*` in allow would mean "everything not denied"; we only need the
+// deny field today.
+const SORTIE_ACS_TAXONOMY_FILTER = {
+  glider:    { deny: ['VII.B', 'VII.C', 'V.C', 'V.D'] },
+  tow_plane: { deny: ['IX.A', 'VII.B'] },
+}
+const SORTIE_ACS_CLASSIFIER_TYPE = 'private_pilot_airplane'
 const POP_SCALE_LOCAL = 100_000
 const SORTIE_PURPOSE_XC_NM = 15        // max-excursion threshold for cross_country
 const SORTIE_BRIDGE_GAP_MS = 15_000    // gap above this triggers bridge eval
@@ -199,6 +212,9 @@ function loadSchoolsIndex() {
   if (SCHOOLS_INDEX && SCHOOLS_INDEX.mt === mt) return SCHOOLS_INDEX
   // tailToSchool — uppercase tail → { slug, name, airport }
   const tailToSchool = new Map()
+  // tailRegexes — ordered list of { regex, slug, name, airport }, consulted
+  // when a literal tail lookup misses. Source: schools[].tail_regexes[].
+  const tailRegexes = []
   try {
     const raw = JSON.parse(fs.readFileSync(PATH, 'utf8'))
     for (const s of (raw.schools || [])) {
@@ -209,12 +225,30 @@ function loadSchoolsIndex() {
         const tail = (ac.tail || '').toUpperCase()
         if (tail) tailToSchool.set(tail, { slug, name: s.name, airport })
       }
+      for (const rx of (s.tail_regexes || [])) {
+        try { tailRegexes.push({ regex: new RegExp(rx), slug, name: s.name, airport }) }
+        catch (e) { console.error('[sorties] bad tail_regex', s.name, rx, e.message) }
+      }
     }
   } catch (e) {
     console.error('[sorties] schools index load failed:', e.message)
   }
-  SCHOOLS_INDEX = { mt, tailToSchool }
+  SCHOOLS_INDEX = { mt, tailToSchool, tailRegexes }
   return SCHOOLS_INDEX
+}
+// Tail → school resolver. Literal lookup first; regex rules only fire
+// when home-airport matches (rules are scoped to a school's airport).
+function lookupSchoolForTail(idx, tail, homeAirport) {
+  if (!idx || !tail) return null
+  const key = String(tail).toUpperCase()
+  const hit = idx.tailToSchool && idx.tailToSchool.get(key)
+  if (hit) return hit
+  const ap = String(homeAirport || '').toUpperCase()
+  for (const r of (idx.tailRegexes || [])) {
+    if (r.airport && r.airport !== ap) continue
+    if (r.regex.test(key)) return { slug: r.slug, name: r.name, airport: r.airport }
+  }
+  return null
 }
 function slugifySchool(name) {
   if (!name) return null
@@ -892,8 +926,11 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
               }
               if (rawPath.length < 3) continue
 
-              // Operator / base / school filter.
-              const schoolEntry = schoolsIdx.tailToSchool.get(sortieTail) || null
+              // Operator / base / school filter. Literal-tail match first;
+              // falls back to airport-scoped regex rules
+              // (schools[].tail_regexes[]) — e.g. McAir's `^N\d+(SF|FF)$`
+              // catches *SF / *FF tails not in the explicit aircraft list.
+              const schoolEntry = lookupSchoolForTail(schoolsIdx, sortieTail, sortieAirport)
               const sortieOperator = schoolEntry ? schoolEntry.slug : null
               const sortieOperatorName = schoolEntry ? schoolEntry.name : null
               if (sortieSchoolFilter && sortieOperator !== sortieSchoolFilter) continue
@@ -1112,12 +1149,29 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                       tail: sortieTail,
                     })
                     if (a) {
+                      // Ask S-17 — type-gated acsML taxonomy filter.
+                      // PP-ACS codes that physically don't apply to
+                      // gliders/tow planes get dropped from
+                      // tasks_demonstrated[] AND sortie_annotations[]
+                      // AND the top-level sortie_acs_index. The acsML
+                      // detector still runs the same — we just refuse
+                      // to surface the wrong-vocabulary labels for
+                      // this airframe.
+                      const acsDeny = sortieIsGlider ? SORTIE_ACS_TAXONOMY_FILTER.glider.deny
+                        : sortieIsTowPlane ? SORTIE_ACS_TAXONOMY_FILTER.tow_plane.deny
+                        : null
+                      const denied = acsDeny ? new Set(acsDeny) : null
+                      const passesFilter = (code) => !denied || !denied.has(code)
+                      const tasksFiltered = (a.tasks_demonstrated || []).filter(t => passesFilter(t.code))
+                      const tasksDropped = (a.tasks_demonstrated || []).length - tasksFiltered.length
                       sortieAcs = {
-                        tasks_demonstrated: a.tasks_demonstrated || [],
+                        tasks_demonstrated: tasksFiltered,
                         scores: a.scores || [],
                         currency_events: a.currency_events || [],
                         phase_summary: a.phase_summary || {},
-                        notes: a.notes || [],
+                        notes: tasksDropped > 0
+                          ? [...(a.notes || []), `type_filter: dropped ${tasksDropped} task(s) per sortie_acs_taxonomy_filter (${sortieIsGlider ? 'glider' : 'tow_plane'})`]
+                          : (a.notes || []),
                       }
                       // Build sortie_annotations[] per Ask S-9 shape from
                       // the new task_segments[] array acsML now emits.
@@ -1131,6 +1185,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                       sortieAcsAnnotations = []
                       for (const seg of segs) {
                         if (!Number.isFinite(seg.startIdx) || !Number.isFinite(seg.endIdx)) continue
+                        if (!passesFilter(seg.code)) continue
                         const pStart = acsRealToPathIdx[Math.max(0, Math.min(seg.startIdx, acsRealToPathIdx.length - 1))]
                         const pEnd = acsRealToPathIdx[Math.max(0, Math.min(seg.endIdx, acsRealToPathIdx.length - 1))]
                         if (pStart == null || pEnd == null) continue
@@ -1439,6 +1494,12 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             sortie_source: sortieSource,
             sortie_purpose_classifier: purposeMLClassifyFn ? 'purposeML (real-points only, confidence ≥ 0.7) → geometry fallback' : 'geometry only (purposeML unavailable)',
             sortie_acs_classifier: acsMLIdentifyFn ? 'acsML (real-points only, ≥ 30 pts) — Private Pilot ACS Areas of Operation + FAR 61.57 currency. See acsML/README.md and kickoff_sorties_test.md.' : 'unavailable',
+            // Ask S-17 — the lens acsML is applying. PP-ACS doesn't
+            // cover glider or tow-plane operations; codes that don't
+            // apply to those types are filtered out per
+            // sortie_acs_taxonomy_filter below.
+            sortie_acs_classifier_type_assumed: SORTIE_ACS_CLASSIFIER_TYPE,
+            sortie_acs_taxonomy_filter: SORTIE_ACS_TAXONOMY_FILTER,
             sortie_phase_classifier: 'phaseML.classifyTrack — labels every fix; landed_full_stop is used as a hard sortie boundary (overrides ground-threshold merge). Per-sortie segments echoed as sortie_phases. sortieCue (no_new_takeoff / crew_swap_hour_marker / track_ended) is carried on landed_full_stop segments per phaseML\'s post-hoc overlay.',
             // ACS code → array of {sortie_id, tail, type, peak_confidence, ...}
             // sorted by peak confidence descending. Lets operators pick a
