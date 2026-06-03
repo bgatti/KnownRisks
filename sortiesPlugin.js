@@ -32,7 +32,7 @@
 // ignoring the 5th tuple slot keep working.
 
 import fs from 'fs'
-import { impactSegments, pointImpact } from './src/popGrid.js'
+import { impactSegments, pointImpact, POP_KERNEL } from './src/popGrid.js'
 import { distFt, isEnginelessType, pointInPolygon } from './src/geo.js'
 import { NOISE_ZONES } from './src/noiseZones.js'
 import { matchVoices } from './flightScore.js'
@@ -193,6 +193,26 @@ function gradeForSegmentScore(score) {
   if (score < 8) return 'C'
   if (score < 20) return 'D'
   return 'F'
+}
+
+// Throttle-weighted ground-noise factors. Operator directive
+// 2026-06-03: "ensure that the ground noise calculation is using the
+// sorties.segment.throttle." Same source the rest of the surface
+// reads — sortie_path_throttle[] (0..1, null for unknown). Idle
+// floor 0.10: engines never make zero noise; below 10 % throttle
+// the contribution is clipped so a coasting glide isn't silent on
+// the wire. Unknown throttle (null) gets weight 1.0 — conservative,
+// treat as full power until measured otherwise.
+const SORTIE_THROTTLE_FLOOR = 0.10
+function throttleWeight(thr) {
+  if (thr == null || !Number.isFinite(thr)) return 1.0
+  return Math.max(SORTIE_THROTTLE_FLOOR, Math.min(1.0, thr))
+}
+// dB adjustment from throttle weight. dB scales as 10·log10(power),
+// so 50 % throttle ≈ −3 dB, 25 % ≈ −6 dB, 10 % floor ≈ −10 dB.
+// Negative dB only (full throttle adds nothing).
+function throttleDbAdjust(thr) {
+  return 10 * Math.log10(throttleWeight(thr))
 }
 
 // Ask #15d (kiosk) — read JSON body off a request stream. Vite's
@@ -681,8 +701,12 @@ function bridgeSortiePath(rawPath, altOffset) {
 }
 
 // ── Max-pop segment within the sortie path ───────────────────────
-function findSortieMaxPopSegment(sortiePath, popAt, sortieFieldElevFt) {
+function findSortieMaxPopSegment(sortiePath, popAt, sortieFieldElevFt, opts = {}) {
   if (!Array.isArray(sortiePath) || sortiePath.length < 3 || !popAt) return null
+  // Operator brief 2026-06-03: ground-noise calc must factor in
+  // throttle. pathThrottle is sortie_path_throttle[] — parallel to
+  // sortie_path, 0..1 fractional throttle (null = unknown → weight 1).
+  const pathThrottle = Array.isArray(opts.pathThrottle) ? opts.pathThrottle : null
   let sortieBest = null
   for (let i = 0; i < sortiePath.length; i++) {
     // EVALUATION RULE — the max-pop window must contain ONLY real
@@ -699,19 +723,41 @@ function findSortieMaxPopSegment(sortiePath, popAt, sortieFieldElevFt) {
       if (sortiePath[k][4] !== 'real') { allReal = false; break }
     }
     if (!allReal) continue
-    const sortieWin = sortiePath.slice(i, sortieEndIdx + 1)
     let sortiePeakPop = 0, sortiePeakDba = 0
-    for (const p of sortieWin) {
+    for (let k = i; k <= sortieEndIdx; k++) {
+      const p = sortiePath[k]
       const popv = popAt(p[0], p[1]) || 0
-      if (popv > sortiePeakPop) sortiePeakPop = popv
+      const thr = pathThrottle ? pathThrottle[k] : null
+      const w = throttleWeight(thr)
+      const weightedPop = popv * w
+      if (weightedPop > sortiePeakPop) sortiePeakPop = weightedPop
       const agl = Math.max(100, (p[2] || 0) - (sortieFieldElevFt || 0))
       const baseDba = 75
       const atten = agl > 1000 ? 6 * Math.log2(agl / 1000) : 0
-      const dba = Math.max(0, baseDba - atten)
+      const dba = Math.max(0, baseDba - atten + throttleDbAdjust(thr))
       if (dba > sortiePeakDba) sortiePeakDba = dba
     }
     if (sortiePeakPop <= 0) continue
-    const { total, lenFt } = impactSegments(sortieWin, popAt, distFt)
+    // Throttle-weighted impact integral. Same kernel impactSegments
+    // uses (ft × pop × (REF_AGL/AGL)²) but per-segment-weighted by
+    // the average throttle of the two endpoints — a low-throttle
+    // descent contributes less than a full-throttle climb at the
+    // same altitude.
+    let total = 0, lenFt = 0
+    for (let k = i + 1; k <= sortieEndIdx; k++) {
+      const a = sortiePath[k - 1], b = sortiePath[k]
+      const ft = distFt(a[0], a[1], b[0], b[1])
+      lenFt += ft
+      if (!(ft > 0)) continue
+      const midAlt = ((a[2] || 0) + (b[2] || 0)) / 2
+      const pop = popAt((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+      const agl = Math.max(POP_KERNEL.MIN_AGL_FT, midAlt - POP_KERNEL.GROUND_REF_FT)
+      const atten = (POP_KERNEL.REF_AGL_FT / agl) ** 2
+      const thrA = pathThrottle ? pathThrottle[k - 1] : null
+      const thrB = pathThrottle ? pathThrottle[k] : null
+      const wMid = (throttleWeight(thrA) + throttleWeight(thrB)) / 2
+      total += ft * pop * atten * wMid
+    }
     const sortieImpactIndex = lenFt > 0 ? (total / lenFt) / POP_SCALE_LOCAL : 0
     const sortieScore = Math.round(sortieImpactIndex * SORTIE_IMPACT_SCALE)
     if (!sortieBest || sortieScore > sortieBest.score) {
@@ -1549,7 +1595,13 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                   if (p[4] !== 'real') continue
                   if (p[0] == null || p[1] == null) continue
                   const v = pointImpact(p[0], p[1], p[2] || 0, sortiePopAt)
-                  sortiePathPopImpact[k] = Number.isFinite(v) ? Math.round(v * 100) / 100 : null
+                  // Throttle-weight per fix so the heat overlay
+                  // agrees with the segment chip (operator brief
+                  // 2026-06-03). Idle fix at the same lat/lon as a
+                  // climb fix should read quieter on the map.
+                  const w = throttleWeight(sortiePathThrottle[k])
+                  const wv = Number.isFinite(v) ? v * w : null
+                  sortiePathPopImpact[k] = wv == null ? null : Math.round(wv * 100) / 100
                 }
               }
 
@@ -1881,7 +1933,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
               // below in buildSortieNoiseSegments). The wire is now
               // single-shape; kiosks dispatching on noise.type get
               // the pop entry the same way they get report / vnap.
-              const sortieMaxPop = findSortieMaxPopSegment(sortiePath, POPGRID?.popAt, sortieFieldElev)
+              const sortieMaxPop = findSortieMaxPopSegment(sortiePath, POPGRID?.popAt, sortieFieldElev, { pathThrottle: sortiePathThrottle })
               // Ask #15c (revised) — derive sortie_pop_grade from
               // the segment's score (operator directive). The chip
               // and the polyline read the same number, sourced from
@@ -2165,10 +2217,10 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
               repaired: 'quality="repaired" points — synthesized to patch a coverage gap < 5 min where motion is consistent. SAFE to render as solid path; NOT safe for any evaluation (max_pop / purposeML / pop_impact / dBA peak / etc.).',
               broken:   'sortie_path_gaps[] — coverage gaps the bridger refused (> 5 min, no node speed, implausible neighbor speed, or speed mismatch). DO NOT render as a solid line; use a hint line / dashed style between the bracketing real fixes. NEVER use these to compute anything.',
               guarantees: {
-                sortie_noise_segments_pop: 'computed from real-only windows (no repaired point ever lands inside a type="pop" window); literal-slice invariant preserved. sortie_max_pop_segment row field RETIRED 2026-06-03 (Ask #17) — same data lives in sortie_noise_segments[type="pop"].',
+                sortie_noise_segments_pop: 'computed from real-only windows (no repaired point ever lands inside a type="pop" window); literal-slice invariant preserved. score / dba_peak / density_peak are throttle-weighted per fix (sortie_path_throttle[i]) — a low-throttle pattern at the same lat/lon/AGL as a full-power climb reads quieter. Throttle floor 0.10; null throttle weights 1.0 (conservative). sortie_max_pop_segment row field RETIRED 2026-06-03 (Ask #17) — same data lives in sortie_noise_segments[type="pop"].',
                 sortie_purpose:         'computed from real-only points when sortie_purpose_source="shape"; geometry classifier falls through when no shape verdict ≥ 0.7 confidence',
                 sortie_path_throttle:   'non-null entries only at indices where sortie_path[i].quality === "real" AND a prior real fix exists within 60 s. Repaired/synthesized points always carry null. Engineless types (gliders, balloons) return all-null arrays and sortie_performance.perf_source="engineless".',
-                sortie_path_pop_impact: 'people/km² × (REF_AGL / AGL)² evaluated at each fix (popGrid.js pointImpact kernel — same one impactSegments and findSortieMaxPopSegment use). Non-null only at indices where sortie_path[i].quality === "real". Repaired points carry null per the evaluation rule. Scale is consistent across sorties so clients can autoscale by percentile. When POPGRID is unavailable on the server, the array is all-null.',
+                sortie_path_pop_impact: 'people/km² × (REF_AGL / AGL)² × throttle_weight evaluated at each fix (popGrid.js pointImpact kernel × sortie_path_throttle[i]). Throttle weight floors at 0.10 (engines never silent); null throttle gets weight 1.0 (conservative — treat unmeasured as full power). Non-null only at indices where sortie_path[i].quality === "real". Repaired points carry null per the evaluation rule. Scale is consistent across sorties so clients can autoscale by percentile. When POPGRID is unavailable on the server, the array is all-null.',
                 sortie_acs:             'computed from REAL-only points (purposeML uses the same filter). Null when acsML lib missing OR the sortie has < 30 real points after the quality filter. tasks_demonstrated lists every ACS code that fired; currency_events lists per-takeoff/per-landing 61.57(a)/(b) events tagged day vs night by airport lat/lon. scores covers V.A/V.B/V.C/V.D performance-standard verdicts. Mean throttle from sortie_path_throttle drives the VII.B/VII.C/IX.A/IX.B selectors — see kickoff_sorties_test.md round-4 notes.',
                 sortie_phases:          'phaseML segments clipped to the sortie\'s [takeoff_ts, landing_ts] window. Phase ∈ {on_ground, taxiing, pattern, practice_area, departing, inbound, en_route, nearby, landed_full_stop}. landed_full_stop fires only when a ground run is ≥ 30 s AND (dwell ≥ 5 min OR end-of-track) AND no takeoff occurred within 15 min — this is the load-bearing "crew over, flight logged" signal that breaks sorties even when the type-based ground threshold would have merged. Null when phaseML lib missing OR the track has < 5 real points.',
                 sortie_annotations:     'per-segment ACS task annotations derived from acsML\'s raw detection list (post-preempt). Indices reference sortie_path; ts_start/ts_end are derived from the REAL fix at those indices. source="auto" + verdict="not_evaluated" by construction — automated detection brackets a segment, human-grade verdicts come from a separate write path (Ask S-9c). Null when acsML lib missing OR the sortie had < 30 real points (same gate as sortie_acs).',
