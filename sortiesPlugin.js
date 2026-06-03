@@ -1175,6 +1175,113 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
 
           sortieResults.sort((a, b) => b.sortie_landing_ts.localeCompare(a.sortie_landing_ts))
 
+          // Glider ↔ tow pairing — operator brief 2026-06-03: "maybe
+          // we have gliders correlated to tow, but also tow correlated
+          // to gliders (sortie can have related sortie)." Per-sortie
+          // sortie_related_sorties[] entries are emitted on BOTH the
+          // tow plane's row AND the glider's row so either drill-down
+          // resolves to the partner. A pair fires when:
+          //   - the two sorties' [takeoff_ts, landing_ts] windows
+          //     overlap by ≥ 30 s
+          //   - sampling at the tow plane's real fixes during the
+          //     overlap, the glider's nearest-time real fix is within
+          //     900 ft laterally AND 300 ft vertically for ≥ 50 % of
+          //     the samples (mirrors adsb.js pairTowWithGliders'
+          //     0.1 nm / 300 ft thresholds but evaluated across the
+          //     whole overlap, not just a snapshot).
+          // The "tow plane" side accepts both type-flagged (PA25 etc.)
+          // and auto-detected (auto_short_cycle_pattern) tracks so
+          // tows without a known type still pair.
+          const isTowSide = (s) => s.sortie_is_tow_plane
+            || s.sortie_ground_threshold_source === 'auto_short_cycle_pattern'
+          const isGliderSide = (s) => s.sortie_is_glider
+          const PAIR_LAT_FT = 900     // ≈ 0.15 nm — slightly looser than live (0.1) because sortie paths are time-merged
+          const PAIR_ALT_FT = 300
+          const PAIR_MIN_OVERLAP_MS = 30_000
+          const PAIR_MIN_SAMPLES = 3
+          const PAIR_MIN_IN_RANGE_FRAC = 0.5
+          // Build time-sorted real-only sub-paths once per sortie, keyed
+          // by sortie_id, so we can binary-search closest-time matches.
+          const realPathByIdx = new Map()
+          const realPathFor = (row) => {
+            if (realPathByIdx.has(row.sortie_id)) return realPathByIdx.get(row.sortie_id)
+            const arr = (row.sortie_path || []).filter(p => p[4] === 'real')
+            realPathByIdx.set(row.sortie_id, arr)
+            return arr
+          }
+          const closestByTime = (path, ts) => {
+            if (!path.length) return null
+            let lo = 0, hi = path.length - 1
+            while (lo < hi) {
+              const mid = (lo + hi) >> 1
+              if (path[mid][3] < ts) lo = mid + 1
+              else hi = mid
+            }
+            if (lo > 0 && Math.abs(path[lo - 1][3] - ts) < Math.abs(path[lo][3] - ts)) lo -= 1
+            return path[lo]
+          }
+          const tows = sortieResults.filter(isTowSide)
+          const gliders = sortieResults.filter(isGliderSide)
+          for (const tow of tows) {
+            const tT = [Date.parse(tow.sortie_takeoff_ts), Date.parse(tow.sortie_landing_ts)]
+            const towReal = realPathFor(tow)
+            if (towReal.length < PAIR_MIN_SAMPLES) continue
+            for (const glider of gliders) {
+              if (glider.sortie_tail === tow.sortie_tail) continue
+              const tG = [Date.parse(glider.sortie_takeoff_ts), Date.parse(glider.sortie_landing_ts)]
+              const overlapStart = Math.max(tT[0], tG[0])
+              const overlapEnd = Math.min(tT[1], tG[1])
+              if (overlapEnd - overlapStart < PAIR_MIN_OVERLAP_MS) continue
+              const gliderReal = realPathFor(glider)
+              if (gliderReal.length < PAIR_MIN_SAMPLES) continue
+              let samples = 0, inRange = 0, sumLatFt = 0, sumAltFt = 0
+              for (const tp of towReal) {
+                if (tp[3] < overlapStart || tp[3] > overlapEnd) continue
+                const gp = closestByTime(gliderReal, tp[3])
+                if (!gp) continue
+                if (Math.abs(gp[3] - tp[3]) > 10_000) continue   // > 10 s slop, skip
+                samples++
+                const latFt = distFt(tp[0], tp[1], gp[0], gp[1])
+                const altFt = Math.abs((tp[2] || 0) - (gp[2] || 0))
+                sumLatFt += latFt
+                sumAltFt += altFt
+                if (latFt < PAIR_LAT_FT && altFt < PAIR_ALT_FT) inRange++
+              }
+              if (samples < PAIR_MIN_SAMPLES) continue
+              if (inRange / samples < PAIR_MIN_IN_RANGE_FRAC) continue
+              const overlapSec = Math.round((overlapEnd - overlapStart) / 1000)
+              const meanLatFt = Math.round(sumLatFt / samples)
+              const meanAltFt = Math.round(sumAltFt / samples)
+              const inRangeFrac = Math.round(inRange / samples * 100) / 100
+              if (!Array.isArray(tow.sortie_related_sorties)) tow.sortie_related_sorties = []
+              tow.sortie_related_sorties.push({
+                sortie_id: glider.sortie_id,
+                tail: glider.sortie_tail,
+                type: glider.sortie_type,
+                role: 'towed_glider',
+                overlap_seconds: overlapSec,
+                sample_count: samples,
+                in_range_count: inRange,
+                in_range_fraction: inRangeFrac,
+                mean_lateral_ft: meanLatFt,
+                mean_vertical_ft: meanAltFt,
+              })
+              if (!Array.isArray(glider.sortie_related_sorties)) glider.sortie_related_sorties = []
+              glider.sortie_related_sorties.push({
+                sortie_id: tow.sortie_id,
+                tail: tow.sortie_tail,
+                type: tow.sortie_type,
+                role: 'tow_plane',
+                overlap_seconds: overlapSec,
+                sample_count: samples,
+                in_range_count: inRange,
+                in_range_fraction: inRangeFrac,
+                mean_lateral_ft: meanLatFt,
+                mean_vertical_ft: meanAltFt,
+              })
+            }
+          }
+
           // ACS maneuver index — operator brief 2026-06-03: "I need a
           // way to see all identified maneuvers of ACS / so I need to
           // be able to request a sample of flights that covers the
@@ -1260,6 +1367,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_phases:          'phaseML segments clipped to the sortie\'s [takeoff_ts, landing_ts] window. Phase ∈ {on_ground, taxiing, pattern, practice_area, departing, inbound, en_route, nearby, landed_full_stop}. landed_full_stop fires only when a ground run is ≥ 30 s AND (dwell ≥ 5 min OR end-of-track) AND no takeoff occurred within 15 min — this is the load-bearing "crew over, flight logged" signal that breaks sorties even when the type-based ground threshold would have merged. Null when phaseML lib missing OR the track has < 5 real points.',
                 sortie_annotations:     'per-segment ACS task annotations derived from acsML\'s raw detection list (post-preempt). Indices reference sortie_path; ts_start/ts_end are derived from the REAL fix at those indices. source="auto" + verdict="not_evaluated" by construction — automated detection brackets a segment, human-grade verdicts come from a separate write path (Ask S-9c). Null when acsML lib missing OR the sortie had < 30 real points (same gate as sortie_acs).',
                 sortie_boundary_source: 'how this sortie was bounded from the next: "phaseml_landed_full_stop" (hard signal — preferred), "ground_threshold" (type-based merge fired), "track_end" (last sortie of the day, clean end), "track_edge" (last sortie of the day, still airborne).',
+                sortie_related_sorties: 'cross-sortie glider ↔ tow pairings. A pair fires when [takeoff_ts, landing_ts] windows overlap ≥ 30 s AND ≥ 50 % of the tow plane\'s real fixes during the overlap have a nearest-time glider fix within 900 ft lateral + 300 ft vertical. Entries are bidirectional — the tow row carries role="towed_glider" pointing at the glider sortie, the glider row carries role="tow_plane" pointing at the tow. mean_lateral_ft and mean_vertical_ft summarise the formation. Tow-side acceptance includes both type-flagged (PA25 etc.) AND auto-detected (auto_short_cycle_pattern) tracks so unknown-type tow planes still pair.',
               },
             },
             sorties: sortieResults,
