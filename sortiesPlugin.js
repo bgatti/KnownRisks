@@ -76,6 +76,54 @@ async function getAcsMLIdentify() {
   return _acsMLIdentify
 }
 
+// ── phaseML — labels each fix with a flight phase (on_ground, taxiing,
+// pattern, practice_area, departing, inbound, en_route, nearby,
+// landed_full_stop). The `landed_full_stop` phase is load-bearing for
+// sortie boundary detection: oracle fires it when there's ≥ 30 s
+// ground time AND (dwell ≥ 5 min OR end-of-track), with no new
+// takeoff within 15 min — i.e. "the crew is done with this flight, log
+// entry written." We use it as a hard sortie boundary that overrides
+// the ground-threshold merge rules, so a powered aircraft that taxied
+// in, shut down, and waited 7 min before another flight gets split
+// even if the type-based threshold says merge.
+let _phaseMLClassify = null
+let _phaseMLAttempted = false
+async function getPhaseMLClassify() {
+  if (_phaseMLAttempted) return _phaseMLClassify
+  _phaseMLAttempted = true
+  try {
+    const mod = await import('./phaseML/index.js')
+    if (mod && typeof mod.classifyTrack === 'function') {
+      _phaseMLClassify = mod.classifyTrack
+    }
+  } catch (err) {
+    console.warn('[sorties] phaseML unavailable, no sortie_phases field:', err && err.message)
+  }
+  return _phaseMLClassify
+}
+
+// Compress phaseML per-fix labels into contiguous {phase, ts_start,
+// ts_end} segments for compact wire shape. Adjacent same-phase fixes
+// merge into one entry.
+function phaseLabelsToSegments(labels, canonicalPts) {
+  if (!Array.isArray(labels) || !Array.isArray(canonicalPts)) return []
+  const segs = []
+  let cur = null
+  for (let i = 0; i < labels.length && i < canonicalPts.length; i++) {
+    const ph = labels[i] && labels[i].phase
+    if (!ph) continue
+    const tsMs = canonicalPts[i].tsUnix * 1000
+    if (!cur || cur.phase !== ph) {
+      if (cur) cur.ts_end_ms = tsMs
+      cur = { phase: ph, ts_start_ms: tsMs, ts_end_ms: tsMs }
+      segs.push(cur)
+    } else {
+      cur.ts_end_ms = tsMs
+    }
+  }
+  return segs
+}
+
 const SORTIE_GROUND_MS = 5 * 60_000
 // Gliders turn around faster than typical powered aircraft. 2-3 min
 // is normal at busy glider ops (KBDU on a thermal day). With the
@@ -169,7 +217,7 @@ function slugifySchool(name) {
 // own sortie, even when the type code is null and the tail isn't in
 // the PA25/PA18/PIAT/PC6 regex. Operator brief 2026-06-03 —
 // "we should have the tow planes well identified."
-function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = SORTIE_GROUND_MS) {
+function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = SORTIE_GROUND_MS, hardBoundaries = []) {
   const sortieList = []
   if (!Array.isArray(sortieAllPts) || sortieAllPts.length < 2) return sortieList
   const sortieSessions = []
@@ -253,19 +301,37 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
     }
   }
 
-  let sortieCur = { ...sortieSessions[0], cycles: 1 }
+  // Helper: does any hardBoundary segment overlap the [a, b] time gap?
+  // hardBoundaries[i] = { ts_start_ms, ts_end_ms } from phaseML's
+  // landed_full_stop labelling. When yes, the merge MUST split — the
+  // crew is logged as ended; the next airborne session is a new sortie
+  // regardless of the type-based ground threshold.
+  const hasHardBoundaryInGap = (a, b) => {
+    for (const hb of hardBoundaries) {
+      if (hb.ts_end_ms >= a && hb.ts_start_ms <= b) return true
+    }
+    return false
+  }
+  let sortieCur = { ...sortieSessions[0], cycles: 1, ended_by: null }
   for (let i = 1; i < sortieSessions.length; i++) {
     const next = sortieSessions[i]
-    const sortieGroundGapMs = (sortieAllPts[next.s][3] || 0) - (sortieAllPts[sortieCur.e][3] || 0)
-    if (sortieGroundGapMs < effectiveGroundMs) {
+    const gapStart = sortieAllPts[sortieCur.e][3] || 0
+    const gapEnd = sortieAllPts[next.s][3] || 0
+    const sortieGroundGapMs = gapEnd - gapStart
+    const hardBoundary = hasHardBoundaryInGap(gapStart, gapEnd)
+    if (sortieGroundGapMs < effectiveGroundMs && !hardBoundary) {
       sortieCur.e = next.e
       sortieCur.cycles += 1
       if (next.open) sortieCur.open = true
     } else {
+      sortieCur.ended_by = hardBoundary ? 'phaseml_landed_full_stop' : 'ground_threshold'
       sortieList.push(sortieCur)
-      sortieCur = { ...next, cycles: 1 }
+      sortieCur = { ...next, cycles: 1, ended_by: null }
     }
   }
+  // Last sortie ends at the track edge — flag it so callers can render
+  // an "open" hint differently from a clean shutdown.
+  sortieCur.ended_by = sortieCur.open ? 'track_edge' : 'track_end'
   sortieList.push(sortieCur)
   // Stamp the effective threshold + source on every sortie in this
   // track. Callers read these to populate sortie_ground_threshold_min
@@ -625,6 +691,11 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
           // acsML — lazy-loaded once per process. Identifies ACS tasks
           // demonstrated + 61.57 currency events from REAL-ONLY points.
           const acsMLIdentifyFn = await getAcsMLIdentify()
+          // phaseML — lazy-loaded once per process. Labels each fix
+          // with a flight phase; we use landed_full_stop as a hard
+          // sortie boundary signal (overrides ground-threshold merge)
+          // and expose the segment list per sortie as sortie_phases.
+          const phaseMLClassifyFn = await getPhaseMLClassify()
 
           // Pre-pass to collect tails so we can batch the base lookup.
           const tailsSeen = new Set()
@@ -656,7 +727,34 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             const sortieGroundMsForType = sortieIsTowPlane ? SORTIE_GROUND_MS_TOW_PLANE
               : sortieIsGlider ? SORTIE_GROUND_MS_SHORT_TURN
               : SORTIE_GROUND_MS
-            const sortieList = detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMsForType)
+
+            // phaseML pre-pass — labels each fix; we extract the
+            // landed_full_stop segments to use as hard sortie
+            // boundaries (a real shutdown breaks any merge, even when
+            // the type-based threshold says merge). Falls through to
+            // an empty list when phaseML is unavailable; downstream
+            // behaviour is identical to pre-phaseML.
+            let sortieTrackPhases = []
+            let sortieHardBoundaries = []
+            if (phaseMLClassifyFn) {
+              const phaseCanonical = []
+              for (const p of sortieAllPts) {
+                if (p[0] == null || p[1] == null || p[2] == null || p[3] == null) continue
+                phaseCanonical.push({ lat: p[0], lon: p[1], altMslFt: p[2], tsUnix: Math.floor(p[3] / 1000) })
+              }
+              if (phaseCanonical.length >= 5) {
+                try {
+                  const labels = phaseMLClassifyFn(phaseCanonical)
+                  if (Array.isArray(labels) && labels.length === phaseCanonical.length) {
+                    sortieTrackPhases = phaseLabelsToSegments(labels, phaseCanonical)
+                    sortieHardBoundaries = sortieTrackPhases.filter(seg => seg.phase === 'landed_full_stop')
+                  }
+                } catch (err) {
+                  console.warn('[sorties] phaseML classify error for', sortieTail, err && err.message)
+                }
+              }
+            }
+            const sortieList = detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMsForType, sortieHardBoundaries)
             for (const s of sortieList) {
               const sortieStartPt = sortieAllPts[s.s]
               const sortieEndPt = sortieAllPts[s.e]
@@ -834,6 +932,23 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 }
               }
 
+              // Slice the track's phase segments to this sortie's
+              // time window. Each entry: { phase, ts_start, ts_end }.
+              // Clipped to the sortie's bounds so a phase segment
+              // straddling a boundary doesn't bleed into the next
+              // sortie.
+              const sortieStartMs = sortieStartPt[3] || 0
+              const sortieEndMs = sortieEndPt[3] || 0
+              const sortiePhases = sortieTrackPhases.length
+                ? sortieTrackPhases
+                    .filter(seg => seg.ts_end_ms >= sortieStartMs && seg.ts_start_ms <= sortieEndMs)
+                    .map(seg => ({
+                      phase: seg.phase,
+                      ts_start: new Date(Math.max(seg.ts_start_ms, sortieStartMs)).toISOString(),
+                      ts_end: new Date(Math.min(seg.ts_end_ms, sortieEndMs)).toISOString(),
+                    }))
+                : null
+
               const sortieRow = {
                 sortie_id: sortieId,
                 sortie_tail: sortieTail,
@@ -842,6 +957,8 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_is_tow_plane: sortieIsTowPlane,
                 sortie_ground_threshold_min: (s.effective_ground_ms || sortieGroundMsForType) / 60_000,
                 sortie_ground_threshold_source: s.threshold_source || null,
+                sortie_boundary_source: s.ended_by || null,
+                sortie_phases: sortiePhases,
                 sortie_operator: sortieOperator,
                 sortie_operator_name: sortieOperatorName,
                 sortie_base: sortieBase,
@@ -927,6 +1044,7 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
             sortie_source: sortieSource,
             sortie_purpose_classifier: purposeMLClassifyFn ? 'purposeML (real-points only, confidence ≥ 0.7) → geometry fallback' : 'geometry only (purposeML unavailable)',
             sortie_acs_classifier: acsMLIdentifyFn ? 'acsML (real-points only, ≥ 30 pts) — Private Pilot ACS Areas of Operation + FAR 61.57 currency. See acsML/README.md and kickoff_sorties_test.md.' : 'unavailable',
+            sortie_phase_classifier: 'phaseML.classifyTrack — labels every fix; landed_full_stop is used as a hard sortie boundary (overrides ground-threshold merge). Per-sortie segments echoed as sortie_phases.',
             sortie_count: sortieResults.length,
             sortie_invariant: 'sortie_max_pop_segment.sortie_max_pop_points === sortie_path.slice(sortie_max_pop_index_start, sortie_max_pop_index_end + 1). Every point in the slice has quality="real".',
             sortie_path_format: '[lat, lon, alt_msl_corrected_ft, ts_ms, quality] — quality ∈ {"real", "repaired"}. sortie_path_gaps lists "broken" coverage breaks; render those as hint lines, not solid path. sortie_path_throttle[i] is a parallel array of 0..1 throttle estimates aligned with sortie_path[i]; null entries mean either repaired/engineless or no prior real fix within 60 s.',
@@ -946,6 +1064,8 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID }) {
                 sortie_purpose:         'computed from real-only points when sortie_purpose_source="shape"; geometry classifier falls through when no shape verdict ≥ 0.7 confidence',
                 sortie_path_throttle:   'non-null entries only at indices where sortie_path[i].quality === "real" AND a prior real fix exists within 60 s. Repaired/synthesized points always carry null. Engineless types (gliders, balloons) return all-null arrays and sortie_performance.perf_source="engineless".',
                 sortie_acs:             'computed from REAL-only points (purposeML uses the same filter). Null when acsML lib missing OR the sortie has < 30 real points after the quality filter. tasks_demonstrated lists every ACS code that fired; currency_events lists per-takeoff/per-landing 61.57(a)/(b) events tagged day vs night by airport lat/lon. scores covers V.A/V.B/V.C/V.D performance-standard verdicts. Mean throttle from sortie_path_throttle drives the VII.B/VII.C/IX.A/IX.B selectors — see kickoff_sorties_test.md round-4 notes.',
+                sortie_phases:          'phaseML segments clipped to the sortie\'s [takeoff_ts, landing_ts] window. Phase ∈ {on_ground, taxiing, pattern, practice_area, departing, inbound, en_route, nearby, landed_full_stop}. landed_full_stop fires only when a ground run is ≥ 30 s AND (dwell ≥ 5 min OR end-of-track) AND no takeoff occurred within 15 min — this is the load-bearing "crew over, flight logged" signal that breaks sorties even when the type-based ground threshold would have merged. Null when phaseML lib missing OR the track has < 5 real points.',
+                sortie_boundary_source: 'how this sortie was bounded from the next: "phaseml_landed_full_stop" (hard signal — preferred), "ground_threshold" (type-based merge fired), "track_end" (last sortie of the day, clean end), "track_edge" (last sortie of the day, still airborne).',
               },
             },
             sorties: sortieResults,
