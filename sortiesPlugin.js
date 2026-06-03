@@ -542,7 +542,12 @@ function detectSortiesInTrack(sortieAllPts, sortieGroundCeil, sortieGroundMs = S
   // via the auto_short_cycle_pattern override. Trainers with quick
   // taxi-backs no longer split.
   const REAL_STOP_GS_KTS = 25
-  const REAL_STOP_DWELL_MS = 3 * 60_000
+  // 10 min matches SORTIE_GROUND_MS so realStop never overrides the
+  // type-based ground threshold. Stops shorter than that are now
+  // interior taxi-back cycles surfaced via sortie_landings.taxi_back
+  // (categorized 2026-06-03 operator: "might be a taxi back, we should
+  // categorize it as such").
+  const REAL_STOP_DWELL_MS = 10 * 60_000
   let sortieCur = { ...sortieSessions[0], cycles: 1, ended_by: null }
   for (let i = 1; i < sortieSessions.length; i++) {
     const next = sortieSessions[i]
@@ -603,9 +608,22 @@ const SORTIE_LANDING_HIGH_AGL_FT = 500
 function countSortieLandings(sortiePath, fieldElevFt) {
   if (!Array.isArray(sortiePath) || sortiePath.length < 3) return null
   if (!Number.isFinite(fieldElevFt)) return null
+  // T&G vs taxi-back vs full-stop discriminator:
+  //   - low → high within < 60 s    : touch_and_go (rolling)
+  //   - low → high after 60 s..10 min: taxi_back (stopped briefly, taxied,
+  //                                    took off again — same crew, same
+  //                                    sortie, often a refuel / debrief
+  //                                    / student swap during training)
+  //   - ends in "low" state          : full_stop (final landing)
+  // Operator brief 2026-06-03 — taxi-back should be categorized, not
+  // silently merged into T&G. A debrief between two training cycles
+  // is operationally distinct from a T&G even though both are
+  // interior low→high transitions on the AGL trace.
+  const TAXI_BACK_MIN_DWELL_MS = 60_000
   let touchAndGo = 0
+  let taxiBack = 0
   let fullStop = 0
-  let state = null  // null until first real fix
+  let state = null
   let lastLowTs = null
   let firstLowTs = null
   for (const p of sortiePath) {
@@ -622,7 +640,9 @@ function countSortieLandings(sortiePath, fieldElevFt) {
       firstLowTs = p[3]
       lastLowTs = p[3]
     } else if (state === 'low' && agl > SORTIE_LANDING_HIGH_AGL_FT) {
-      touchAndGo += 1
+      const dwellMs = firstLowTs != null ? (p[3] - firstLowTs) : 0
+      if (dwellMs >= TAXI_BACK_MIN_DWELL_MS) taxiBack += 1
+      else touchAndGo += 1
       state = 'high'
       firstLowTs = null
     } else if (state === 'low') {
@@ -631,8 +651,9 @@ function countSortieLandings(sortiePath, fieldElevFt) {
   }
   if (state === 'low') fullStop = 1
   return {
-    total: touchAndGo + fullStop,
+    total: touchAndGo + taxiBack + fullStop,
     touch_and_go: touchAndGo,
+    taxi_back: taxiBack,
     full_stop: fullStop,
     last_low_ts: lastLowTs ? new Date(lastLowTs).toISOString() : null,
   }
