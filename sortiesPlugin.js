@@ -1733,21 +1733,42 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
 
               // Path quality passes: alt offset + bridge.
               // Calibration order (operator full-court press 2026-06-03):
+              //   0. Amend ground-coerced fixes BEFORE anything else.
+              //      Capture worker coerces ADS-B `alt_baro: "ground"`
+              //      to `0 MSL`. Letting the bump probe see those as
+              //      real altimeter readings causes a phantom −5288 ft
+              //      offset on tracks whose lowest fix was a ground
+              //      ping (e.g. taxi point at KBDU). The fix: for any
+              //      raw fix with alt == 0 within 3 nm of a known
+              //      airport, set its MSL to that airport's field
+              //      elevation. Operator directive 2026-06-03:
+              //      "correct the MSL, then calculate the AGL based on
+              //      the real ground altitude."
               //   1. Airport consensus from the cross-flight pre-pass at
               //      the QUERIED airport (where the sortie is being
               //      anchored). Robust to sparse-data tracks.
               //   2. Per-sortie self-cal fallback when consensus is
               //      unavailable for the queried airport.
-              //   3. Per-sortie BUMP (added 2026-06-03 after the
-              //      operator flagged residual -225 AGL on busy tails):
-              //      if the consensus would still leave any real fix
-              //      below field_elev - 50 ft, bump the offset further
-              //      so the lowest real fix lands at exactly -50 ft AGL.
-              //      Guarantees no real point ever resolves below
-              //      −50 AGL post-correction — the only cost is a
-              //      systematic bias upward when individual tracks
-              //      have higher altimeter setting noise than the
-              //      consensus captured.
+              //   3. Per-sortie BUMP: if the consensus would still
+              //      leave any real fix below 0 AGL, bump the offset
+              //      further so the lowest real fix lands at exactly
+              //      0 ft AGL. With Step 0 in place, bump magnitudes
+              //      now reflect real altimeter bias only — no more
+              //      phantom field-elev-sized offsets.
+              let groundFixAmendments = 0
+              for (let k = 0; k < rawPath.length; k++) {
+                const p = rawPath[k]
+                if (p[2] !== 0) continue
+                let nearestAp = null, nearestNm = Infinity
+                for (const ap of ENRICH_AP) {
+                  const nm = distNmAp(p[0], p[1], ap.lat, ap.lon)
+                  if (nm < nearestNm && nm < 3) { nearestNm = nm; nearestAp = ap }
+                }
+                if (nearestAp) {
+                  rawPath[k] = [p[0], p[1], nearestAp.elev, p[3], ...(p.slice(4))]
+                  groundFixAmendments++
+                }
+              }
               const consensus = sortieAirportBaroOffsets.get(sortieAirport)
               let altCal
               if (consensus) {
@@ -2221,6 +2242,8 @@ export function sortiesApiPlugin({ db, ENRICH_AP, POPGRID, aircraftIconUrl }) {
                     field_elev_ft: sortieFieldElev,
                     min_real_msl: Number.isFinite(minMsl) ? Math.round(minMsl) : null,
                     min_real_agl: minAgl,
+                    bump_ft: altCal.bump_ft ?? null,
+                    ground_fix_amendments: groundFixAmendments,
                     alert: minAgl != null && minAgl < SORTIE_ALT_QUALITY_ALERT_AGL_FT,
                   }
                 })(),
